@@ -69,10 +69,7 @@ fn run_crash_cycles(exe: &Path, dir: &Path) -> Result<(bool, bool), Box<dyn std:
     {
         let conn = Connection::open(&db)?;
         child::init_schema(&conn)?;
-        conn.execute(
-            "INSERT INTO snapshots VALUES ('crash-run', 0, 'init')",
-            [],
-        )?;
+        conn.execute("INSERT INTO snapshots VALUES ('crash-run', 0, 'init')", [])?;
     }
     let mut atomicity_ok = true;
     let mut recovery_ok = true;
@@ -86,7 +83,11 @@ fn run_crash_cycles(exe: &Path, dir: &Path) -> Result<(bool, bool), Box<dyn std:
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()?;
-        let got = wait_for_marker(&marker, &format!("BEFORE_COMMIT {}", cycle), Duration::from_secs(60));
+        let got = wait_for_marker(
+            &marker,
+            &format!("BEFORE_COMMIT {}", cycle),
+            Duration::from_secs(60),
+        );
         if !got {
             eprintln!("crash cycle {}: BEFORE_COMMIT marker timeout", cycle);
             atomicity_ok = false;
@@ -97,26 +98,85 @@ fn run_crash_cycles(exe: &Path, dir: &Path) -> Result<(bool, bool), Box<dyn std:
         kill_child(&mut proc);
         // Reopen and verify: committed present as a whole, uncommitted absent.
         let conn = Connection::open(&db)?;
-        let committed_events = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM events WHERE event_id='committed-{}'", cycle))?;
-        let committed_outbox = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM outbox WHERE intent_id='committed-{}'", cycle))?;
-        let committed_receipts = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM receipts WHERE command_id='cmd-committed-{}'", cycle))?;
-        let uncommitted_events = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM events WHERE event_id='uncommitted-{}'", cycle))?;
-        let uncommitted_outbox = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM outbox WHERE intent_id='uncommitted-{}'", cycle))?;
-        let uncommitted_receipts = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM receipts WHERE command_id='cmd-uncommitted-{}'", cycle))?;
-        let state = scalar_string(&conn, "SELECT state FROM snapshots WHERE run_id='crash-run'")?;
+        let committed_events = scalar_i64(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM events WHERE event_id='committed-{}'",
+                cycle
+            ),
+        )?;
+        let committed_outbox = scalar_i64(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM outbox WHERE intent_id='committed-{}'",
+                cycle
+            ),
+        )?;
+        let committed_receipts = scalar_i64(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM receipts WHERE command_id='cmd-committed-{}'",
+                cycle
+            ),
+        )?;
+        let uncommitted_events = scalar_i64(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM events WHERE event_id='uncommitted-{}'",
+                cycle
+            ),
+        )?;
+        let uncommitted_outbox = scalar_i64(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM outbox WHERE intent_id='uncommitted-{}'",
+                cycle
+            ),
+        )?;
+        let uncommitted_receipts = scalar_i64(
+            &conn,
+            &format!(
+                "SELECT COUNT(*) FROM receipts WHERE command_id='cmd-uncommitted-{}'",
+                cycle
+            ),
+        )?;
+        let state = scalar_string(
+            &conn,
+            "SELECT state FROM snapshots WHERE run_id='crash-run'",
+        )?;
         let expected = format!("committed-{}", cycle);
-        if !(committed_events == 1 && committed_outbox == 1 && committed_receipts == 1 && state == expected) {
-            eprintln!("cycle {} committed set incomplete: ev={} ob={} rc={} state={}", cycle, committed_events, committed_outbox, committed_receipts, state);
+        if !(committed_events == 1
+            && committed_outbox == 1
+            && committed_receipts == 1
+            && state == expected)
+        {
+            eprintln!(
+                "cycle {} committed set incomplete: ev={} ob={} rc={} state={}",
+                cycle, committed_events, committed_outbox, committed_receipts, state
+            );
             atomicity_ok = false;
         }
-        if !(uncommitted_events == 0 && uncommitted_outbox == 0 && uncommitted_receipts == 0 && state != format!("uncommitted-{}", cycle)) {
-            eprintln!("cycle {} uncommitted leaked: ev={} ob={} rc={} state={}", cycle, uncommitted_events, uncommitted_outbox, uncommitted_receipts, state);
+        if !(uncommitted_events == 0
+            && uncommitted_outbox == 0
+            && uncommitted_receipts == 0
+            && state != format!("uncommitted-{}", cycle))
+        {
+            eprintln!(
+                "cycle {} uncommitted leaked: ev={} ob={} rc={} state={}",
+                cycle, uncommitted_events, uncommitted_outbox, uncommitted_receipts, state
+            );
             atomicity_ok = false;
             recovery_ok = false;
         }
         // Prior cycles must still be intact (no lost ack across crashes).
         if cycle > 1 {
-            let prev = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM events WHERE event_id='committed-{}'", cycle - 1))?;
+            let prev = scalar_i64(
+                &conn,
+                &format!(
+                    "SELECT COUNT(*) FROM events WHERE event_id='committed-{}'",
+                    cycle - 1
+                ),
+            )?;
             if prev != 1 {
                 eprintln!("cycle {} lost prior committed event {}", cycle, cycle - 1);
                 recovery_ok = false;
@@ -132,10 +192,15 @@ fn run_duplicate_test(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     child::init_schema(&conn)?;
     conn.execute("INSERT INTO snapshots VALUES ('run-dup', 0, 'init')", [])?;
     // First commit of (actor, cmd-1, hash-A).
-    let commit = |conn: &mut Connection, hash: &str, rev: i64| -> Result<String, Box<dyn std::error::Error>> {
+    let commit = |conn: &mut Connection,
+                  hash: &str,
+                  rev: i64|
+     -> Result<String, Box<dyn std::error::Error>> {
         // Check existing receipt first (idempotency / conflict detection).
         let existing: Result<String, _> = {
-            let mut stmt = conn.prepare("SELECT payload_hash FROM receipts WHERE actor='actor-1' AND command_id='cmd-1'")?;
+            let mut stmt = conn.prepare(
+                "SELECT payload_hash FROM receipts WHERE actor='actor-1' AND command_id='cmd-1'",
+            )?;
             stmt.query_row([], |r| r.get(0))
         };
         if let Ok(h) = existing {
@@ -145,23 +210,45 @@ fn run_duplicate_test(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
             return Ok("conflict".to_string());
         }
         let tx = conn.transaction()?;
-        tx.execute("UPDATE snapshots SET revision=?, state='dup-state' WHERE run_id='run-dup'", params![rev])?;
+        tx.execute(
+            "UPDATE snapshots SET revision=?, state='dup-state' WHERE run_id='run-dup'",
+            params![rev],
+        )?;
         tx.execute("INSERT INTO events VALUES ('dup-ev-1','run-dup',1,'p')", [])?;
         tx.execute("INSERT INTO outbox VALUES ('dup-ob-1','run-dup','p')", [])?;
-        tx.execute("INSERT INTO receipts VALUES ('actor-1','cmd-1',?,?)", params![hash, rev])?;
+        tx.execute(
+            "INSERT INTO receipts VALUES ('actor-1','cmd-1',?,?)",
+            params![hash, rev],
+        )?;
         tx.commit()?;
         Ok("committed".to_string())
     };
     let r1 = commit(&mut conn, "hash-A", 1)?;
     let r2 = commit(&mut conn, "hash-A", 1)?;
     let r3 = commit(&mut conn, "hash-B", 2)?;
-    let receipt_count = scalar_i64(&conn, "SELECT COUNT(*) FROM receipts WHERE actor='actor-1' AND command_id='cmd-1'")?;
-    let stored_hash = scalar_string(&conn, "SELECT payload_hash FROM receipts WHERE actor='actor-1' AND command_id='cmd-1'")?;
-    let rev = scalar_i64(&conn, "SELECT revision FROM snapshots WHERE run_id='run-dup'")?;
-    let ok = r1 == "committed" && r2 == "duplicate-same" && r3 == "conflict"
-        && receipt_count == 1 && stored_hash == "hash-A" && rev == 1;
+    let receipt_count = scalar_i64(
+        &conn,
+        "SELECT COUNT(*) FROM receipts WHERE actor='actor-1' AND command_id='cmd-1'",
+    )?;
+    let stored_hash = scalar_string(
+        &conn,
+        "SELECT payload_hash FROM receipts WHERE actor='actor-1' AND command_id='cmd-1'",
+    )?;
+    let rev = scalar_i64(
+        &conn,
+        "SELECT revision FROM snapshots WHERE run_id='run-dup'",
+    )?;
+    let ok = r1 == "committed"
+        && r2 == "duplicate-same"
+        && r3 == "conflict"
+        && receipt_count == 1
+        && stored_hash == "hash-A"
+        && rev == 1;
     if !ok {
-        eprintln!("duplicate test: r1={} r2={} r3={} count={} hash={} rev={}", r1, r2, r3, receipt_count, stored_hash, rev);
+        eprintln!(
+            "duplicate test: r1={} r2={} r3={} count={} hash={} rev={}",
+            r1, r2, r3, receipt_count, stored_hash, rev
+        );
     }
     Ok(ok)
 }
@@ -170,8 +257,11 @@ fn run_lock_test(exe: &Path, dir: &Path) -> Result<bool, Box<dyn std::error::Err
     let db = dir.join("crash.duckdb");
     let marker = dir.join("lock-marker.txt");
     let mut holder = Command::new(exe)
-        .arg("holdlock").arg(&db).arg(&marker)
-        .stdout(Stdio::null()).stderr(Stdio::null())
+        .arg("holdlock")
+        .arg(&db)
+        .arg(&marker)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()?;
     if !wait_for_marker(&marker, "LOCK_HELD", Duration::from_secs(60)) {
         kill_child(&mut holder);
@@ -179,8 +269,10 @@ fn run_lock_test(exe: &Path, dir: &Path) -> Result<bool, Box<dyn std::error::Err
     }
     // A second process must not be able to write the same file concurrently.
     let mut tryer = Command::new(exe)
-        .arg("trywrite").arg(&db)
-        .stdout(Stdio::piped()).stderr(Stdio::piped())
+        .arg("trywrite")
+        .arg(&db)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()?;
     let start = Instant::now();
     let lock_ok;
@@ -188,7 +280,9 @@ fn run_lock_test(exe: &Path, dir: &Path) -> Result<bool, Box<dyn std::error::Err
         match tryer.try_wait()? {
             Some(status) => {
                 let mut out = String::new();
-                if let Some(mut so) = tryer.stdout.take() { let _ = so.read_to_string(&mut out); }
+                if let Some(mut so) = tryer.stdout.take() {
+                    let _ = so.read_to_string(&mut out);
+                }
                 eprintln!("trywrite status={} out={}", status, out.trim());
                 lock_ok = !out.contains("TRYWRITE_OK");
                 break;
@@ -223,7 +317,12 @@ fn run_io_failure_test(dir: &Path) -> Result<bool, Box<dyn std::error::Error>> {
     // The real DB must remain intact and readable after the failures.
     let db = dir.join("crash.duckdb");
     let intact = match Connection::open(&db) {
-        Ok(conn) => scalar_i64(&conn, "SELECT COUNT(*) FROM events WHERE event_id LIKE 'committed-%'").map(|n| n >= 1).unwrap_or(false),
+        Ok(conn) => scalar_i64(
+            &conn,
+            "SELECT COUNT(*) FROM events WHERE event_id LIKE 'committed-%'",
+        )
+        .map(|n| n >= 1)
+        .unwrap_or(false),
         Err(_) => false,
     };
     Ok(bad_failed && bad2 && intact)
@@ -250,7 +349,9 @@ struct PerfOutcome {
 }
 
 fn percentile(sorted: &[f64], p: f64) -> f64 {
-    if sorted.is_empty() { return 0.0; }
+    if sorted.is_empty() {
+        return 0.0;
+    }
     let idx = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
     sorted[idx.saturating_sub(1).min(sorted.len() - 1)]
 }
@@ -264,16 +365,26 @@ fn run_perf(dir: &Path) -> Result<PerfOutcome, Box<dyn std::error::Error>> {
         let tx = conn.transaction()?;
         {
             let mut s1 = tx.prepare("INSERT INTO snapshots VALUES (?, 0, 'seed')")?;
-            for r in 0..100i64 { s1.execute(params![format!("run-{}", r)])?; }
+            for r in 0..100i64 {
+                s1.execute(params![format!("run-{}", r)])?;
+            }
             let mut s2 = tx.prepare("INSERT INTO task_meta VALUES (?, ?, ?)")?;
             for r in 0..100i64 {
                 for t in 0..100i64 {
-                    s2.execute(params![format!("run-{}", r), format!("task-{}", t), format!("task {} of run {}", t, r)])?;
+                    s2.execute(params![
+                        format!("run-{}", r),
+                        format!("task-{}", t),
+                        format!("task {} of run {}", t, r)
+                    ])?;
                 }
             }
             let mut s3 = tx.prepare("INSERT INTO events VALUES (?, ?, ?, 'seed')")?;
             for i in 0..100_000i64 {
-                s3.execute(params![format!("seed-ev-{}", i), format!("run-{}", i % 100), i])?;
+                s3.execute(params![
+                    format!("seed-ev-{}", i),
+                    format!("run-{}", i % 100),
+                    i
+                ])?;
             }
         }
         tx.commit()?;
@@ -294,20 +405,41 @@ fn run_perf(dir: &Path) -> Result<PerfOutcome, Box<dyn std::error::Error>> {
             let rev = 1000 + w.seq as i64;
             let res: Result<(), String> = (|| {
                 let tx = conn.transaction().map_err(|e| e.to_string())?;
-                tx.execute("UPDATE snapshots SET revision=?, state=? WHERE run_id=?",
-                    params![rev, format!("perf-{}", w.seq), format!("run-{}", w.run_idx)]).map_err(|e| e.to_string())?;
-                tx.execute("INSERT INTO events VALUES (?, ?, ?, 'perf')",
-                    params![format!("perf-ev-{}", w.seq), format!("run-{}", w.run_idx), 100000 + w.seq as i64]).map_err(|e| e.to_string())?;
-                tx.execute("INSERT INTO outbox VALUES (?, ?, 'perf')",
-                    params![format!("perf-ob-{}", w.seq), format!("run-{}", w.run_idx)]).map_err(|e| e.to_string())?;
-                tx.execute("INSERT INTO receipts VALUES ('perf-actor', ?, 'hash-perf', ?)",
-                    params![format!("perf-cmd-{}", w.seq), rev]).map_err(|e| e.to_string())?;
+                tx.execute(
+                    "UPDATE snapshots SET revision=?, state=? WHERE run_id=?",
+                    params![rev, format!("perf-{}", w.seq), format!("run-{}", w.run_idx)],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO events VALUES (?, ?, ?, 'perf')",
+                    params![
+                        format!("perf-ev-{}", w.seq),
+                        format!("run-{}", w.run_idx),
+                        100000 + w.seq as i64
+                    ],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO outbox VALUES (?, ?, 'perf')",
+                    params![format!("perf-ob-{}", w.seq), format!("run-{}", w.run_idx)],
+                )
+                .map_err(|e| e.to_string())?;
+                tx.execute(
+                    "INSERT INTO receipts VALUES ('perf-actor', ?, 'hash-perf', ?)",
+                    params![format!("perf-cmd-{}", w.seq), rev],
+                )
+                .map_err(|e| e.to_string())?;
                 tx.commit().map_err(|e| e.to_string())?;
                 Ok(())
             })();
             match res {
-                Ok(()) => { done += 1; let _ = w.respond.send(Ok(w.sent_at.elapsed())); }
-                Err(e) => { let _ = w.respond.send(Err(e)); }
+                Ok(()) => {
+                    done += 1;
+                    let _ = w.respond.send(Ok(w.sent_at.elapsed()));
+                }
+                Err(e) => {
+                    let _ = w.respond.send(Err(e));
+                }
             }
         }
         Ok(done)
@@ -327,7 +459,14 @@ fn run_perf(dir: &Path) -> Result<PerfOutcome, Box<dyn std::error::Error>> {
                     let mut stmt = conn.prepare("SELECT state FROM snapshots WHERE run_id=?")?;
                     stmt.query_row(params![format!("run-{}", n % 100)], |r| r.get(0))
                 })();
-                match q { Ok(_) => { rc.fetch_add(1, Ordering::SeqCst); }, Err(_) => { rf.fetch_add(1, Ordering::SeqCst); } }
+                match q {
+                    Ok(_) => {
+                        rc.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(_) => {
+                        rf.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
                 n += 1;
                 std::thread::sleep(Duration::from_millis(200));
             }
@@ -347,8 +486,16 @@ fn run_perf(dir: &Path) -> Result<PerfOutcome, Box<dyn std::error::Error>> {
             while Instant::now() < deadline {
                 let seq = seq_counter.fetch_add(1, Ordering::SeqCst);
                 let (rtx, rrx) = mpsc::channel();
-                let w = Work { seq, run_idx: (seq % 100) as i64, sent_at: Instant::now(), respond: rtx };
-                if tx.send(w).is_err() { errs += 1; break; }
+                let w = Work {
+                    seq,
+                    run_idx: (seq % 100) as i64,
+                    sent_at: Instant::now(),
+                    respond: rtx,
+                };
+                if tx.send(w).is_err() {
+                    errs += 1;
+                    break;
+                }
                 match rrx.recv() {
                     Ok(Ok(d)) => lat.push(d.as_secs_f64() * 1000.0),
                     _ => errs += 1,
@@ -378,11 +525,21 @@ fn run_perf(dir: &Path) -> Result<PerfOutcome, Box<dyn std::error::Error>> {
     let writes_completed = all_lat.len() as u64;
     // Verify durability: every acked write is present exactly once.
     let (receipts_n, events_n) = {
-        (scalar_i64(&base_conn, "SELECT COUNT(*) FROM receipts WHERE command_id LIKE 'perf-cmd-%'")?,
-         scalar_i64(&base_conn, "SELECT COUNT(*) FROM events WHERE event_id LIKE 'perf-ev-%'")?)
+        (
+            scalar_i64(
+                &base_conn,
+                "SELECT COUNT(*) FROM receipts WHERE command_id LIKE 'perf-cmd-%'",
+            )?,
+            scalar_i64(
+                &base_conn,
+                "SELECT COUNT(*) FROM events WHERE event_id LIKE 'perf-ev-%'",
+            )?,
+        )
     };
-    let zero_lost = total_errs == 0 && writer_done == writes_completed
-        && receipts_n as u64 == writes_completed && events_n as u64 == writes_completed
+    let zero_lost = total_errs == 0
+        && writer_done == writes_completed
+        && receipts_n as u64 == writes_completed
+        && events_n as u64 == writes_completed
         && writes_sent == writes_completed;
     let rc = reads_completed.load(Ordering::SeqCst);
     let rf = reads_failed.load(Ordering::SeqCst);
@@ -402,7 +559,9 @@ fn run_perf(dir: &Path) -> Result<PerfOutcome, Box<dyn std::error::Error>> {
 }
 
 fn hardware_string() -> String {
-    if let Ok(h) = std::env::var("GATE_HARDWARE") { return h; }
+    if let Ok(h) = std::env::var("GATE_HARDWARE") {
+        return h;
+    }
     let cpu = std::env::var("PROCESSOR_IDENTIFIER").unwrap_or_else(|_| "unknown CPU".to_string());
     let cores = std::env::var("NUMBER_OF_PROCESSORS").unwrap_or_else(|_| "?".to_string());
     format!("{}; {} logical cores; target x86_64-pc-windows-gnu; filesystem: workspace local disk (see validation doc)", cpu, cores)
@@ -456,19 +615,33 @@ fn main() {
     }
     let run = (|| -> Result<GateReport, Box<dyn std::error::Error>> {
         let (atomicity_ok, recovery_ok) = run_crash_cycles(&exe, &dir)?;
-        eprintln!("crash cycles done atomicity={} recovery={}", atomicity_ok, recovery_ok);
+        eprintln!(
+            "crash cycles done atomicity={} recovery={}",
+            atomicity_ok, recovery_ok
+        );
         let duplicate_ok = run_duplicate_test(&dir)?;
         let lock_ok = run_lock_test(&exe, &dir)?;
         let io_failure_ok = run_io_failure_test(&dir)?;
-        eprintln!("duplicate={} lock={} io={}", duplicate_ok, lock_ok, io_failure_ok);
+        eprintln!(
+            "duplicate={} lock={} io={}",
+            duplicate_ok, lock_ok, io_failure_ok
+        );
         let perf = run_perf(&dir)?;
         let version = {
             let conn = Connection::open(dir.join("perf.duckdb"))?;
             scalar_string(&conn, "SELECT version()").unwrap_or_else(|_| "unknown".to_string())
         };
-        let gate_pass = atomicity_ok && recovery_ok && duplicate_ok && lock_ok && io_failure_ok
-            && perf.zero_lost_ack && perf.starvation_ok && perf.reads_ok
-            && perf.p95_ms <= 100.0 && perf.p99_ms <= 500.0 && perf.sustained_writes_per_s >= 25.0;
+        let gate_pass = atomicity_ok
+            && recovery_ok
+            && duplicate_ok
+            && lock_ok
+            && io_failure_ok
+            && perf.zero_lost_ack
+            && perf.starvation_ok
+            && perf.reads_ok
+            && perf.p95_ms <= 100.0
+            && perf.p99_ms <= 500.0
+            && perf.sustained_writes_per_s >= 25.0;
         Ok(GateReport {
             atomicity_ok,
             recovery_ok,
@@ -504,5 +677,3 @@ fn main() {
         }
     }
 }
-
-

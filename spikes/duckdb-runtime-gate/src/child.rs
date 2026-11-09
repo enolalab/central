@@ -4,7 +4,11 @@ use std::io::Write;
 use std::path::Path;
 
 pub fn append_marker(marker_path: &Path, line: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(marker_path) {
+    if let Ok(mut f) = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(marker_path)
+    {
         let _ = writeln!(f, "{}", line);
         let _ = f.flush();
         let _ = f.sync_all();
@@ -22,7 +26,11 @@ pub fn init_schema(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> 
     Ok(())
 }
 
-pub fn run_child(db_path: &Path, cycle: i64, marker_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run_child(
+    db_path: &Path,
+    cycle: i64,
+    marker_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut conn = Connection::open(db_path)?;
     init_schema(&conn)?;
     // Committed transaction: snapshot + event + outbox + receipt atomically.
@@ -34,11 +42,18 @@ pub fn run_child(db_path: &Path, cycle: i64, marker_path: &Path) -> Result<(), B
         )?;
         tx.execute(
             "INSERT INTO events VALUES (?, 'crash-run', ?, ?)",
-            params![format!("committed-{}", cycle), cycle, format!("committed-payload-{}", cycle)],
+            params![
+                format!("committed-{}", cycle),
+                cycle,
+                format!("committed-payload-{}", cycle)
+            ],
         )?;
         tx.execute(
             "INSERT INTO outbox VALUES (?, 'crash-run', ?)",
-            params![format!("committed-{}", cycle), format!("committed-payload-{}", cycle)],
+            params![
+                format!("committed-{}", cycle),
+                format!("committed-payload-{}", cycle)
+            ],
         )?;
         tx.execute(
             "INSERT INTO receipts VALUES ('crash-actor', ?, 'hash-committed', ?)",
@@ -56,11 +71,18 @@ pub fn run_child(db_path: &Path, cycle: i64, marker_path: &Path) -> Result<(), B
         )?;
         tx.execute(
             "INSERT INTO events VALUES (?, 'crash-run', ?, ?)",
-            params![format!("uncommitted-{}", cycle), cycle, format!("uncommitted-payload-{}", cycle)],
+            params![
+                format!("uncommitted-{}", cycle),
+                cycle,
+                format!("uncommitted-payload-{}", cycle)
+            ],
         )?;
         tx.execute(
             "INSERT INTO outbox VALUES (?, 'crash-run', ?)",
-            params![format!("uncommitted-{}", cycle), format!("uncommitted-payload-{}", cycle)],
+            params![
+                format!("uncommitted-{}", cycle),
+                format!("uncommitted-payload-{}", cycle)
+            ],
         )?;
         tx.execute(
             "INSERT INTO receipts VALUES ('crash-actor', ?, 'hash-uncommitted', ?)",
