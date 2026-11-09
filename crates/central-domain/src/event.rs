@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    quality::QualityDecision, ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, RunId, TaskId,
-    Timestamp, VerificationOutcome,
+    quality::QualityDecision, ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, ProfileId,
+    RunId, TaskId, Timestamp, VerificationOutcome,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +115,55 @@ pub enum Event {
     AttemptFailed {
         run_id: RunId,
         attempt_id: AttemptId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A failed task reopened for recovery after a refused or
+    /// retry-exhausted send.
+    TaskReopened {
+        run_id: RunId,
+        task: TaskId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One safe retry deferred to a virtual-clock deadline.
+    AttemptRetryDeferred {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        not_before: Timestamp,
+        retries_used: u32,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// The run's shared limits were set (actor recorded for audit).
+    LimitsSet {
+        run_id: RunId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One usage report folded into the shared ledger.
+    UsageReconciled {
+        run_id: RunId,
+        dedup_key: String,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One missing-final entry resolved by explicit user decision.
+    UsageGapResolved {
+        run_id: RunId,
+        missing_key: String,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A quota/auth fallback: the old attempt confirmed stopped, the new
+    /// attempt continuing on the fallback profile. This event is the
+    /// durable user notification.
+    FallbackTaken {
+        run_id: RunId,
+        task: TaskId,
+        old_attempt: AttemptId,
+        new_attempt: AttemptId,
+        profile: ProfileId,
         by: ActorId,
         at: Timestamp,
     },

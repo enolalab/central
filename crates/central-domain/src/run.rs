@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActorId, ArtifactId, AttemptId, ContentHash, PlanDocumentV1, PlanHash, ProfileId, Revision,
-    RunId, TaskId, TaskKind, Timestamp, VerifySpec,
+    ActorId, ArtifactId, AttemptId, ContentHash, MissingUsage, PlanDocumentV1, PlanHash, ProfileId,
+    Revision, RunId, TaskId, TaskKind, Timestamp, UsageAuditEntry, UsageLimits, VerifySpec,
 };
 
 pub const RUN_STATE_VERSION: u32 = 1;
@@ -156,6 +156,40 @@ pub struct UsageLedger {
     pub total_tokens: u64,
     pub total_cost_minor: Option<u64>,
     pub unknown: bool,
+    /// Confirmed finals only. Gap resolutions and estimates never land here.
+    #[serde(default)]
+    pub observed_tokens: u64,
+    /// Vendor estimates only; never converted into observed.
+    #[serde(default)]
+    pub estimated_tokens: u64,
+    #[serde(default)]
+    pub observed_cost_minor: u64,
+    /// Dedup keys of every counted or parked report.
+    #[serde(default)]
+    pub seen_events: BTreeSet<String>,
+    /// Per-stream cumulative high-water marks: replays and late lower
+    /// figures never reduce the known totals.
+    #[serde(default)]
+    pub cumulative_high_water: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub cumulative_cost_high_water: BTreeMap<String, u64>,
+    /// Live cost with no final yet (keyed by live key). Ongoing cost,
+    /// never a fabricated total.
+    #[serde(default)]
+    pub in_flight: BTreeMap<String, MissingUsage>,
+    /// Finals that never arrived (keyed by dedup key). Non-empty keeps
+    /// the ledger unknown until evidence or audited resolution.
+    #[serde(default)]
+    pub missing_final: BTreeMap<String, MissingUsage>,
+    #[serde(default)]
+    pub limits: UsageLimits,
+    /// When the current limit window started (set by the first
+    /// `SetLimits` that leaves it unset).
+    #[serde(default)]
+    pub window_started_at: Option<Timestamp>,
+    /// Audited user gap resolutions, newest last.
+    #[serde(default)]
+    pub audit: Vec<UsageAuditEntry>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -209,6 +243,14 @@ pub struct RunState {
     /// Written by a `Repair` verdict, consumed by `QueueRepairAttempt`.
     #[serde(default)]
     pub repair_base: BTreeMap<TaskId, AttemptId>,
+    /// Safe-retry bookkeeping per attempt (P3/T3 owns it): how many
+    /// `DefinitelyNotSent` retries the attempt already used.
+    #[serde(default)]
+    pub retry_used: BTreeMap<AttemptId, u32>,
+    /// Earliest virtual-clock time the next safe retry may send. Queued
+    /// attempts at or past this time are due; earlier ones wait.
+    #[serde(default)]
+    pub retry_not_before: BTreeMap<AttemptId, Timestamp>,
     /// Repair chain: each repair attempt links to the predecessor attempt
     /// whose candidate it repairs. Append-only; a repair never rewrites
     /// the attempt it chains from.
@@ -242,6 +284,8 @@ impl RunState {
             attempt_sessions: BTreeMap::new(),
             verification_disputes: BTreeMap::new(),
             repair_base: BTreeMap::new(),
+            retry_used: BTreeMap::new(),
+            retry_not_before: BTreeMap::new(),
             attempt_predecessor: BTreeMap::new(),
         }
     }

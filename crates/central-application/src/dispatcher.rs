@@ -1,32 +1,41 @@
-//! Attempt dispatch over the agent gateway (P3 Task 1).
+//! Attempt dispatch over the agent gateway (P3 Task 1, budget/retry/
+//! fallback in P3 Task 3).
 //!
-//! [`Dispatcher::dispatch_queued`] sends every `Queued` attempt once: it
-//! reloads the run, rechecks the control/hold/plan/capability/budget gate,
-//! claims the attempt with `StartDispatch` (CAS), calls the gateway, and
-//! records the outcome — `Running` with its session binding, `UnknownOutcome`
-//! without resending, back to `Queued` when definitely unsent, or `Failed`
-//! when the harness refuses the turn.
+//! [`Dispatcher::dispatch_queued`] sends every due `Queued` attempt once:
+//! it reloads the run, rechecks the control/hold/plan/capability/budget
+//! gate (including the shared admission gate and each attempt's retry
+//! backoff deadline), claims the attempt with `StartDispatch` (CAS),
+//! calls the gateway, and records the outcome — `Running` with its
+//! session binding, `UnknownOutcome` without resending (never retried),
+//! a deferred `Queued` with backoff when definitely unsent (bounded to
+//! the retry policy), `Failed` when the harness refuses the turn, or a
+//! profile-fallback continuation when quota/auth refuses it.
 //!
 //! No store transaction is ever held across a gateway call: the state is
 //! loaded, the gateway is awaited with nothing held, and the outcome is
 //! committed afterwards. Two racing dispatchers cannot double-send: the
 //! `StartDispatch` compare-and-swap admits exactly one sender per attempt.
 //!
-//! Budget here means the run holds (`BudgetExceeded`/`UsageUnknown`); the
-//! shared ledger and its limits arrive with P3/T3. Capability means the
-//! harness still serves the attempt's resolved profile and model; full
-//! layer resolution and fallback chains belong to P2/T2 and P3/T3.
+//! Budget here means the shared ledger gate: `BudgetExceeded` or
+//! `UsageUnknown` holds (plus the live admission check), which close the
+//! gate for every role including retries and fallbacks. Capability means
+//! the harness still serves the attempt's resolved profile and model.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use central_domain::{
-    Actor, AttemptId, AttemptSession, Command, CommandEnvelope, RunId, Task, TaskId, TaskStatus,
+    admission, classify_rejection, failure_for_rejection, Actor, Admission, AttemptId,
+    AttemptSession, Command, CommandEnvelope, RetryPolicy, RunId, Task, TaskId, TaskStatus,
+    WorkRequest, WorkRole,
 };
 
 use crate::contracts::{AppError, DispatchError, DispatchSummary, OpenSession, SendTurn};
+use crate::fallback::{choose_fallback, select_fallback, FallbackOverrides};
 use crate::ports::{AgentGateway, Clock, IdSource, Store};
-use crate::scheduler::ProfileResolver;
+use crate::retries::RetryAction;
+use crate::retries::{classify_open, classify_send, retries_used, retry_due, retry_not_before};
+use crate::scheduler::{ProfileResolver, DEFAULT_MAX_PARALLEL};
 use crate::Runtime;
 
 /// Sends queued attempts through the harness, one guarded attempt at a time.
@@ -37,6 +46,9 @@ pub struct Dispatcher {
     agent: Arc<dyn AgentGateway>,
     resolver: Arc<ProfileResolver>,
     resources: BTreeMap<TaskId, Vec<String>>,
+    fallbacks: Arc<FallbackOverrides>,
+    retry_policy: RetryPolicy,
+    max_parallel: usize,
     actor: Actor,
 }
 
@@ -57,8 +69,30 @@ impl Dispatcher {
             agent,
             resolver,
             resources,
+            fallbacks: Arc::new(FallbackOverrides::default()),
+            retry_policy: RetryPolicy::default(),
+            max_parallel: DEFAULT_MAX_PARALLEL,
             actor,
         }
+    }
+
+    /// Share the scheduler's fallback state (chosen profiles plus the
+    /// registry the fallback chain resolves against).
+    pub fn with_fallbacks(mut self, fallbacks: Arc<FallbackOverrides>) -> Self {
+        self.fallbacks = fallbacks;
+        self
+    }
+
+    /// Bound safe retries (default: 3 retries at 2s/10s/30s).
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
+    }
+
+    /// Concurrency bound for attempts queued by fallback handling.
+    pub fn with_max_parallel(mut self, max_parallel: usize) -> Self {
+        self.max_parallel = max_parallel;
+        self
     }
 
     fn runtime_for(&self, run_id: RunId) -> Runtime {
@@ -123,10 +157,23 @@ impl Dispatcher {
         }
         // Deterministic dispatch order: task first, then attempt.
         queued.sort();
-        // The gate is closed while the run is not Running or while any
-        // hold (budget unknown, budget exceeded, ...) is set: running
+        // The gate is closed while the run is not Running, while any
+        // hold is set, or while the shared budget admission holds: running
         // attempts continue, nothing new is sent.
-        if state.control != central_domain::RunControl::Running || !state.holds.is_empty() {
+        let budget_held = matches!(
+            admission(
+                &state,
+                &WorkRequest {
+                    role: WorkRole::Worker
+                },
+                self.clock.now()
+            ),
+            Admission::Held(_)
+        );
+        if state.control != central_domain::RunControl::Running
+            || !state.holds.is_empty()
+            || budget_held
+        {
             return Ok(DispatchSummary {
                 dispatched: 0,
                 unknown: 0,
@@ -177,7 +224,26 @@ impl Dispatcher {
             Some(task) => task.clone(),
             None => return Ok(()),
         };
+        // A deferred safe retry is not due yet: leave it queued and
+        // let a later tick (past the virtual-clock deadline) send it.
+        // The end-of-scan recount reports it as still pending, and no
+        // real sleep is ever taken.
+        if !retry_due(&state, attempt_id, self.clock.now()) {
+            return Ok(());
+        }
         if state.control != central_domain::RunControl::Running || !state.holds.is_empty() {
+            return Ok(());
+        }
+        if matches!(
+            admission(
+                &state,
+                &WorkRequest {
+                    role: WorkRole::Worker
+                },
+                self.clock.now()
+            ),
+            Admission::Held(_)
+        ) {
             return Ok(());
         }
         if state.active_plan.as_ref() != Some(&task.plan_hash) || task.status != TaskStatus::Running
@@ -257,31 +323,40 @@ impl Dispatcher {
             .await
     }
 
-    /// An `open` failure happens before any turn exists: capability and
-    /// request errors are definitive, transport errors retry later.
+    /// An `open` failure happens before any turn exists: quota/auth
+    /// failures take the fallback chain, safe transport losses defer a
+    /// bounded retry, and capability/request errors are definitive.
     async fn on_open_error(
         &self,
         run_id: RunId,
         attempt_id: AttemptId,
         error: AppError,
     ) -> Result<(), AppError> {
-        let definitive = matches!(
-            error,
-            AppError::Capability(_)
-                | AppError::Validation(_)
-                | AppError::Forbidden(_)
-                | AppError::NotFound(_)
-        );
-        let command = if definitive {
-            Command::AttemptFailed {
-                attempt: attempt_id,
+        match classify_open(&error) {
+            RetryAction::Fallback => {
+                self.run_fallback(run_id, attempt_id, &error.to_string())
+                    .await
             }
-        } else {
-            Command::RequeueAttempt {
-                attempt: attempt_id,
+            RetryAction::RetryNotSent => self.defer_or_fail(run_id, attempt_id).await,
+            RetryAction::NeverRetryUnknown | RetryAction::Park => {
+                self.fail_attempt(run_id, attempt_id).await
             }
-        };
-        match self.execute_on(run_id, command).await {
+        }
+    }
+
+    /// Record a terminal refusal. The task parks as failed too; recovery
+    /// is explicit through `ReopenTask`, so the refusal stays recoverable
+    /// without ever auto-retrying.
+    async fn fail_attempt(&self, run_id: RunId, attempt_id: AttemptId) -> Result<(), AppError> {
+        match self
+            .execute_on(
+                run_id,
+                Command::AttemptFailed {
+                    attempt: attempt_id,
+                },
+            )
+            .await
+        {
             Ok(_) => Ok(()),
             // A stop raced the failure: the attempt is reconciling now,
             // which already owns the outcome.
@@ -290,9 +365,162 @@ impl Dispatcher {
         }
     }
 
+    /// Defer one safe retry with virtual-clock backoff, or park the
+    /// attempt as failed (recoverably) when the retry budget is
+    /// exhausted. Never sleeps: the deadline is enforced by the
+    /// dispatch gate on later ticks.
+    async fn defer_or_fail(&self, run_id: RunId, attempt_id: AttemptId) -> Result<(), AppError> {
+        let Some(state) = self.store.load(run_id).await? else {
+            return Err(AppError::NotFound(format!("run {run_id} not found")));
+        };
+        let used = retries_used(&state, attempt_id);
+        let now = self.clock.now();
+        let command = match retry_not_before(&self.retry_policy, used, now) {
+            Some(not_before) => Command::DeferRetry {
+                attempt: attempt_id,
+                not_before,
+            },
+            // Exhausted: park like a refused send; `ReopenTask`
+            // recovers it explicitly.
+            None => Command::AttemptFailed {
+                attempt: attempt_id,
+            },
+        };
+        match self.execute_on(run_id, command).await {
+            Ok(_) => Ok(()),
+            // A stop raced the deferral: reconciling owns the outcome.
+            Err(AppError::Conflict(_)) => Ok(()),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Quota/auth fallback: confirm the old attempt stopped, then open
+    /// one new attempt on the first chain candidate that meets harness
+    /// capability without raising permissions, and record the decision
+    /// durably as the user notification. A held or exhausted budget
+    /// opens zero new attempts; an unresolvable chain parks quietly.
+    async fn run_fallback(
+        &self,
+        run_id: RunId,
+        attempt_id: AttemptId,
+        reason: &str,
+    ) -> Result<(), AppError> {
+        let Some(state) = self.store.load(run_id).await? else {
+            return Err(AppError::NotFound(format!("run {run_id} not found")));
+        };
+        let attempt = match state.attempts.get(&attempt_id) {
+            Some(attempt) => attempt.clone(),
+            None => return Ok(()),
+        };
+        let task = match state.tasks.get(&attempt.task_id) {
+            Some(task) => task.clone(),
+            None => return Ok(()),
+        };
+        let current = match (self.resolver)(&task) {
+            Some(profile) => profile,
+            // No servable profile: park without touching the chain.
+            None => return self.fail_attempt(run_id, attempt_id).await,
+        };
+        let capabilities = match self.agent.capabilities(&current).await {
+            Ok(capabilities) => capabilities,
+            Err(_) => return self.fail_attempt(run_id, attempt_id).await,
+        };
+        // Chain gate first (quota/auth with a usable chain), then
+        // the capability/permission selection: a candidate must meet
+        // the harness and never raise permissions, or the attempt parks
+        // without opening anything.
+        let failure = failure_for_rejection(classify_rejection(reason));
+        if choose_fallback(&current, &failure, &capabilities).is_none() {
+            return self.fail_attempt(run_id, attempt_id).await;
+        }
+        let registry = self.fallbacks.registry_snapshot();
+        let candidate = match select_fallback(&current, &registry, &capabilities) {
+            Some(candidate) => candidate,
+            None => return self.fail_attempt(run_id, attempt_id).await,
+        };
+        // Confirmed old stop first: the refused attempt is terminal and
+        // releases its claims before anything new opens.
+        self.fail_attempt(run_id, attempt_id).await?;
+        // No separate budget for fallbacks: the shared gate decides.
+        // A held or exhausted budget opens zero new attempts.
+        let Some(fresh) = self.store.load(run_id).await? else {
+            return Err(AppError::NotFound(format!(
+                "run {run_id} vanished mid-fallback"
+            )));
+        };
+        if matches!(
+            admission(
+                &fresh,
+                &WorkRequest {
+                    role: WorkRole::Fallback
+                },
+                self.clock.now()
+            ),
+            Admission::Held(_)
+        ) {
+            return Ok(());
+        }
+        // Freeze the fallback profile for the new attempt, then reopen
+        // the parked task and queue its continuation on the old input.
+        // Cached inputs are never rewritten: the new attempt reuses the
+        // stored input verbatim.
+        self.fallbacks.set(task.id, candidate.clone());
+        match self
+            .execute_on(run_id, Command::ReopenTask { task: task.id })
+            .await
+        {
+            Ok(_) => {}
+            Err(AppError::Conflict(_)) => return Ok(()),
+            Err(other) => return Err(other),
+        }
+        let input = fresh
+            .attempt_inputs
+            .get(&attempt_id)
+            .cloned()
+            .unwrap_or_default();
+        let resources = self.resources.get(&task.id).cloned().unwrap_or_default();
+        let new_attempt = self.ids.next_attempt_id();
+        match self
+            .execute_on(
+                run_id,
+                Command::QueueAttempt {
+                    attempt: new_attempt,
+                    task: task.id,
+                    input,
+                    resources,
+                    max_parallel: self.max_parallel,
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(AppError::Conflict(_)) => return Ok(()),
+            Err(other) => return Err(other),
+        }
+        match self
+            .execute_on(
+                run_id,
+                Command::NoteFallback {
+                    task: task.id,
+                    old_attempt: attempt_id,
+                    new_attempt,
+                    profile_id: candidate.id,
+                    reason: format!("quota or auth refusal on attempt {attempt_id}: {reason}"),
+                },
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(AppError::Conflict(_)) => Ok(()),
+            Err(other) => Err(other),
+        }
+    }
+
     /// Record what the send proved. `Ok` means running with a session
-    /// binding; ambiguity parks the attempt without resending; a refused
-    /// turn fails it; a definitely-unsent turn goes back to queued.
+    /// binding; ambiguity parks the attempt without resending (never
+    /// retried); a definitely-unsent turn defers a bounded retry; a
+    /// quota/auth refusal takes the fallback chain; any other refusal
+    /// fails the attempt recoverably.
     async fn on_send_outcome(
         &self,
         run_id: RunId,
@@ -348,33 +576,12 @@ impl Dispatcher {
                 }
             }
             Err(DispatchError::DefinitelyNotSent(_)) => {
-                match self
-                    .execute_on(
-                        run_id,
-                        Command::RequeueAttempt {
-                            attempt: attempt_id,
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => Ok(()),
-                    Err(AppError::Conflict(_)) => Ok(()),
-                    Err(other) => Err(other),
-                }
+                self.defer_or_fail(run_id, attempt_id).await
             }
-            Err(DispatchError::Rejected(_)) => {
-                match self
-                    .execute_on(
-                        run_id,
-                        Command::AttemptFailed {
-                            attempt: attempt_id,
-                        },
-                    )
-                    .await
-                {
-                    Ok(_) => Ok(()),
-                    Err(AppError::Conflict(_)) => Ok(()),
-                    Err(other) => Err(other),
+            Err(DispatchError::Rejected(message)) => {
+                match classify_send(&DispatchError::Rejected(message.clone())) {
+                    RetryAction::Fallback => self.run_fallback(run_id, attempt_id, &message).await,
+                    _ => self.fail_attempt(run_id, attempt_id).await,
                 }
             }
         }

@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     quality::VerificationReport, ActorId, AnswerPayload, AttemptId, AttemptSession, CommandId,
-    ContentHash, InboxKey, InboxRequest, Observation, PlanDocumentV1, PlanHash, Revision, TaskId,
+    ContentHash, InboxKey, InboxRequest, Observation, PlanDocumentV1, PlanHash, ProfileId,
+    Revision, TaskId, Timestamp, UsageLimits, UsageObservation,
 };
 
 /// Internal identity kind. The actor is derived from auth/session mapping,
@@ -117,9 +118,55 @@ pub enum Command {
         attempt: AttemptId,
     },
     /// The harness definitively refused the turn: terminal, releases
-    /// the attempt's resource claims.
+    /// the attempt's resource claims. The task parks as failed too;
+    /// recovery is explicit through `ReopenTask` (the retry policy owns
+    /// reopening), so a refused send is never silently dropped and never
+    /// auto-retried.
     AttemptFailed {
         attempt: AttemptId,
+    },
+    /// Reopen a task parked as failed by a refused (or retry-exhausted)
+    /// send so a retry-policy or user-driven recovery can queue a new
+    /// attempt. Refused sends stay recoverable before the P3 gate closes.
+    ReopenTask {
+        task: TaskId,
+    },
+    /// Defer one safe retry of a definitely-unsent attempt to a
+    /// virtual-clock deadline. Records the retry against the attempt's
+    /// bounded budget; an exhausted budget parks the attempt as failed
+    /// (recoverable via `ReopenTask`) instead of storming.
+    DeferRetry {
+        attempt: AttemptId,
+        not_before: Timestamp,
+    },
+    /// Set the run's shared count/token/time limits (plus the optional
+    /// user-configured monetary estimate cap). User only; the actor is
+    /// recorded as the limits' author for audit.
+    SetLimits {
+        limits: UsageLimits,
+    },
+    /// Fold one usage report into the shared ledger: observed totals,
+    /// estimates, live in-flight cost, or a missing final. User only.
+    ReconcileUsage {
+        observation: UsageObservation,
+    },
+    /// Resolve one missing-final entry by explicit user decision, with
+    /// an audit note. Releases the hold without converting anything
+    /// estimated or missing into observed usage. User only.
+    ResolveUsageGap {
+        missing_key: String,
+        note: String,
+    },
+    /// Record a profile-fallback decision durably: which quota/auth-hit
+    /// attempt stopped, which new attempt continues, and on what
+    /// profile. The notification readers (CLI/UI) consume this event;
+    /// the profile itself travels frozen with the new attempt.
+    NoteFallback {
+        task: TaskId,
+        old_attempt: AttemptId,
+        new_attempt: AttemptId,
+        profile_id: ProfileId,
+        reason: String,
     },
     /// Judge one independent verifier verdict against a task awaiting
     /// verification. Only a verifier (or the user, for a same-session

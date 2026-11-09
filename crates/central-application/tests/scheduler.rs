@@ -581,6 +581,7 @@ impl Harness {
 
 fn default_config() -> SchedulerConfig {
     SchedulerConfig {
+        retry_policy: central_domain::RetryPolicy::default(),
         max_parallel: 2,
         resources: BTreeMap::new(),
         poll_interval_ms: 5_000,
@@ -592,6 +593,7 @@ fn port_config(m: TaskId, n: TaskId) -> SchedulerConfig {
     resources.insert(m, vec!["port:5432".to_string()]);
     resources.insert(n, vec!["port:5432".to_string()]);
     SchedulerConfig {
+        retry_policy: central_domain::RetryPolicy::default(),
         max_parallel: 2,
         resources,
         poll_interval_ms: 5_000,

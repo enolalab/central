@@ -83,6 +83,21 @@ pub fn execute(cli: Cli) -> i32 {
         Commands::Plan { command } => plan(&state_dir, command),
         Commands::Result { command } => result(&state_dir, command),
         Commands::Handover { command } => handover_cmd(&state_dir, command),
+        Commands::Budget { run } => budget(&state_dir, run),
+        Commands::SetLimits {
+            run,
+            max_tokens,
+            max_cost_minor,
+            max_attempts,
+            max_duration_ms,
+        } => set_limits(
+            &state_dir,
+            run,
+            *max_tokens,
+            *max_cost_minor,
+            *max_attempts,
+            *max_duration_ms,
+        ),
         Commands::Pause { run } => simple(&state_dir, run, Command::Pause),
         Commands::Stop { run } => simple(&state_dir, run, Command::Stop),
         Commands::Resume { run } => simple(&state_dir, run, Command::Resume),
@@ -150,6 +165,68 @@ fn simple(state_dir: &Path, run: &RunId, command: Command) -> i32 {
         Err(message) => return fail(&message),
     };
     match send_command(&client, Some(run), command, Some(revision)) {
+        Ok(receipt) => {
+            print_json(&receipt);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Show the shared budget ledger of a run: limits, totals, unknown
+/// usage with its evidence, and the current holds.
+fn budget(state_dir: &Path, run: &RunId) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.get(&format!("/v1/runs/{run}")) {
+        Ok(view) => {
+            print_json(&serde_json::json!({
+                "run_id": run.to_string(),
+                "revision": view["state"]["revision"],
+                "usage": view["state"]["usage"],
+                "holds": view["state"]["holds"],
+            }));
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Set the run's shared limits. The daemon records the authenticated
+/// user as the limits' author for audit.
+fn set_limits(
+    state_dir: &Path,
+    run: &RunId,
+    max_tokens: Option<u64>,
+    max_cost_minor: Option<u64>,
+    max_attempts: Option<u64>,
+    max_duration_ms: Option<i64>,
+) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let revision = match current_revision(&client, run) {
+        Ok(revision) => revision,
+        Err(message) => return fail(&message),
+    };
+    match send_command(
+        &client,
+        Some(run),
+        Command::SetLimits {
+            limits: central_domain::UsageLimits {
+                max_tokens,
+                max_cost_minor,
+                max_attempts,
+                max_duration_ms,
+                extra_caps: Default::default(),
+                updated_by: None,
+            },
+        },
+        Some(revision),
+    ) {
         Ok(receipt) => {
             print_json(&receipt);
             0

@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod command;
 pub mod decision;
 pub mod dependency;
@@ -8,9 +9,15 @@ pub mod inbox;
 pub mod plan;
 pub mod profile;
 pub mod quality;
+pub mod retry;
 pub mod run;
 pub mod scheduling;
 
+pub use budget::{
+    admission, apply_usage, budget_exceeded, capped_metric, retry_used, sync_budget_holds,
+    usage_unknown_hold, Admission, MissingUsage, UsageAuditEntry, UsageFinality, UsageLimits,
+    UsageObservation, WorkRequest, WorkRole,
+};
 pub use command::{Actor, ActorKind, Command, CommandEnvelope};
 pub use decision::{decide, decide_envelope, Decision};
 pub use dependency::{
@@ -35,6 +42,10 @@ pub use profile::{
 };
 pub use quality::{
     check_report, criteria_hash_for, decide_quality, QualityDecision, VerificationReport,
+};
+pub use retry::{
+    classify_rejection, failure_for_rejection, next_retry_delay, Failure, RejectionKind,
+    RetryPolicy, DEFAULT_DELAYS_MS, MAX_RETRIES_DEFAULT,
 };
 pub use run::{
     Artifact, Attempt, AttemptSession, AttemptStatus, HoldReason, Observation, PlanRevision,

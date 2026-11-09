@@ -101,6 +101,29 @@ pub enum Commands {
         #[arg(long)]
         secret: Option<String>,
     },
+    /// Show the shared budget ledger of a run (limits, totals, unknown).
+    Budget {
+        #[arg(long)]
+        run: RunId,
+    },
+    /// Set the run's shared count/token/time limits (plus the optional
+    /// user-configured monetary estimate cap). User only.
+    SetLimits {
+        #[arg(long)]
+        run: RunId,
+        /// Maximum total tokens before new attempts hold.
+        #[arg(long)]
+        max_tokens: Option<u64>,
+        /// Maximum total cost in minor units before new attempts hold.
+        #[arg(long)]
+        max_cost_minor: Option<u64>,
+        /// Maximum total attempts before new attempts hold.
+        #[arg(long)]
+        max_attempts: Option<u64>,
+        /// Maximum window duration in ms before new attempts hold.
+        #[arg(long)]
+        max_duration_ms: Option<i64>,
+    },
     /// Pause a running run (in-flight attempts finish).
     Pause {
         #[arg(long)]

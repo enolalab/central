@@ -1,14 +1,17 @@
 pub mod artifacts;
 pub mod contracts;
 pub mod dispatcher;
+pub mod fallback;
 pub mod handover;
 pub mod inbox;
 pub mod leader;
 pub mod ports;
 pub mod profiles;
 pub mod quality_loop;
+pub mod retries;
 pub mod runtime;
 pub mod scheduler;
+pub mod usage;
 pub mod verification;
 
 pub use runtime::Runtime;

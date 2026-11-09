@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    blocking_dependencies, check_report, covering_attempt, decide_quality, inbox,
-    live_attempt_count, release_settled_claims, validate_plan, Actor, ActorKind, AnswerPayload,
-    Attempt, AttemptStatus, Command, CommandEnvelope, DomainError, Effect, Event, InboxEntry,
-    InboxKey, InboxKind, InboxOutcome, InboxStatus, PlanRevision, PlanStatus, QualityDecision,
-    RunControl, RunState, Task, TaskStatus, Timestamp,
+    admission, apply_usage, blocking_dependencies, check_report, covering_attempt, decide_quality,
+    inbox, live_attempt_count, release_settled_claims, retry_used, sync_budget_holds,
+    validate_plan, Actor, ActorKind, Admission, AnswerPayload, Attempt, AttemptStatus, Command,
+    CommandEnvelope, DomainError, Effect, Event, HoldReason, InboxEntry, InboxKey, InboxKind,
+    InboxOutcome, InboxStatus, PlanRevision, PlanStatus, QualityDecision, RunControl, RunState,
+    Task, TaskStatus, Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -681,6 +682,137 @@ pub fn decide(
             ))
         }
 
+        Command::ReopenTask { task } => reopen_task(state, actor, *task, now),
+
+        Command::DeferRetry {
+            attempt,
+            not_before,
+        } => defer_retry(state, actor, *attempt, *not_before, now),
+
+        Command::SetLimits { limits } => {
+            require_user(actor)?;
+            require_created(state)?;
+            limits.validate()?;
+            let mut next = state.clone();
+            let mut limits = limits.clone();
+            limits.updated_by = Some(actor.id);
+            next.usage.limits = limits;
+            if next.usage.window_started_at.is_none() {
+                next.usage.window_started_at = Some(now);
+            }
+            sync_budget_holds(&mut next, now);
+            Ok(finish(
+                next.clone(),
+                vec![Event::LimitsSet {
+                    run_id: next.id,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::ReconcileUsage { observation } => {
+            require_user(actor)?;
+            require_created(state)?;
+            let mut next = state.clone();
+            let changed = apply_usage(&mut next.usage, observation, now)?;
+            sync_budget_holds(&mut next, now);
+            let events = if changed {
+                vec![Event::UsageReconciled {
+                    run_id: next.id,
+                    dedup_key: observation.dedup_key(),
+                    by: actor.id,
+                    at: now,
+                }]
+            } else {
+                Vec::new()
+            };
+            Ok(finish(next.clone(), events, Vec::new()))
+        }
+
+        Command::ResolveUsageGap { missing_key, note } => {
+            require_user(actor)?;
+            require_created(state)?;
+            if note.trim().is_empty() {
+                return Err(DomainError::InvalidCommand(
+                    "a gap resolution needs a note for the audit trail".to_string(),
+                ));
+            }
+            let mut next = state.clone();
+            let pending = next
+                .usage
+                .missing_final
+                .remove(missing_key.as_str())
+                .ok_or_else(|| {
+                    DomainError::InvalidCommand(format!(
+                        "no missing usage entry for key {missing_key}"
+                    ))
+                })?;
+            // The missing figure stays missing: the audit records what was
+            // decided, never a fabricated observed total.
+            next.usage.audit.push(UsageAuditEntry {
+                missing_key: pending.key.clone(),
+                note: note.clone(),
+                by: actor.id,
+                at: now,
+                resolved_observed: false,
+            });
+            next.usage.unknown = !next.usage.missing_final.is_empty();
+            sync_budget_holds(&mut next, now);
+            Ok(finish(
+                next.clone(),
+                vec![Event::UsageGapResolved {
+                    run_id: next.id,
+                    missing_key: pending.key,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::NoteFallback {
+            task,
+            old_attempt,
+            new_attempt,
+            profile_id,
+            reason,
+        } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            if reason.trim().is_empty() {
+                return Err(DomainError::InvalidCommand(
+                    "a fallback needs a reason for the notification".to_string(),
+                ));
+            }
+            let old_task = state.attempts.get(old_attempt).map(|record| record.task_id);
+            let new_task = state.attempts.get(new_attempt).map(|record| record.task_id);
+            match (old_task, new_task) {
+                (Some(old), Some(new))
+                    if old == *task && new == *task && old_attempt != new_attempt => {}
+                _ => {
+                    return Err(DomainError::InvalidCommand(format!(
+                        "fallback attempts {old_attempt} -> {new_attempt} do not both belong to task {task}"
+                    )));
+                }
+            }
+            let next = state.clone();
+            Ok(finish(
+                next.clone(),
+                vec![Event::FallbackTaken {
+                    run_id: next.id,
+                    task: *task,
+                    old_attempt: *old_attempt,
+                    new_attempt: *new_attempt,
+                    profile: *profile_id,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
         Command::SubmitVerification {
             task,
             attempt,
@@ -944,6 +1076,7 @@ fn queue_repair_attempt(
             )));
         }
     }
+    budget_gate(state, WorkRole::Repair, now)?;
     let predecessor_task = state
         .attempts
         .get(&predecessor)
@@ -1038,6 +1171,141 @@ fn queue_repair_attempt(
     ))
 }
 
+/// Reopen a task parked as failed so a refused (or retry-exhausted)
+/// send stays recoverable. Only a failed task with no live or unknown
+/// attempt covering it may reopen; anything else is a conflict a later
+/// tick cannot fix by reopening.
+fn reopen_task(
+    state: &RunState,
+    actor: &Actor,
+    task: crate::TaskId,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user_or_system(actor)?;
+    require_created(state)?;
+    let task_state = state
+        .tasks
+        .get(&task)
+        .ok_or(DomainError::UnknownTask(task))?;
+    if task_state.status != TaskStatus::Failed {
+        return Err(DomainError::InvalidTransition(format!(
+            "task {task} is not failed (it is {:?}); only failed tasks reopen",
+            task_state.status,
+        )));
+    }
+    if let Some(covering) = covering_attempt(state, task) {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is already covered by attempt {covering}"
+        )));
+    }
+    let mut next = state.clone();
+    if let Some(record) = next.tasks.get_mut(&task) {
+        record.status = TaskStatus::Ready;
+    }
+    Ok(finish(
+        next.clone(),
+        vec![Event::TaskReopened {
+            run_id: next.id,
+            task,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+/// Defer one safe retry of a definitely-unsent attempt. The retry budget
+/// is bounded: an exhausted attempt parks as failed (recoverable via
+/// `ReopenTask`, same as a refused send) instead of retrying forever.
+fn defer_retry(
+    state: &RunState,
+    actor: &Actor,
+    attempt: crate::AttemptId,
+    not_before: Timestamp,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user_or_system(actor)?;
+    require_created(state)?;
+    if not_before < now {
+        return Err(DomainError::InvalidCommand(
+            "a deferred retry must wait until now or later".to_string(),
+        ));
+    }
+    let attempt_state = state
+        .attempts
+        .get(&attempt)
+        .map(|record| record.status)
+        .ok_or(DomainError::QueueConflict(format!(
+            "attempt {attempt} is unknown to this run"
+        )))?;
+    if attempt_state != AttemptStatus::Dispatching {
+        return Err(DomainError::QueueConflict(format!(
+            "attempt {attempt} is not waiting on a dispatch (it is {attempt_state:?})"
+        )));
+    }
+    let used = retry_used(state, attempt);
+    if used >= crate::MAX_RETRIES_DEFAULT {
+        // Retry budget exhausted: park recoverably, like a refused send.
+        let mut next = state.clone();
+        let task_id = next.attempts.get(&attempt).expect("checked above").task_id;
+        if let Some(record) = next.attempts.get_mut(&attempt) {
+            record.status = AttemptStatus::Failed;
+        }
+        if let Some(task) = next.tasks.get_mut(&task_id) {
+            task.status = TaskStatus::Failed;
+        }
+        release_settled_claims(&mut next);
+        return Ok(finish(
+            next.clone(),
+            vec![Event::AttemptFailed {
+                run_id: next.id,
+                attempt_id: attempt,
+                by: actor.id,
+                at: now,
+            }],
+            Vec::new(),
+        ));
+    }
+    let mut next = state.clone();
+    if let Some(record) = next.attempts.get_mut(&attempt) {
+        record.status = AttemptStatus::Queued;
+    }
+    next.retry_used.insert(attempt, used + 1);
+    next.retry_not_before.insert(attempt, not_before);
+    Ok(finish(
+        next.clone(),
+        vec![Event::AttemptRetryDeferred {
+            run_id: next.id,
+            attempt_id: attempt,
+            not_before,
+            retries_used: used + 1,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+/// The shared-budget gate every queue path enforces under the commit
+/// CAS: unknown usage (with cost limits) or an exceeded limit defers
+/// the attempt, including leader and verifier attempts.
+fn budget_gate(state: &RunState, role: WorkRole, now: Timestamp) -> Result<(), DomainError> {
+    match admission(state, &WorkRequest { role }, now) {
+        Admission::Allowed => Ok(()),
+        Admission::Held(HoldReason::BudgetExceeded) => Err(DomainError::QueueConflict(
+            "the shared budget is exhausted; running attempts finish, nothing new queues"
+                .to_string(),
+        )),
+        Admission::Held(HoldReason::UsageUnknown) => Err(DomainError::QueueConflict(
+            "usage is unknown and the run carries cost limits; reconcile or resolve the gap first"
+                .to_string(),
+        )),
+        Admission::Held(other) => Err(DomainError::QueueConflict(format!(
+            "the run is held ({other:?}); reconcile the hold first"
+        ))),
+    }
+}
+
 /// Queue one attempt: the full scheduler gate as a pure decision. Every
 /// refusal that a later tick could retry maps to [`DomainError::QueueConflict`];
 /// only loud misconfiguration (empty input, empty or duplicated resource
@@ -1091,6 +1359,7 @@ fn queue_attempt(
             task_state.status
         )));
     }
+    budget_gate(state, WorkRole::Worker, now)?;
     if state.attempts.contains_key(&attempt) {
         return Err(DomainError::QueueConflict(format!(
             "attempt {attempt} is already queued"

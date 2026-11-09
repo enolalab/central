@@ -18,13 +18,14 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use central_domain::{
-    dependencies_of, eligible_tasks, eligible_tasks_ignoring_gate, live_attempt_count,
-    verified_output, Actor, Command, CommandEnvelope, ResolvedProfile, RunId, RunState, Task,
-    TaskId,
+    admission, dependencies_of, eligible_tasks, eligible_tasks_ignoring_gate, live_attempt_count,
+    verified_output, Actor, Admission, Command, CommandEnvelope, ResolvedProfile, RetryPolicy,
+    RunId, RunState, Task, TaskId, WorkRequest, WorkRole,
 };
 
 use crate::contracts::{AppError, DispatchSummary};
 use crate::dispatcher::Dispatcher;
+use crate::fallback::FallbackOverrides;
 use crate::ports::{AgentGateway, Clock, IdSource, Store};
 use crate::Runtime;
 
@@ -41,12 +42,14 @@ pub const DEFAULT_POLL_INTERVAL_MS: i64 = 5_000;
 
 /// Static scheduling policy: the concurrency bound plus the named
 /// exclusive resources (`port:5432`, `db:test`, ...) each task needs.
-/// A task with no entry needs no exclusive resource.
+/// A task with no entry needs no exclusive resource. The safe-retry
+/// policy is the plan's configurable default (3 retries at 2s/10s/30s).
 #[derive(Clone, Debug)]
 pub struct SchedulerConfig {
     pub max_parallel: usize,
     pub resources: BTreeMap<TaskId, Vec<String>>,
     pub poll_interval_ms: i64,
+    pub retry_policy: RetryPolicy,
 }
 
 impl Default for SchedulerConfig {
@@ -55,6 +58,7 @@ impl Default for SchedulerConfig {
             max_parallel: DEFAULT_MAX_PARALLEL,
             resources: BTreeMap::new(),
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+            retry_policy: RetryPolicy::default(),
         }
     }
 }
@@ -64,6 +68,7 @@ impl SchedulerConfig {
     /// key or a duplicated key for one task would otherwise fail every
     /// queue attempt at dispatch time.
     pub fn validate(&self) -> Result<(), AppError> {
+        self.retry_policy.validate().map_err(AppError::from)?;
         for (task, keys) in &self.resources {
             let mut seen = std::collections::BTreeSet::new();
             for key in keys {
@@ -102,6 +107,7 @@ pub struct Scheduler {
     agent: Arc<dyn AgentGateway>,
     config: SchedulerConfig,
     resolver: Arc<ProfileResolver>,
+    fallbacks: Arc<FallbackOverrides>,
     actor: Actor,
 }
 
@@ -123,8 +129,29 @@ impl Scheduler {
             agent,
             config,
             resolver,
+            fallbacks: Arc::new(FallbackOverrides::default()),
             actor,
         })
+    }
+
+    /// Register the profile registry the fallback chain resolves
+    /// against. Without a registry no fallback can be selected and
+    /// quota/auth failures park instead of storming.
+    pub fn with_fallback_registry(
+        mut self,
+        registry: std::collections::BTreeMap<central_domain::ProfileId, ResolvedProfile>,
+    ) -> Self {
+        self.fallbacks = Arc::new(FallbackOverrides::new(registry));
+        self
+    }
+
+    /// The effective profile resolver: fallback profiles chosen by
+    /// quota/auth handling win over the base resolver for their task,
+    /// without rewriting the approved task definition.
+    fn effective_resolver(&self) -> Arc<ProfileResolver> {
+        let base = Arc::clone(&self.resolver);
+        let fallbacks = Arc::clone(&self.fallbacks);
+        Arc::new(move |task: &Task| fallbacks.get(task.id).or_else(|| base(task)))
     }
 
     pub fn config(&self) -> &SchedulerConfig {
@@ -147,10 +174,13 @@ impl Scheduler {
             Arc::clone(&self.clock),
             Arc::clone(&self.ids),
             Arc::clone(&self.agent),
-            Arc::clone(&self.resolver),
+            self.effective_resolver(),
             self.config.resources.clone(),
             self.actor.clone(),
         )
+        .with_fallbacks(Arc::clone(&self.fallbacks))
+        .with_retry_policy(self.config.retry_policy.clone())
+        .with_max_parallel(self.config.max_parallel)
     }
 
     /// Whether the daemon's periodic scan is due.
@@ -208,10 +238,27 @@ impl Scheduler {
             .load(run_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
-        if state.control != central_domain::RunControl::Running || !state.holds.is_empty() {
-            // The gate is closed (pause/stop/hold/awaiting resume): running
-            // attempts continue untouched, nothing new queues. Deferred
-            // counts the work the gate is holding back, not zero.
+        // The shared-budget gate closes alongside the control/holds
+        // gate: an unknown usage with cost limits, or an exhausted
+        // limit, holds every new attempt (leaders and verifiers
+        // included) while running attempts finish untouched.
+        let budget_held = matches!(
+            admission(
+                &state,
+                &WorkRequest {
+                    role: WorkRole::Worker
+                },
+                now
+            ),
+            Admission::Held(_)
+        );
+        if state.control != central_domain::RunControl::Running
+            || !state.holds.is_empty()
+            || budget_held
+        {
+            // The gate is closed (pause/stop/hold/budget/awaiting resume):
+            // running attempts continue untouched, nothing new queues.
+            // Deferred counts the work the gate is holding back, not zero.
             report.deferred = eligible_tasks_ignoring_gate(&state, now).len();
             return Ok(report);
         }
@@ -227,6 +274,19 @@ impl Scheduler {
                 .await?
                 .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
             if fresh.control != central_domain::RunControl::Running || !fresh.holds.is_empty() {
+                report.deferred += 1;
+                continue;
+            }
+            if matches!(
+                admission(
+                    &fresh,
+                    &WorkRequest {
+                        role: WorkRole::Worker
+                    },
+                    now
+                ),
+                Admission::Held(_)
+            ) {
                 report.deferred += 1;
                 continue;
             }
