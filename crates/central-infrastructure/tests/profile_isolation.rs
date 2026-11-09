@@ -6,7 +6,10 @@
 //! concurrent A/B resolutions must never mix model/config. Unobservable skill
 //! hashes are published as an explicit `None`, never fabricated.
 
+use std::sync::Arc;
+
 use central_application::contracts::Capabilities;
+use central_application::ports::AgentGateway;
 use central_application::profiles::{
     enforcement_for, may_dispatch, observe_skills, resolve_profile, CapabilityReport,
     FrozenAttemptProfile, SkillHasher,
@@ -15,6 +18,8 @@ use central_domain::profile::{
     CapabilitySupport, Enforcement, ProfileError, ProfileLayers, ProfilePatch,
 };
 use central_domain::{AttemptId, ContentHash, ProfileId, ResolvedProfile};
+use central_infrastructure::codex::{CodexConfig, CodexGateway};
+use central_infrastructure::process::OwnedProcessSupervisor;
 
 fn personal_profile() -> ResolvedProfile {
     ResolvedProfile {
@@ -189,4 +194,44 @@ fn unenforceable_capability_needs_acceptance() {
     let mut denied = denied;
     denied.accept_instruction_only();
     assert!(!may_dispatch(&denied));
+}
+
+/// The production gateway must never self-attest the requested model:
+/// `capabilities()` advertises only models surveyed from a real
+/// harness/config smoke, so `resolve_profile` against gateway capabilities
+/// with an unsurveyed model raises `ModelUnavailable` (no silent fallback).
+/// Portable: no process is spawned, only the capability report is queried.
+#[tokio::test]
+async fn gateway_capabilities_never_self_attest_unsurveyed_model() {
+    let profile = personal_profile();
+    let layers = layers_with_task_model(&profile.model);
+
+    let gateway = CodexGateway::new(
+        Arc::new(OwnedProcessSupervisor::new()),
+        CodexConfig::default(),
+    );
+    let caps = gateway.capabilities(&profile).await.expect("capabilities");
+    assert!(
+        !caps
+            .features
+            .iter()
+            .any(|feature| feature == &format!("model:{}", profile.model)),
+        "unsurveyed model must not be self-attested"
+    );
+    match resolve_profile(&layers, &caps) {
+        Err(ProfileError::ModelUnavailable(_)) => {}
+        other => panic!("expected ModelUnavailable, got {other:?}"),
+    }
+
+    // A model proven by a real harness/config smoke IS advertised and
+    // resolves.
+    let surveyed = CodexGateway::new(
+        Arc::new(OwnedProcessSupervisor::new()),
+        CodexConfig {
+            surveyed_models: vec![profile.model.clone()],
+            ..CodexConfig::default()
+        },
+    );
+    let caps = surveyed.capabilities(&profile).await.expect("capabilities");
+    resolve_profile(&layers, &caps).expect("surveyed model resolves");
 }

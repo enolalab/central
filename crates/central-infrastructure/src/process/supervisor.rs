@@ -45,6 +45,14 @@ struct SupervisedChild {
     created_at_ms: i64,
     child: Child,
     job: Option<JobObject>,
+    /// How THIS process was contained. The supervisor-level [`placement`]
+    /// probe is taken once in [`new`]; a later per-spawn assignment can still
+    /// fail (nested job), so each record carries its own outcome instead of
+    /// inheriting the probe.
+    ///
+    /// [`placement`]: OwnedProcessSupervisor::placement
+    /// [`new`]: OwnedProcessSupervisor::new
+    placement: JobPlacement,
     exited: Option<i32>,
 }
 
@@ -52,11 +60,21 @@ struct SupervisorState {
     children: HashMap<String, SupervisedChild>,
 }
 
+/// Builds one kill-on-close job object.
+type CreateJobFn = fn() -> Result<JobObject, JobError>;
+/// Assigns a live PID to a job object.
+type AssignFn = fn(&JobObject, u32) -> Result<(), JobError>;
+/// Reads the kernel creation time of a live PID.
+type CreationTimeFn = fn(u32) -> Result<i64, JobError>;
+
 /// Supervises owned agent processes with job-object containment where the
 /// host allows it.
 pub struct OwnedProcessSupervisor {
     state: Mutex<SupervisorState>,
     placement: JobPlacement,
+    create_job: CreateJobFn,
+    assign: AssignFn,
+    creation_time: CreationTimeFn,
 }
 
 impl Default for OwnedProcessSupervisor {
@@ -67,7 +85,25 @@ impl Default for OwnedProcessSupervisor {
 
 impl OwnedProcessSupervisor {
     pub fn new() -> Self {
-        let placement = match JobObject::new_kill_on_close() {
+        Self::with_hooks(
+            JobObject::new_kill_on_close,
+            JobObject::assign,
+            default_creation_time,
+        )
+    }
+
+    /// Build a supervisor with injectable process hooks. Production code
+    /// always uses [`new`]; this seam exists so tests can deterministically
+    /// exercise the refused-assignment and failed-clock paths instead of
+    /// depending on the host's job nesting.
+    ///
+    /// [`new`]: OwnedProcessSupervisor::new
+    pub fn with_hooks(
+        create_job: CreateJobFn,
+        assign: AssignFn,
+        creation_time: CreationTimeFn,
+    ) -> Self {
+        let placement = match create_job() {
             Ok(_) => JobPlacement::Enforced,
             Err(error) => JobPlacement::InstructionOnly(format!(
                 "kill-on-close job unavailable ({error}); processes are supervised by \
@@ -79,14 +115,60 @@ impl OwnedProcessSupervisor {
                 children: HashMap::new(),
             }),
             placement,
+            create_job,
+            assign,
+            creation_time,
         }
     }
 
     /// How containment was established. `Enforced` is only reported with
     /// query-backed proof from the job object; otherwise the reason for
     /// `InstructionOnly` is published.
+    ///
+    /// This is the construction-time probe. For the outcome of a single
+    /// spawn, see [`placement_of`], which is the per-process truth.
+    ///
+    /// [`placement_of`]: OwnedProcessSupervisor::placement_of
     pub fn placement(&self) -> JobPlacement {
         self.placement.clone()
+    }
+
+    /// Per-process containment truth: how the process behind `identity` was
+    /// actually contained. A refused assignment is published here as
+    /// `InstructionOnly` with the reason instead of being swallowed, even
+    /// when [`placement`] still reports `Enforced` from its earlier probe.
+    ///
+    /// [`placement`]: OwnedProcessSupervisor::placement
+    pub fn placement_of(&self, identity: &ProcessIdentity) -> Result<JobPlacement, AppError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| AppError::Storage("supervisor lock poisoned".to_string()))?;
+        let entry = state.children.get(&identity.ownership_id).ok_or_else(|| {
+            AppError::NotFound(format!(
+                "unknown supervised process '{}'",
+                identity.ownership_id
+            ))
+        })?;
+        if entry.pid != identity.pid || entry.created_at_ms != identity.created_at.0 {
+            return Err(AppError::NotFound(format!(
+                "identity does not match the supervised record for '{}'; refusing \
+                 (possible recycled PID)",
+                identity.ownership_id
+            )));
+        }
+        Ok(entry.placement.clone())
+    }
+
+    /// How many supervised identities are currently recorded. A spawn that
+    /// fails loudly records nothing, so the count is unchanged by it.
+    pub fn supervised_count(&self) -> Result<usize, AppError> {
+        Ok(self
+            .state
+            .lock()
+            .map_err(|_| AppError::Storage("supervisor lock poisoned".to_string()))?
+            .children
+            .len())
     }
 
     /// Identity-checked termination with an observable kill count.
@@ -203,6 +285,19 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+/// Default kernel-clock query. On Windows this is the real process creation
+/// time, and it is load-bearing there: terminate/inspect cross-check it
+/// against the live OS value. Off Windows there is no kernel clock and those
+/// cross-checks are compiled out, so the wall clock is only an opaque
+/// correlator — and job containment there is always `InstructionOnly`.
+fn default_creation_time(pid: u32) -> Result<i64, JobError> {
+    if cfg!(windows) {
+        windows_job::process_creation_time_ms(pid)
+    } else {
+        Ok(now_millis())
+    }
+}
+
 #[async_trait]
 impl ProcessSupervisor for OwnedProcessSupervisor {
     async fn spawn(&self, spec: &ProcessSpec) -> Result<ProcessIdentity, AppError> {
@@ -225,21 +320,63 @@ impl ProcessSupervisor for OwnedProcessSupervisor {
             const CREATE_NO_WINDOW: u32 = 0x0800_0000;
             command.creation_flags(CREATE_NO_WINDOW);
         }
-        let child = command.spawn().map_err(|error| {
+        let mut child = command.spawn().map_err(|error| {
             AppError::Transport(format!("spawn '{}' failed: {error}", spec.program))
         })?;
         let pid = child.id();
-        // Prefer the OS creation time so a later liveness check compares
-        // kernel truth, not our own clock.
-        let created_at_ms =
-            windows_job::process_creation_time_ms(pid).unwrap_or_else(|_| now_millis());
+        // The kernel creation time, never the wall clock on platforms where
+        // the stamp is load-bearing: a later liveness check compares it
+        // against live kernel truth, and a substituted clock would mismatch
+        // there — failing closed on every later terminate and leaking an
+        // unterminable record. Retry once for a transient query failure; a
+        // second failure fails the spawn loudly and reaps the child through
+        // its own handle, so no unidentifiable process is ever supervised or
+        // orphaned, and nothing is recorded.
+        let created_at_ms = match (self.creation_time)(pid) {
+            Ok(stamp) => stamp,
+            Err(first) => match (self.creation_time)(pid) {
+                Ok(stamp) => stamp,
+                Err(second) => {
+                    child.kill().ok();
+                    for _ in 0..100 {
+                        match child.try_wait() {
+                            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                            _ => break,
+                        }
+                    }
+                    return Err(AppError::Transport(format!(
+                        "cannot read kernel creation time of spawned pid {pid} \
+                         ({first}; retry: {second}); refusing to supervise an \
+                         unidentifiable process"
+                    )));
+                }
+            },
+        };
         let ownership_id = Uuid::new_v4().to_string();
         // Contain first, before the child can fork away from the job. When
         // assignment fails (nested job, platform without jobs) the child
-        // stays supervised by handle only; placement() says so honestly.
-        let job = match JobObject::new_kill_on_close() {
-            Ok(job) => job.assign(pid).ok().map(|()| job),
-            Err(_) => None,
+        // stays supervised by handle only, and the per-process outcome is
+        // stored on the record — never swallowed — so `placement_of` reports
+        // it honestly even when the construction-time `placement()` probe
+        // still says `Enforced`.
+        let (job, per_process) = match (self.create_job)() {
+            Ok(job) => match (self.assign)(&job, pid) {
+                Ok(()) => (Some(job), JobPlacement::Enforced),
+                Err(error) => (
+                    None,
+                    JobPlacement::InstructionOnly(format!(
+                        "job assignment failed for pid {pid} ({error}); process is \
+                         supervised by handle only and its tree may outlive the supervisor"
+                    )),
+                ),
+            },
+            Err(error) => (
+                None,
+                JobPlacement::InstructionOnly(format!(
+                    "kill-on-close job unavailable ({error}); process is supervised by \
+                     handle only and its tree may outlive the supervisor"
+                )),
+            ),
         };
         let identity = ProcessIdentity {
             pid,
@@ -257,6 +394,7 @@ impl ProcessSupervisor for OwnedProcessSupervisor {
                     created_at_ms,
                     child,
                     job,
+                    placement: per_process,
                     exited: None,
                 },
             );

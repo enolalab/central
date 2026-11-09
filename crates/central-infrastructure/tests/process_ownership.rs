@@ -19,10 +19,13 @@ use central_application::ports::{AgentGateway, ProcessSupervisor};
 use central_domain::{AttemptId, ContentHash, ProfileId, ResolvedProfile, Timestamp};
 use central_infrastructure::codex::{CodexConfig, CodexGateway};
 use central_infrastructure::process::{
-    current_process_in_job, process_in_job, spawn_detached, DetachPlacement, JobPlacement,
-    OwnedProcessSupervisor,
+    current_process_in_job, process_creation_time_ms, process_in_job, spawn_detached,
+    DetachPlacement, JobError, JobObject, JobPlacement, OwnedProcessSupervisor,
 };
 
+/// Helper sleeper: Windows and portable variants so supervision itself is
+/// exercised on every platform; only job-object containment is Windows-only.
+#[cfg(windows)]
 fn sleeper_spec() -> ProcessSpec {
     ProcessSpec {
         program: "powershell.exe".to_string(),
@@ -34,6 +37,49 @@ fn sleeper_spec() -> ProcessSpec {
         ],
         working_dir: None,
     }
+}
+
+#[cfg(not(windows))]
+fn sleeper_spec() -> ProcessSpec {
+    ProcessSpec {
+        program: "sh".to_string(),
+        args: vec!["-c".to_string(), "sleep 120".to_string()],
+        working_dir: None,
+    }
+}
+
+/// App-server stand-in for the gateway open/cancel test, per platform.
+#[cfg(windows)]
+fn helper_command() -> (String, Vec<String>) {
+    (
+        "powershell.exe".to_string(),
+        vec![
+            "-NoProfile".to_string(),
+            "-NonInteractive".to_string(),
+            "-Command".to_string(),
+            "Start-Sleep -Seconds 60".to_string(),
+        ],
+    )
+}
+
+#[cfg(not(windows))]
+fn helper_command() -> (String, Vec<String>) {
+    (
+        "sh".to_string(),
+        vec!["-c".to_string(), "sleep 60".to_string()],
+    )
+}
+
+/// Deterministic nested-job-style refusal for the assign hook.
+fn fail_assign(_job: &JobObject, _pid: u32) -> Result<(), JobError> {
+    Err(JobError::Win32(5))
+}
+
+/// Deterministic kernel-clock failure for the creation-time hook.
+fn fail_creation_time(pid: u32) -> Result<i64, JobError> {
+    Err(JobError::NotFound(format!(
+        "test hook: cannot read creation time of pid {pid}"
+    )))
 }
 
 fn personal_profile() -> ResolvedProfile {
@@ -167,6 +213,107 @@ fn job_placement_is_published_never_silent() {
     }
 }
 
+/// A refused job assignment must be published per process instead of
+/// swallowed: the supervisor-level `placement()` probe (taken once in
+/// `new()`) can still say `Enforced` while THIS process was never assigned.
+/// Windows-only: the deterministic refusal needs the real kernel clock plus
+/// a real job object, and the assertion pins `Running` via the OS check.
+#[cfg(windows)]
+#[tokio::test]
+async fn assign_failure_is_published_per_process() {
+    let supervisor = OwnedProcessSupervisor::with_hooks(
+        JobObject::new_kill_on_close,
+        fail_assign,
+        process_creation_time_ms,
+    );
+    let identity = supervisor
+        .spawn(&sleeper_spec())
+        .await
+        .expect("refused assignment still supervises by handle");
+    match supervisor
+        .placement_of(&identity)
+        .expect("per-process placement")
+    {
+        JobPlacement::InstructionOnly(reason) => {
+            assert!(!reason.is_empty(), "reason published, never silent")
+        }
+        JobPlacement::Enforced => {
+            panic!("a failing assign hook must never report Enforced")
+        }
+    }
+    // The process stays supervised: liveness and exactly-once kill work
+    // through the owned handle.
+    assert_eq!(
+        supervisor.inspect(&identity).await.expect("inspect"),
+        ProcessState::Running
+    );
+    let report = supervisor
+        .terminate_detailed(&identity)
+        .await
+        .expect("terminate");
+    assert_eq!(report.kill_count, 1);
+}
+
+/// Portable twin: off Windows every job creation fails, so the default
+/// supervisor must publish that per process too — supervised, but honestly
+/// contained by handle only.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn unenforceable_containment_is_published_per_process() {
+    let supervisor = OwnedProcessSupervisor::new();
+    let identity = supervisor.spawn(&sleeper_spec()).await.expect("spawn");
+    match supervisor
+        .placement_of(&identity)
+        .expect("per-process placement")
+    {
+        JobPlacement::InstructionOnly(reason) => {
+            assert!(!reason.is_empty(), "reason published, never silent")
+        }
+        JobPlacement::Enforced => {
+            panic!("no job objects off Windows; must never report Enforced")
+        }
+    }
+    assert_eq!(
+        supervisor.inspect(&identity).await.expect("inspect"),
+        ProcessState::Running
+    );
+    let report = supervisor
+        .terminate_detailed(&identity)
+        .await
+        .expect("terminate");
+    assert_eq!(report.kill_count, 1);
+}
+
+/// A failed kernel creation-time query must fail the spawn loudly — never
+/// substitute the wall clock (that stamp would later mismatch the terminate
+/// check, leaking an unterminable entry). Portable: the hook fails on every
+/// platform and the failure path kills through the owned handle, so no
+/// identity is recorded and no orphan is left behind.
+#[tokio::test]
+async fn creation_time_failure_fails_spawn_loudly() {
+    let supervisor = OwnedProcessSupervisor::with_hooks(
+        JobObject::new_kill_on_close,
+        JobObject::assign,
+        fail_creation_time,
+    );
+    let before = supervisor.supervised_count().expect("count");
+    match supervisor.spawn(&sleeper_spec()).await {
+        Err(AppError::Transport(message)) => {
+            assert!(
+                message.contains("creation time"),
+                "names the cause: {message}"
+            );
+        }
+        other => panic!("expected a loud Transport failure, got {other:?}"),
+    }
+    assert_eq!(
+        supervisor.supervised_count().expect("count"),
+        before,
+        "a failed spawn records no identity"
+    );
+}
+
+#[cfg(windows)]
 #[tokio::test]
 async fn daemon_is_not_in_cli_tied_job() {
     let dir = std::env::temp_dir().join(format!("central-t2-{}", uuid::Uuid::new_v4()));
@@ -212,17 +359,42 @@ async fn daemon_is_not_in_cli_tied_job() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Portable twin: off Windows there are no job objects, so a detached spawn
+/// trivially escapes CLI-tied lifetime — the test pins that the spawn,
+/// liveness check, and placement report work there too.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn daemon_spawns_detached_portable() {
+    let dir = std::env::temp_dir().join(format!("central-t2-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let log = dir.join("daemon.log");
+    let mut detached = spawn_detached(
+        Path::new("sh"),
+        &["-c".to_string(), "sleep 30".to_string()],
+        &log,
+    )
+    .expect("detached spawn succeeds");
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        detached.child.try_wait().expect("reap check").is_none(),
+        "detached child is running, not stillborn"
+    );
+    assert_eq!(
+        detached.placement,
+        DetachPlacement::EscapedJob,
+        "no job objects off Windows: always escaped"
+    );
+    detached.child.kill().ok();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn gateway_open_spawns_owned_process_and_cancel_kills_it() {
     let supervisor: Arc<dyn ProcessSupervisor> = Arc::new(OwnedProcessSupervisor::new());
+    let (binary, app_server_args) = helper_command();
     let config = CodexConfig {
-        binary: "powershell.exe".to_string(),
-        app_server_args: vec![
-            "-NoProfile".to_string(),
-            "-NonInteractive".to_string(),
-            "-Command".to_string(),
-            "Start-Sleep -Seconds 60".to_string(),
-        ],
+        binary,
+        app_server_args,
         ..CodexConfig::default()
     };
     let gateway = CodexGateway::new(Arc::clone(&supervisor), config);

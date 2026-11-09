@@ -45,6 +45,14 @@ pub struct CodexConfig {
     /// Owned by P2/T2: `open` spawns `binary` with these args through the
     /// real supervisor.
     pub app_server_args: Vec<String>,
+    /// Models proven servable by a real harness or config smoke (for example
+    /// an observed `initialize` result or a versioned model list). Only these
+    /// are advertised as `model:<id>` features. Entries must come from
+    /// observed evidence, never from the request: an unsurveyed model stays
+    /// unadvertised so `resolve_profile` raises `ModelUnavailable` instead of
+    /// silently falling back. Empty — the default while no smoke has proven
+    /// anything — advertises no model at all.
+    pub surveyed_models: Vec<String>,
 }
 
 impl Default for CodexConfig {
@@ -58,6 +66,7 @@ impl Default for CodexConfig {
             request_timeout_ms: 30_000,
             allow_provider_model_fallback: false,
             app_server_args: vec!["app-server".to_string()],
+            surveyed_models: Vec::new(),
         }
     }
 }
@@ -205,25 +214,30 @@ fn into_capability(error: VersionError) -> AppError {
 
 #[async_trait]
 impl AgentGateway for CodexGateway {
-    async fn capabilities(&self, profile: &ResolvedProfile) -> Result<Capabilities, AppError> {
+    async fn capabilities(&self, _profile: &ResolvedProfile) -> Result<Capabilities, AppError> {
         self.ensure_compatible()?;
+        // Never self-attest the requested model: only models surveyed from a
+        // real harness/config smoke are advertised as `model:<id>` features.
+        // An unsurveyed model stays unadvertised so `resolve_profile` treats
+        // it as unavailable and raises `ModelUnavailable` — never a silent
+        // fallback.
+        let mut features = vec![
+            "initialize".to_string(),
+            "thread/start".to_string(),
+            "thread/resume".to_string(),
+            "thread/read".to_string(),
+            "turn/start".to_string(),
+            "item/commandExecution/requestApproval".to_string(),
+            "item/tool/requestUserInput".to_string(),
+            "serverRequest/resolved".to_string(),
+        ];
+        for model in &self.config.surveyed_models {
+            features.push(format!("model:{model}"));
+        }
         Ok(Capabilities {
             provider: "codex".to_string(),
             supports_resume: true,
-            features: vec![
-                "initialize".to_string(),
-                "thread/start".to_string(),
-                "thread/resume".to_string(),
-                "thread/read".to_string(),
-                "turn/start".to_string(),
-                "item/commandExecution/requestApproval".to_string(),
-                "item/tool/requestUserInput".to_string(),
-                "serverRequest/resolved".to_string(),
-                // The profile this query was made for is the model the
-                // harness must serve: `resolve_profile` treats a missing
-                // entry as unavailable, never as a silent fallback.
-                format!("model:{}", profile.model),
-            ],
+            features,
         })
     }
 

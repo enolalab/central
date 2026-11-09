@@ -7,4 +7,4 @@ pub use daemon::{
     ALREADY_RUNNING_EXIT_CODE,
 };
 pub use supervisor::{current_process_in_job, JobError, JobPlacement, OwnedProcessSupervisor};
-pub use windows_job::{process_creation_time_ms, process_exit_code, process_in_job};
+pub use windows_job::{process_creation_time_ms, process_exit_code, process_in_job, JobObject};
