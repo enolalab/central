@@ -3,8 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActorId, ArtifactId, AttemptId, ContentHash, MissingUsage, PlanDocumentV1, PlanHash, ProfileId,
-    Revision, RunId, TaskId, TaskKind, Timestamp, UsageAuditEntry, UsageLimits, VerifySpec,
+    ActorId, ArtifactId, AttemptId, ContentHash, MissingUsage, PendingRevision, PlanDocumentV1,
+    PlanHash, ProfileId, Revision, RunId, StaleCandidate, TaskId, TaskKind, Timestamp,
+    UsageAuditEntry, UsageLimits, VerifySpec,
 };
 
 pub const RUN_STATE_VERSION: u32 = 1;
@@ -119,6 +120,15 @@ pub struct Task {
     pub repair_rounds_used: u8,
 }
 
+impl Task {
+    /// Whether the task can accept a new attempt once the remaining
+    /// gates (plan binding, dependencies, holds, budget) pass: it has
+    /// no live attempt outcome yet, so it is `Pending` or `Ready`.
+    pub fn is_ready(&self) -> bool {
+        matches!(self.status, TaskStatus::Pending | TaskStatus::Ready)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attempt {
     pub id: AttemptId,
@@ -127,6 +137,15 @@ pub struct Attempt {
     pub status: AttemptStatus,
     pub profile_id: Option<ProfileId>,
     pub created_at: Timestamp,
+}
+
+impl Attempt {
+    /// The revision the attempt was queued under. Attempts never move
+    /// revisions: a revision activates around them, and their results
+    /// are quarantined with this binding intact.
+    pub fn bound_plan(&self) -> &PlanHash {
+        &self.plan_hash
+    }
 }
 
 /// Where one dispatched attempt is executing, as reported by the harness.
@@ -256,6 +275,22 @@ pub struct RunState {
     /// the attempt it chains from.
     #[serde(default)]
     pub attempt_predecessor: BTreeMap<AttemptId, AttemptId>,
+    /// The immutable revision proposal awaiting user approval, if any.
+    /// While it pends, [`RunState::revision_holds`] keeps the impacted
+    /// tasks from queueing or dispatching new work; running attempts
+    /// continue on their original binding.
+    #[serde(default)]
+    pub pending_revision: Option<PendingRevision>,
+    /// Tasks held by the pending revision proposal: the impacted set
+    /// (changed nodes, data descendants and leader semantic nodes).
+    /// Queued attempts wait; nothing held is cancelled.
+    #[serde(default)]
+    pub revision_holds: BTreeSet<TaskId>,
+    /// Results produced by attempts bound to a superseded revision,
+    /// quarantined with their original provenance. Keyed by attempt;
+    /// a late result inserts here without touching the active revision.
+    #[serde(default)]
+    pub stale_candidates: BTreeMap<AttemptId, StaleCandidate>,
 }
 
 impl RunState {
@@ -287,6 +322,9 @@ impl RunState {
             retry_used: BTreeMap::new(),
             retry_not_before: BTreeMap::new(),
             attempt_predecessor: BTreeMap::new(),
+            pending_revision: None,
+            revision_holds: BTreeSet::new(),
+            stale_candidates: BTreeMap::new(),
         }
     }
 

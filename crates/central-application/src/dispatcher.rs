@@ -234,6 +234,13 @@ impl Dispatcher {
         if state.control != central_domain::RunControl::Running || !state.holds.is_empty() {
             return Ok(());
         }
+        // A pending revision proposal holds its impacted queued
+        // descendants: they wait for the user's decision and are never
+        // dispatched on speculation. Running attempts continue; only
+        // new sends are held.
+        if state.revision_holds.contains(&attempt.task_id) {
+            return Ok(());
+        }
         if matches!(
             admission(
                 &state,

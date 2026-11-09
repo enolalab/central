@@ -105,6 +105,11 @@ pub fn eligible_tasks(state: &RunState, now: Timestamp) -> Vec<TaskId> {
 /// open. Used for honest paused/held telemetry: a closed gate holds back
 /// real work, and the deferred figure must count that held-back work
 /// rather than report zero.
+///
+/// A pending revision proposal holds its impacted tasks regardless of
+/// the gate: held tasks never appear here, so neither the scheduler
+/// tick nor the dispatcher can queue or send new work for them while
+/// the user decides. Queued attempts wait; running attempts continue.
 pub fn eligible_tasks_ignoring_gate(state: &RunState, now: Timestamp) -> Vec<TaskId> {
     let _ = now;
     if !state.created {
@@ -122,6 +127,7 @@ pub fn eligible_tasks_ignoring_gate(state: &RunState, now: Timestamp) -> Vec<Tas
                     task.status,
                     crate::TaskStatus::Pending | crate::TaskStatus::Ready
                 )
+                && !state.revision_holds.contains(&task.id)
                 && covering_attempt(state, task.id).is_none()
                 && blocking_dependencies(task, state).is_empty()
         })

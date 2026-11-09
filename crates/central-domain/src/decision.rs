@@ -1,12 +1,15 @@
 use std::collections::BTreeSet;
 
+use crate::revision::content_hash_of;
 use crate::{
-    admission, apply_usage, blocking_dependencies, check_report, covering_attempt, decide_quality,
-    inbox, live_attempt_count, release_settled_claims, retry_used, sync_budget_holds,
-    validate_plan, Actor, ActorKind, Admission, AnswerPayload, Attempt, AttemptStatus, Command,
-    CommandEnvelope, DomainError, Effect, Event, HoldReason, InboxEntry, InboxKey, InboxKind,
-    InboxOutcome, InboxStatus, PlanRevision, PlanStatus, QualityDecision, RunControl, RunState,
-    Task, TaskStatus, Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
+    admission, apply_usage, assess_impact, blocking_dependencies, check_report, covering_attempt,
+    criteria_changed, decide_quality, describe_criteria_impact, inbox, is_confirmed_terminal,
+    live_attempt_count, release_settled_claims, retry_used, sync_budget_holds, validate_plan,
+    Actor, ActorKind, Admission, AnswerPayload, Attempt, AttemptStatus, Command, CommandEnvelope,
+    ContentHash, DomainError, Effect, Event, HoldReason, InboxEntry, InboxKey, InboxKind,
+    InboxOutcome, InboxStatus, PlanDocumentV1, PlanHash, PlanRevision, PlanStatus, QualityDecision,
+    ReuseBindings, ReuseDecision, RunControl, RunState, StaleCandidate, Task, TaskId, TaskStatus,
+    Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -92,6 +95,12 @@ pub fn decide(
 
         Command::ProposePlan { plan } => {
             require_created(state)?;
+            if state.pending_revision.is_some() {
+                return Err(DomainError::InvalidTransition(
+                    "a plan revision proposal is already pending; approve or supersede it before proposing an initial plan"
+                        .to_string(),
+                ));
+            }
             if !matches!(actor.kind, ActorKind::Leader | ActorKind::User) {
                 return Err(DomainError::Forbidden);
             }
@@ -885,7 +894,425 @@ pub fn decide(
             *max_parallel,
             now,
         ),
+
+        Command::ProposeRevision {
+            plan,
+            reason,
+            criteria_explanation,
+            semantic_affected,
+        } => propose_revision(
+            state,
+            actor,
+            plan,
+            reason,
+            criteria_explanation,
+            semantic_affected,
+            now,
+        ),
+
+        Command::ApproveRevision { plan_hash } => approve_revision(state, actor, plan_hash, now),
+
+        Command::AssessReuse {
+            attempt,
+            decision,
+            current,
+        } => assess_reuse_decision(state, actor, *attempt, *decision, current, now),
     }
+}
+
+/// Propose an immutable revision of the active plan (P3 Task 4).
+///
+/// The leader or the user proposes the full replacement document with
+/// the reason it exists. A revision that moves verification criteria
+/// must carry an explanation — without one the proposal is refused and
+/// the run is untouched. The impact (changed nodes plus data
+/// descendants, expanded only by the leader's semantic nodes) becomes
+/// the pending hold set: impacted queued descendants wait for the
+/// user's decision, running attempts continue untouched on their old
+/// binding. A newer proposal supersedes the pending one, like plans.
+#[allow(clippy::too_many_arguments)]
+fn propose_revision(
+    state: &RunState,
+    actor: &Actor,
+    plan: &PlanDocumentV1,
+    reason: &str,
+    criteria_explanation: &Option<String>,
+    semantic_affected: &[TaskId],
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_created(state)?;
+    if !matches!(actor.kind, ActorKind::Leader | ActorKind::User) {
+        return Err(DomainError::Forbidden);
+    }
+    if state.control == RunControl::Stopped {
+        return Err(DomainError::InvalidTransition(
+            "cannot propose a revision for a stopped run".to_string(),
+        ));
+    }
+    let Some(base_plan) = state.active_plan.clone() else {
+        return Err(DomainError::InvalidTransition(
+            "the run has no active plan; propose an initial plan first".to_string(),
+        ));
+    };
+    if state.pending_plan.is_some() {
+        return Err(DomainError::InvalidTransition(
+            "an initial plan proposal is already pending; resolve it before proposing a revision"
+                .to_string(),
+        ));
+    }
+    if reason.trim().is_empty() {
+        return Err(DomainError::InvalidCommand(
+            "a revision proposal needs a reason for the user review".to_string(),
+        ));
+    }
+    let hash = validate_plan(plan)?;
+    if hash == base_plan {
+        return Err(DomainError::InvalidTransition(
+            "the revision is identical to the active plan".to_string(),
+        ));
+    }
+    if matches!(
+        state.plans.get(&hash).map(|entry| entry.status),
+        Some(PlanStatus::Approved)
+    ) {
+        return Err(DomainError::InvalidTransition(
+            "the revised plan is already approved".to_string(),
+        ));
+    }
+    let base_document = state
+        .plans
+        .get(&base_plan)
+        .map(|entry| entry.document.clone())
+        .ok_or_else(|| DomainError::UnknownPlan(base_plan.clone()))?;
+    if criteria_changed(&base_document, plan)? {
+        let explained = criteria_explanation
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+        if !explained {
+            let changed = describe_criteria_impact(&base_document, plan)?.changed_tasks;
+            return Err(DomainError::InvalidCommand(format!(
+                "a revision changing verification criteria needs an explanation \
+                 covering the requirement and verdict impact plus the reverify tasks \
+                 (criteria changed for tasks: {changed:?})"
+            )));
+        }
+    }
+    let mut impact = assess_impact(&base_document, plan)?;
+    let new_ids: BTreeSet<TaskId> = plan.tasks.iter().map(|task| task.id).collect();
+    let mut semantic = BTreeSet::new();
+    for node in semantic_affected {
+        if !new_ids.contains(node) {
+            return Err(DomainError::InvalidCommand(format!(
+                "semantic node {node} is not part of the revised plan"
+            )));
+        }
+        semantic.insert(*node);
+    }
+    impact = impact.expanded_with(semantic.clone());
+
+    let mut next = state.clone();
+    if let Some(previous) = next.pending_revision.take() {
+        if previous.plan_hash != hash {
+            if let Some(entry) = next.plans.get_mut(&previous.plan_hash) {
+                entry.status = PlanStatus::Superseded;
+            }
+        }
+    }
+    next.plans.insert(
+        hash.clone(),
+        PlanRevision {
+            hash: hash.clone(),
+            document: plan.clone(),
+            status: PlanStatus::Proposed,
+            proposed_by: actor.id,
+            proposed_at: now,
+            approved_by: None,
+            approved_at: None,
+        },
+    );
+    let impacted: Vec<TaskId> = impact.impacted().into_iter().collect();
+    next.pending_revision = Some(crate::PendingRevision {
+        base_plan: base_plan.clone(),
+        plan_hash: hash.clone(),
+        document: plan.clone(),
+        reason: reason.to_string(),
+        criteria_explanation: criteria_explanation.clone(),
+        impact,
+        semantic_affected: semantic,
+        proposed_by: actor.id,
+        proposed_at: now,
+    });
+    next.revision_holds = impacted.iter().copied().collect();
+    Ok(finish(
+        next.clone(),
+        vec![Event::PlanRevisionProposed {
+            run_id: next.id,
+            base_plan,
+            plan_hash: hash,
+            impacted,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+/// Activate the pending revision proposal (P3 Task 4).
+///
+/// User only. The target hash must be the pending revision — anything
+/// else conflicts, so a stale tab can never activate unreviewed
+/// content — and the revision must still be based on the active plan.
+/// Every task present in the new document is rebound to it (status and
+/// repair budget preserved); tasks whose data inputs the impact names
+/// lose an acceptance they held, because verification must come first,
+/// never a silent carry-over. Order-only changes invalidate nothing.
+/// Running attempts keep their old binding: only tasks move.
+fn approve_revision(
+    state: &RunState,
+    actor: &Actor,
+    plan_hash: &PlanHash,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user(actor)?;
+    require_created(state)?;
+    let Some(pending) = state.pending_revision.clone() else {
+        return Err(DomainError::InvalidTransition(
+            "no revision proposal is pending".to_string(),
+        ));
+    };
+    if pending.plan_hash != *plan_hash {
+        return Err(DomainError::PlanHashMismatch);
+    }
+    if state.active_plan.as_ref() != Some(&pending.base_plan) {
+        return Err(DomainError::InvalidTransition(format!(
+            "the revision was proposed against {} but the active plan is now {}; \
+             re-propose against the current revision",
+            pending.base_plan,
+            state
+                .active_plan
+                .as_ref()
+                .map(PlanHash::as_str)
+                .unwrap_or("<none>"),
+        )));
+    }
+
+    let mut next = state.clone();
+    if let Some(old_hash) = next.active_plan.take() {
+        if old_hash != *plan_hash {
+            if let Some(old) = next.plans.get_mut(&old_hash) {
+                old.status = PlanStatus::Superseded;
+            }
+        }
+    }
+    let document = {
+        let approved = next
+            .plans
+            .get_mut(plan_hash)
+            .expect("pending revision is stored");
+        approved.status = PlanStatus::Approved;
+        approved.approved_by = Some(actor.id);
+        approved.approved_at = Some(now);
+        approved.document.clone()
+    };
+    next.active_plan = Some(plan_hash.clone());
+    // Rebase before clearing: the invalidation reads the pending impact.
+    let invalidated = rebase_tasks_for_revision(&mut next, &document, plan_hash);
+    next.pending_revision = None;
+    next.revision_holds.clear();
+    Ok(finish(
+        next.clone(),
+        vec![Event::PlanRevisionApproved {
+            run_id: next.id,
+            base_plan: pending.base_plan,
+            plan_hash: plan_hash.clone(),
+            invalidated,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+/// Rebind every task present in the newly approved document to the new
+/// revision, preserving status and repair budget. Fresh tasks enter
+/// `Pending`; tasks the impact names lose a held acceptance (verified
+/// output cleared, parked for verification first). Returns the
+/// invalidated tasks in stable order.
+fn rebase_tasks_for_revision(
+    next: &mut RunState,
+    document: &PlanDocumentV1,
+    plan_hash: &PlanHash,
+) -> Vec<TaskId> {
+    let impacted: BTreeSet<TaskId> = next
+        .pending_revision
+        .as_ref()
+        .map(|pending| pending.impact.impacted())
+        .unwrap_or_default();
+    let mut invalidated = Vec::new();
+    for plan_task in &document.tasks {
+        let verify = plan_task
+            .verify
+            .clone()
+            .expect("approved revisions passed validation");
+        match next.tasks.entry(plan_task.id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(Task {
+                    id: plan_task.id,
+                    plan_hash: plan_hash.clone(),
+                    kind: plan_task.kind.clone(),
+                    objective: plan_task.objective.clone(),
+                    status: TaskStatus::Pending,
+                    depends_on: plan_task.depends_on.clone(),
+                    data_depends_on: plan_task.data_depends_on.clone(),
+                    verify,
+                    profile_id: plan_task.profile_id,
+                    max_repair_rounds: plan_task.max_repair_rounds,
+                    repair_rounds_used: 0,
+                });
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let task = entry.get_mut();
+                task.plan_hash = plan_hash.clone();
+                task.kind = plan_task.kind.clone();
+                task.objective = plan_task.objective.clone();
+                task.depends_on = plan_task.depends_on.clone();
+                task.data_depends_on = plan_task.data_depends_on.clone();
+                task.verify = verify;
+                task.profile_id = plan_task.profile_id;
+                task.max_repair_rounds = plan_task.max_repair_rounds;
+                if impacted.contains(&plan_task.id) && task.status == TaskStatus::Succeeded {
+                    task.status = TaskStatus::AwaitingVerification;
+                    next.verified_outputs.remove(&plan_task.id);
+                    invalidated.push(plan_task.id);
+                }
+            }
+        }
+    }
+    invalidated
+}
+
+/// Conclude the reuse assessment of one quarantined stale result
+/// (P3 Task 4).
+///
+/// User or leader. `NeedsAssessment` is the initial state, never a
+/// conclusion. `ReuseUnchangedEvidence` is refused unless every
+/// binding still matches the quarantined record — and it restores a
+/// parked acceptance so the evidence is reused without
+/// re-verification. `Repair` anchors a repair base on the assessed
+/// predecessor so follow-up chains from it. `VerifyAgain` parks the
+/// result for a verifier verdict under the current bindings.
+/// `Discard` of a parked task without newer evidence reopens it for
+/// fresh implementation. Nothing here ever rewrites the quarantined
+/// provenance, and a task that already succeeded under the active
+/// revision is never overwritten.
+#[allow(clippy::too_many_arguments)]
+fn assess_reuse_decision(
+    state: &RunState,
+    actor: &Actor,
+    attempt: crate::AttemptId,
+    decision: ReuseDecision,
+    current: &ReuseBindings,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    if !matches!(actor.kind, ActorKind::User | ActorKind::Leader) {
+        return Err(DomainError::Forbidden);
+    }
+    require_created(state)?;
+    if decision == ReuseDecision::NeedsAssessment {
+        return Err(DomainError::InvalidCommand(
+            "a reuse assessment must conclude with VerifyAgain, Repair, Discard or ReuseUnchangedEvidence; NeedsAssessment is the initial state only"
+                .to_string(),
+        ));
+    }
+    let candidate = state
+        .stale_candidates
+        .get(&attempt)
+        .cloned()
+        .ok_or_else(|| {
+            DomainError::InvalidCommand(format!(
+                "no quarantined result for attempt {attempt}; only stale results from a superseded revision can be assessed"
+            ))
+        })?;
+    let task_state = state
+        .tasks
+        .get(&candidate.task_id)
+        .cloned()
+        .ok_or(DomainError::UnknownTask(candidate.task_id))?;
+    let retained = Some(&task_state.plan_hash) == state.active_plan.as_ref();
+
+    let mut next = state.clone();
+    match decision {
+        ReuseDecision::NeedsAssessment => {
+            return Err(DomainError::InvalidCommand(
+                "NeedsAssessment is the initial state, not a conclusion".to_string(),
+            ));
+        }
+        ReuseDecision::ReuseUnchangedEvidence => {
+            if !candidate.matches(current) {
+                return Err(DomainError::InvalidCommand(format!(
+                    "stale result for task {} has moving bindings; reuse needs VerifyAgain, not a silent accept",
+                    candidate.task_id,
+                )));
+            }
+            if !retained {
+                return Err(DomainError::InvalidCommand(format!(
+                    "task {} was removed by the revision; its result cannot be reused",
+                    candidate.task_id,
+                )));
+            }
+            // A task that already succeeded under the active revision
+            // keeps its newer acceptance; otherwise the parked task
+            // succeeds on the reused evidence.
+            if matches!(
+                task_state.status,
+                TaskStatus::Pending | TaskStatus::AwaitingVerification
+            ) {
+                if let Some(task) = next.tasks.get_mut(&candidate.task_id) {
+                    task.status = TaskStatus::Succeeded;
+                }
+                next.verified_outputs
+                    .insert(candidate.task_id, candidate.candidate_hash.clone());
+            }
+        }
+        ReuseDecision::VerifyAgain => {
+            // The task waits for a verifier verdict under the current
+            // bindings; the quarantine judge accepts exactly that.
+        }
+        ReuseDecision::Repair => {
+            // Anchor one repair attempt on the assessed predecessor, so
+            // follow-up chains from the quarantined result instead of
+            // silently re-implementing. Only a parked task can anchor.
+            if task_state.status == TaskStatus::AwaitingVerification {
+                next.repair_base.insert(candidate.task_id, attempt);
+            }
+        }
+        ReuseDecision::Discard => {
+            // A parked task with no newer acceptance reopens for fresh
+            // implementation; anything newer is left alone.
+            if task_state.status == TaskStatus::AwaitingVerification
+                && !next.verified_outputs.contains_key(&candidate.task_id)
+            {
+                if let Some(task) = next.tasks.get_mut(&candidate.task_id) {
+                    task.status = TaskStatus::Ready;
+                }
+            }
+        }
+    }
+    if let Some(record) = next.stale_candidates.get_mut(&attempt) {
+        record.reuse = decision;
+        record.verified_against = Some(current.clone());
+    }
+    Ok(finish(
+        next.clone(),
+        vec![Event::ReuseAssessed {
+            run_id: next.id,
+            attempt_id: attempt,
+            decision,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
 }
 
 /// Judge one independent verifier verdict (P3 Task 2).
@@ -922,6 +1349,30 @@ fn submit_verification(
             "attempt {attempt} does not belong to task {task}"
         )));
     }
+    let attempt_record = state
+        .attempts
+        .get(&attempt)
+        .expect("attempt membership checked above")
+        .clone();
+    // An attempt bound to a superseded revision never judges against the
+    // active plan: its result is quarantined with the original
+    // provenance, and reuse waits for an explicit assessment.
+    if state
+        .active_plan
+        .as_ref()
+        .is_some_and(|active| attempt_record.plan_hash != *active)
+    {
+        return record_stale_result(
+            state,
+            actor,
+            task,
+            attempt,
+            &attempt_record,
+            &task_state,
+            report,
+            now,
+        );
+    }
     // A Blocked task resumes here: after recovery the next verdict is a
     // fresh verification that preserves the repair rounds the block never
     // consumed. Any other non-open status is a stale verdict.
@@ -936,10 +1387,28 @@ fn submit_verification(
         )));
     }
     check_report(&task_state, report)?;
-    // Verifier independence: the default verifier runs in its own session.
-    // A verdict from the worker's own session is refused unless the user
-    // overrode it for this task — and only a user-carried submission may
-    // carry that override.
+    check_verifier_independence(state, actor, attempt, report)?;
+    Ok(apply_verdict_routing(
+        state.clone(),
+        actor,
+        task,
+        attempt,
+        &task_state,
+        report,
+        now,
+    ))
+}
+
+/// Verifier independence: the default verifier runs in its own session.
+/// A verdict from the worker's own session is refused unless the user
+/// overrode it for this task — and only a user-carried submission may
+/// carry that override.
+fn check_verifier_independence(
+    state: &RunState,
+    actor: &Actor,
+    attempt: crate::AttemptId,
+    report: &crate::VerificationReport,
+) -> Result<(), DomainError> {
     if let Some(session) = state.attempt_sessions.get(&attempt) {
         if session.thread_id == report.verifier_thread && !report.same_session_override {
             return Err(DomainError::Forbidden);
@@ -948,8 +1417,25 @@ fn submit_verification(
     if report.same_session_override && actor.kind != ActorKind::User {
         return Err(DomainError::Forbidden);
     }
-    let routing = decide_quality(&task_state, report.outcome);
-    let mut next = state.clone();
+    Ok(())
+}
+
+/// Apply one judged verdict to its task: the shared tail of the live
+/// verification path and the quarantine re-verification path. The
+/// verdict is the evidence the candidate-producing attempt's output
+/// exists, so the attempt completes and its resource claims release,
+/// freeing the repair or downstream work.
+fn apply_verdict_routing(
+    next: RunState,
+    actor: &Actor,
+    task: crate::TaskId,
+    attempt: crate::AttemptId,
+    task_state: &Task,
+    report: &crate::VerificationReport,
+    now: Timestamp,
+) -> Decision {
+    let routing = decide_quality(task_state, report.outcome);
+    let mut next = next;
     // The candidate-producing attempt is done producing: the verdict is
     // the evidence its output exists. Marking it completed also releases
     // its resource claims below, freeing the repair or downstream work.
@@ -996,7 +1482,7 @@ fn submit_verification(
         QualityDecision::Disputed => {}
     }
     release_settled_claims(&mut next);
-    Ok(finish(
+    finish(
         next.clone(),
         vec![Event::VerificationSubmitted {
             run_id: next.id,
@@ -1004,6 +1490,103 @@ fn submit_verification(
             attempt_id: attempt,
             outcome: report.outcome,
             decision: routing,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    )
+}
+
+/// Quarantine the result of an attempt bound to a superseded revision
+/// (P3 Task 4).
+///
+/// The result is stored with its original plan binding — never
+/// relabeled — and waits for an explicit [`Command::AssessReuse`].
+/// The old attempt completes, and a running task parks for
+/// verification; a task that already succeeded under the active
+/// revision is never overwritten. When the quarantined result was
+/// assessed as [`ReuseDecision::VerifyAgain`] and this verdict cites
+/// exactly the assessed current bindings, the verdict concludes
+/// normally under the current criteria: verification first, not a
+/// silent carry-over and not a whole re-implementation.
+#[allow(clippy::too_many_arguments)]
+fn record_stale_result(
+    state: &RunState,
+    actor: &Actor,
+    task: crate::TaskId,
+    attempt: crate::AttemptId,
+    attempt_record: &Attempt,
+    task_state: &Task,
+    report: &crate::VerificationReport,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    let mut next = state.clone();
+    if !next.stale_candidates.contains_key(&attempt) {
+        let input_hash = next
+            .attempt_inputs
+            .get(&attempt)
+            .map(|input| content_hash_of(input.as_bytes()))
+            .unwrap_or_else(|| ContentHash::from_hex(""));
+        next.stale_candidates.insert(
+            attempt,
+            StaleCandidate {
+                attempt_id: attempt,
+                task_id: task,
+                bound_plan: attempt_record.plan_hash.clone(),
+                input_hash,
+                candidate_hash: report.subject_hash.clone(),
+                criteria_hash: report.criteria_hash.clone(),
+                environment: report.environment.clone(),
+                reuse: ReuseDecision::NeedsAssessment,
+                verified_against: None,
+            },
+        );
+    }
+    let assessed = next
+        .stale_candidates
+        .get(&attempt)
+        .expect("quarantined above")
+        .clone();
+
+    // Verification-first follow-up: the assessment authorized exactly
+    // one re-verification of these bytes under the current bindings.
+    if task_state.status == TaskStatus::AwaitingVerification
+        && assessed.reuse == ReuseDecision::VerifyAgain
+        && Some(&task_state.plan_hash) == next.active_plan.as_ref()
+    {
+        if let Some(current) = assessed.verified_against.clone() {
+            if report.subject_hash == assessed.candidate_hash
+                && report.criteria_hash == current.criteria_hash
+                && report.environment == current.environment
+            {
+                check_report(task_state, report)?;
+                check_verifier_independence(state, actor, attempt, report)?;
+                return Ok(apply_verdict_routing(
+                    next, actor, task, attempt, task_state, report, now,
+                ));
+            }
+        }
+    }
+
+    if !is_confirmed_terminal(attempt_record.status) {
+        if let Some(record) = next.attempts.get_mut(&attempt) {
+            record.status = AttemptStatus::Completed;
+        }
+    }
+    if task_state.status == TaskStatus::Running {
+        if let Some(task_record) = next.tasks.get_mut(&task) {
+            task_record.status = TaskStatus::AwaitingVerification;
+        }
+    }
+    release_settled_claims(&mut next);
+    Ok(finish(
+        next.clone(),
+        vec![Event::StaleCandidateRecorded {
+            run_id: next.id,
+            attempt_id: attempt,
+            task,
+            bound_plan: attempt_record.plan_hash.clone(),
+            candidate: report.subject_hash.clone(),
             by: actor.id,
             at: now,
         }],
@@ -1061,6 +1644,11 @@ fn queue_repair_attempt(
     if task_state.plan_hash != *active {
         return Err(DomainError::QueueConflict(format!(
             "task {task} is bound to a superseded plan"
+        )));
+    }
+    if state.revision_holds.contains(&task) {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is held by a pending revision proposal; it repairs after the user decides"
         )));
     }
     if task_state.status != TaskStatus::AwaitingVerification {
@@ -1355,6 +1943,11 @@ fn queue_attempt(
     if task_state.plan_hash != *active {
         return Err(DomainError::QueueConflict(format!(
             "task {task} is bound to a superseded plan"
+        )));
+    }
+    if state.revision_holds.contains(&task) {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is held by a pending revision proposal; it queues again after the user decides"
         )));
     }
     if !matches!(task_state.status, TaskStatus::Pending | TaskStatus::Ready) {

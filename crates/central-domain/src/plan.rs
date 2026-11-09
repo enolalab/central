@@ -18,6 +18,22 @@ pub enum TaskKind {
     Verification,
     Integration,
     Assessment,
+    /// A leader analysis step owned by a revision proposal.
+    Proposal,
+    /// A user approval gate owned by a revision workflow.
+    Approval,
+}
+
+impl TaskKind {
+    /// Whether the kind is a review step rather than build work:
+    /// proposal, approval, verification or assessment. Revision
+    /// follow-ups surface these first when listing reverify work.
+    pub fn is_review(&self) -> bool {
+        matches!(
+            self,
+            TaskKind::Proposal | TaskKind::Approval | TaskKind::Verification | TaskKind::Assessment
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -10,6 +10,7 @@ pub mod plan;
 pub mod profile;
 pub mod quality;
 pub mod retry;
+pub mod revision;
 pub mod run;
 pub mod scheduling;
 
@@ -46,6 +47,10 @@ pub use quality::{
 pub use retry::{
     classify_rejection, failure_for_rejection, next_retry_delay, Failure, RejectionKind,
     RetryPolicy, DEFAULT_DELAYS_MS, MAX_RETRIES_DEFAULT,
+};
+pub use revision::{
+    active_plan_hash, assess_impact, assess_reuse, criteria_changed, describe_criteria_impact,
+    CriteriaImpact, ImpactSet, PendingRevision, ReuseBindings, ReuseDecision, StaleCandidate,
 };
 pub use run::{
     Artifact, Attempt, AttemptSession, AttemptStatus, HoldReason, Observation, PlanRevision,

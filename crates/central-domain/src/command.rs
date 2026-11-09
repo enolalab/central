@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     quality::VerificationReport, ActorId, AnswerPayload, AttemptId, AttemptSession, CommandId,
     ContentHash, InboxKey, InboxRequest, Observation, PlanDocumentV1, PlanHash, ProfileId,
-    Revision, TaskId, Timestamp, UsageLimits, UsageObservation,
+    ReuseBindings, ReuseDecision, Revision, TaskId, Timestamp, UsageLimits, UsageObservation,
 };
 
 /// Internal identity kind. The actor is derived from auth/session mapping,
@@ -207,6 +207,39 @@ pub enum Command {
         input: String,
         resources: Vec<String>,
         max_parallel: usize,
+    },
+    /// Propose an immutable revision of the active plan. The proposal
+    /// carries the full replacement document, the reason, an optional
+    /// criteria explanation (mandatory when verification criteria move)
+    /// and leader-supplied semantic nodes, which can only expand the
+    /// computed impact. Committing holds the impacted queued
+    /// descendants; running attempts continue on their old binding.
+    /// Leader or user; never the harness.
+    ProposeRevision {
+        plan: PlanDocumentV1,
+        reason: String,
+        criteria_explanation: Option<String>,
+        semantic_affected: Vec<TaskId>,
+    },
+    /// Activate the pending revision proposal. User only; the target
+    /// hash must be the pending revision and the envelope revision
+    /// must be current, so a stale tab can never activate a revision
+    /// the user did not review. Changed data inputs invalidate
+    /// acceptances (verification first, not re-implementation);
+    /// order-only changes keep data evidence.
+    ApproveRevision {
+        plan_hash: PlanHash,
+    },
+    /// Conclude the reuse assessment of one quarantined stale result.
+    /// `current` names the bindings the decision was made against.
+    /// `ReuseUnchangedEvidence` is refused unless every binding still
+    /// matches; anything else records the routing (verify again,
+    /// repair-chain, or discard) without touching new-plan evidence.
+    /// User or leader; never the harness.
+    AssessReuse {
+        attempt: AttemptId,
+        decision: ReuseDecision,
+        current: ReuseBindings,
     },
 }
 

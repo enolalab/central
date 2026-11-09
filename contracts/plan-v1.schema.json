@@ -58,7 +58,7 @@
         "id": { "$ref": "#/$defs/uuid" },
         "kind": {
           "type": "string",
-          "enum": ["planning", "implementation", "verification", "integration", "assessment"]
+          "enum": ["planning", "implementation", "verification", "integration", "assessment", "proposal", "approval"]
         },
         "objective": { "type": "string", "minLength": 1 },
         "inputs": { "type": "array", "items": { "type": "string" } },

@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    quality::QualityDecision, ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, ProfileId,
-    RunId, TaskId, Timestamp, VerificationOutcome,
+    quality::QualityDecision, revision::ReuseDecision, ActorId, AttemptId, ContentHash, InboxKind,
+    InboxOutcome, PlanHash, ProfileId, RunId, TaskId, Timestamp, VerificationOutcome,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -200,6 +200,48 @@ pub enum Event {
         attempt_id: AttemptId,
         task: TaskId,
         predecessor: AttemptId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// An immutable revision proposal committed: the base it revises,
+    /// the proposed hash and every task it holds, in stable order.
+    PlanRevisionProposed {
+        run_id: RunId,
+        base_plan: PlanHash,
+        plan_hash: PlanHash,
+        impacted: Vec<TaskId>,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A revision proposal activated by the user: the base it replaced
+    /// and every acceptance its data changes invalidated, in stable order.
+    PlanRevisionApproved {
+        run_id: RunId,
+        base_plan: PlanHash,
+        plan_hash: PlanHash,
+        invalidated: Vec<TaskId>,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A result from a superseded revision quarantined with its
+    /// original provenance. The active revision is untouched; reuse
+    /// waits for an explicit assessment.
+    StaleCandidateRecorded {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        task: TaskId,
+        bound_plan: PlanHash,
+        candidate: ContentHash,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One quarantined result assessed: what it may become under the
+    /// active revision. History is append-only; the assessment never
+    /// rewrites the quarantined provenance.
+    ReuseAssessed {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        decision: ReuseDecision,
         by: ActorId,
         at: Timestamp,
     },
