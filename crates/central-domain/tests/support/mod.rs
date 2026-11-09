@@ -25,6 +25,7 @@ pub fn leader() -> Actor {
     }
 }
 
+#[allow(dead_code)]
 pub fn worker() -> Actor {
     Actor {
         id: ActorId::from_u128(102),
@@ -32,6 +33,7 @@ pub fn worker() -> Actor {
     }
 }
 
+#[allow(dead_code)]
 pub fn verifier() -> Actor {
     Actor {
         id: ActorId::from_u128(103),

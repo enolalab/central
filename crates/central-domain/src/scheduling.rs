@@ -92,11 +92,22 @@ pub fn release_settled_claims(state: &mut RunState) -> bool {
 /// The timestamp is accepted for future activation windows and is not
 /// consulted yet; passing it keeps the daemon call shape stable.
 pub fn eligible_tasks(state: &RunState, now: Timestamp) -> Vec<TaskId> {
-    let _ = now;
     if !state.created || state.control != RunControl::Running {
         return Vec::new();
     }
     if !state.holds.is_empty() {
+        return Vec::new();
+    }
+    eligible_tasks_ignoring_gate(state, now)
+}
+
+/// Tasks that would be eligible if the run gate (control/holds) were
+/// open. Used for honest paused/held telemetry: a closed gate holds back
+/// real work, and the deferred figure must count that held-back work
+/// rather than report zero.
+pub fn eligible_tasks_ignoring_gate(state: &RunState, now: Timestamp) -> Vec<TaskId> {
+    let _ = now;
+    if !state.created {
         return Vec::new();
     }
     let Some(active) = state.active_plan.as_ref() else {

@@ -865,6 +865,62 @@ async fn capability_mismatch_defers_dispatch() {
 }
 
 #[tokio::test]
+async fn dispatch_does_not_send_after_claim_release() {
+    // A claim released between queue and dispatch (racing cancel) must
+    // not send: dispatch re-verifies ownership right before StartDispatch.
+    let harness = Harness::new();
+    let (m, n) = harness.exclusive_run().await;
+    let attempt = harness.ids.next_attempt_id();
+    harness
+        .execute(
+            system(),
+            Command::QueueAttempt {
+                attempt,
+                task: m,
+                input: "implement task m".to_string(),
+                resources: vec!["port:5432".to_string()],
+                max_parallel: 2,
+            },
+        )
+        .await;
+    assert_eq!(harness.claim_holder("port:5432"), Some(attempt));
+
+    // The racing cancel released the claim while the attempt stayed Queued.
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.resource_claims.remove("port:5432");
+    });
+
+    let report = harness
+        .scheduler(port_config(m, n))
+        .tick(harness.run_id)
+        .await
+        .expect("tick");
+    // n queues and sends normally; m must not send without its claim.
+    assert_eq!(report.sent, 1);
+    assert_eq!(harness.gateway.send_count(), 1);
+    assert_eq!(harness.attempts_of(m).len(), 1);
+    assert_eq!(harness.attempts_of(m)[0].status, AttemptStatus::Queued);
+    assert!(report.deferred >= 1);
+}
+
+#[tokio::test]
+async fn paused_tick_reports_held_back_work_as_deferred() {
+    // Telemetry honesty: a paused tick must report the work the pause is
+    // holding back, not zero.
+    let harness = Harness::new();
+    let (_a, _b, _c) = harness.approved_run().await;
+    harness.execute(system(), Command::Pause).await;
+    let report = harness
+        .scheduler(default_config())
+        .tick(harness.run_id)
+        .await
+        .expect("tick while paused");
+    assert!(report.queued.is_empty());
+    assert_eq!(report.sent, 0);
+    assert_eq!(report.deferred, 2);
+}
+
+#[tokio::test]
 async fn shuffled_completion_keeps_invariants() {
     // Verification may arrive in any order; c opens exactly when a's
     // verified output lands, no matter what b does first.

@@ -17,6 +17,7 @@
 //! harness still serves the attempt's resolved profile and model; full
 //! layer resolution and fallback chains belong to P2/T2 and P3/T3.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use central_domain::{
@@ -35,6 +36,7 @@ pub struct Dispatcher {
     ids: Arc<dyn IdSource>,
     agent: Arc<dyn AgentGateway>,
     resolver: Arc<ProfileResolver>,
+    resources: BTreeMap<TaskId, Vec<String>>,
     actor: Actor,
 }
 
@@ -45,6 +47,7 @@ impl Dispatcher {
         ids: Arc<dyn IdSource>,
         agent: Arc<dyn AgentGateway>,
         resolver: Arc<ProfileResolver>,
+        resources: BTreeMap<TaskId, Vec<String>>,
         actor: Actor,
     ) -> Self {
         Self {
@@ -53,6 +56,7 @@ impl Dispatcher {
             ids,
             agent,
             resolver,
+            resources,
             actor,
         }
     }
@@ -182,6 +186,20 @@ impl Dispatcher {
         }
         if !self.capabilities_hold(&task).await {
             return Ok(());
+        }
+        // The queue-time claim may have been released while the attempt
+        // stayed Queued (a racing cancel). No domain transition does this
+        // today — the sweep only frees confirmed-terminal owners and Stop
+        // leaves Queued attempts untouched — but a send without the claim
+        // would break exclusivity, so re-verify ownership here and defer.
+        // Queueing stores trimmed keys, so compare trimmed here as well.
+        if let Some(required) = self.resources.get(&attempt.task_id) {
+            let owns_all = required
+                .iter()
+                .all(|key| state.resource_claims.get(key.trim()) == Some(&attempt_id));
+            if !owns_all {
+                return Ok(());
+            }
         }
         let input = state
             .attempt_inputs

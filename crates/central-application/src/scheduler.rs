@@ -18,8 +18,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use central_domain::{
-    dependencies_of, eligible_tasks, live_attempt_count, verified_output, Actor, Command,
-    CommandEnvelope, ResolvedProfile, RunId, RunState, Task, TaskId,
+    dependencies_of, eligible_tasks, eligible_tasks_ignoring_gate, live_attempt_count,
+    verified_output, Actor, Command, CommandEnvelope, ResolvedProfile, RunId, RunState, Task,
+    TaskId,
 };
 
 use crate::contracts::{AppError, DispatchSummary};
@@ -147,6 +148,7 @@ impl Scheduler {
             Arc::clone(&self.ids),
             Arc::clone(&self.agent),
             Arc::clone(&self.resolver),
+            self.config.resources.clone(),
             self.actor.clone(),
         )
     }
@@ -208,8 +210,9 @@ impl Scheduler {
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
         if state.control != central_domain::RunControl::Running || !state.holds.is_empty() {
             // The gate is closed (pause/stop/hold/awaiting resume): running
-            // attempts continue untouched, nothing new queues.
-            report.deferred = eligible_tasks(&state, now).len();
+            // attempts continue untouched, nothing new queues. Deferred
+            // counts the work the gate is holding back, not zero.
+            report.deferred = eligible_tasks_ignoring_gate(&state, now).len();
             return Ok(report);
         }
 
