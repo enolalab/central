@@ -934,3 +934,119 @@ async fn stopped_run_records_no_reply() {
     runtime.dispatch_once(run_id()).await.expect("dispatch");
     assert_eq!(gateway.reply_count(), 0);
 }
+
+#[tokio::test]
+async fn unrelated_observation_does_not_resolve_answered_approval() {
+    let (store, gateway, _secrets, runtime) = created_runtime().await;
+    let fixtures = fixtures();
+    let approval = &fixtures["approval"];
+    script_request(&gateway, approval, Some(AttemptId::from_u128(42)));
+    runtime
+        .reconcile_inbox(&system(), &session_for(approval))
+        .await
+        .expect("ingest");
+    runtime
+        .execute(
+            user(),
+            next_command(
+                980,
+                Command::ApproveAction {
+                    key: inbox_key(approval),
+                    preview_hash: central_domain::preview_hash_for(&approval.preview),
+                },
+            ),
+        )
+        .await
+        .expect("approve");
+
+    // An unrelated notification for the same attempt (a progress ping with no
+    // item correlation) must not resolve the safety-critical approval: there
+    // is no harness evidence for it.
+    gateway
+        .scripted_observations
+        .lock()
+        .expect("lock")
+        .push(Observation {
+            attempt_id: AttemptId::from_u128(42),
+            provider_epoch: approval.epoch.clone(),
+            dedup_key: "thread/status/changed:progress-ping".to_string(),
+            outcome: None,
+        });
+    let summary = runtime
+        .reconcile_inbox(&system(), &session_for(approval))
+        .await
+        .expect("reconcile observes the ping");
+    assert_eq!(summary.observations, 1);
+    assert_eq!(summary.resolved, 0);
+    let state = store.load(run_id()).await.expect("load").expect("run");
+    assert_eq!(
+        state.inbox.values().next().expect("entry").status,
+        InboxStatus::Answered,
+        "unrelated observation must leave the answered approval unresolved"
+    );
+
+    // The matching observation (requestApproval for the same item) resolves it.
+    gateway
+        .scripted_observations
+        .lock()
+        .expect("lock")
+        .push(Observation {
+            attempt_id: AttemptId::from_u128(42),
+            provider_epoch: approval.epoch.clone(),
+            dedup_key: format!("requestApproval:{}", approval.item_id),
+            outcome: None,
+        });
+    let summary = runtime
+        .reconcile_inbox(&system(), &session_for(approval))
+        .await
+        .expect("reconcile resolves");
+    assert_eq!(summary.resolved, 1);
+    let state = store.load(run_id()).await.expect("load").expect("run");
+    assert_eq!(
+        state.inbox.values().next().expect("entry").status,
+        InboxStatus::Resolved
+    );
+}
+
+#[tokio::test]
+async fn conflicting_reuse_counts_as_conflict_not_duplicate() {
+    let (store, gateway, _secrets, runtime) = created_runtime().await;
+    let fixtures = fixtures();
+    let approval = &fixtures["approval"];
+    script_request(&gateway, approval, Some(AttemptId::from_u128(42)));
+    runtime
+        .reconcile_inbox(&system(), &session_for(approval))
+        .await
+        .expect("ingest");
+
+    // Same key (epoch/thread/turn/item/request) but different text: a protocol
+    // violation, never a benign replay.
+    let tampered_preview = "rm -rf C:\\fixture\\workspace\\scratch --tampered".to_string();
+    gateway
+        .scripted_requests
+        .lock()
+        .expect("lock")
+        .push(ExternalRequest {
+            key: external_key(approval),
+            kind: InboxKind::Approval,
+            preview: tampered_preview.clone(),
+            preview_hash: central_domain::preview_hash_for(&tampered_preview),
+            attempt_id: Some(AttemptId::from_u128(42)),
+            is_secret: false,
+        });
+    let summary = runtime
+        .reconcile_inbox(&system(), &session_for(approval))
+        .await
+        .expect("reconcile conflicting reuse");
+    assert_eq!(summary.conflicts, 1);
+    assert_eq!(summary.duplicates, 0);
+    assert_eq!(summary.recorded, 0);
+
+    // The stored entry is untouched: one entry, original text.
+    let state = store.load(run_id()).await.expect("load").expect("run");
+    assert_eq!(state.inbox.len(), 1);
+    assert_eq!(
+        state.inbox.values().next().expect("entry").preview,
+        approval.preview
+    );
+}

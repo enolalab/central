@@ -407,13 +407,14 @@ pub fn decide(
                     at: now,
                 });
             }
-            // Passive reconcile: observations confirm answered entries of the
-            // same attempt. Nothing auto-answers; resolution only follows an
-            // explicit user reply plus harness evidence.
+            // Passive reconcile: observations confirm answered entries with
+            // matching harness evidence (same attempt, epoch and item).
+            // Nothing auto-answers; resolution only follows an explicit user
+            // reply plus an observation correlated to that entry.
             let mut resolved_any = false;
             for entry in next.inbox.values_mut() {
                 if entry.status == InboxStatus::Answered
-                    && entry.attempt_id == Some(observation.attempt_id)
+                    && inbox::observation_matches_entry(observation, entry)
                 {
                     entry.status = InboxStatus::Resolved;
                     events.push(Event::InboxResolved {

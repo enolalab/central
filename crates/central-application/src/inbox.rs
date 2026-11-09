@@ -101,6 +101,11 @@ pub struct InboxReconcileSummary {
     pub recorded: usize,
     /// Drained requests that were already persisted (harness replay).
     pub duplicates: usize,
+    /// Same-key/different-text reuses: protocol violations, never benign
+    /// replays. Counted and surfaced separately (including in the JSON
+    /// reconcile response) so an attack-shaped reuse is never mistaken for a
+    /// harmless duplicate in the summary.
+    pub conflicts: usize,
     /// Observations persisted from the notification buffer.
     pub observations: usize,
     /// Answered entries confirmed by those observations.
@@ -177,7 +182,8 @@ impl Runtime {
     /// 1. Entries raised under another instance epoch go stale — an old
     ///    accept never applies to a new lifetime, even for identical text.
     /// 2. Gateway-queued requests are persisted as pending entries before
-    ///    any UI notice (replays count as duplicates, never as new entries).
+    ///    any UI notice (benign replays count as duplicates, never as new
+    ///    entries; same-key/different-text reuses count as conflicts).
     /// 3. Buffered observations are persisted; answered entries of the same
     ///    attempt resolve passively.
     ///
@@ -235,11 +241,12 @@ impl Runtime {
                     request: InboxRequest::from(request),
                 })
                 .await?;
-            // A same-key/different-text replay is a protocol violation, not
-            // a crash: count the attempt and keep reconciling the rest.
+            // A same-key/different-text reuse is a protocol violation, not
+            // a crash and not a benign replay: count the attempt as a
+            // conflict and keep reconciling the rest.
             match self.execute(actor.clone(), envelope).await {
                 Ok(_) => summary.recorded += 1,
-                Err(AppError::Conflict(_)) => summary.duplicates += 1,
+                Err(AppError::Conflict(_)) => summary.conflicts += 1,
                 Err(error) => return Err(error),
             }
         }

@@ -22,7 +22,7 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{ActorId, AttemptId, ContentHash, Timestamp};
+use crate::{ActorId, AttemptId, ContentHash, Observation, Timestamp};
 
 /// Lifecycle of one inbox entry. Pending answers, Answered awaits harness
 /// confirmation, Resolved is done, Stale demands a fresh verified request.
@@ -153,6 +153,23 @@ pub struct InboxEntry {
     pub item_id: String,
     pub request_id: String,
     pub is_secret: bool,
+}
+
+/// Whether one harness observation is evidence for one inbox entry.
+/// Correlation is attempt plus epoch plus item: the entry must belong to the
+/// observation's attempt and epoch, and the observation's dedup key must name
+/// the entry's item (the `requestApproval:{item_id}` keys in the fixtures, or
+/// the `method:thread:item:id` keys built by `observation_for`). An unrelated
+/// notification for the same attempt never matches, so a progress ping can
+/// never resolve a safety-critical approval without harness evidence for it.
+pub fn observation_matches_entry(observation: &Observation, entry: &InboxEntry) -> bool {
+    if entry.attempt_id != Some(observation.attempt_id) {
+        return false;
+    }
+    if entry.epoch != observation.provider_epoch {
+        return false;
+    }
+    !entry.item_id.is_empty() && observation.dedup_key.contains(&entry.item_id)
 }
 
 /// SHA-256 hex of the exact preview text the user saw. Callers hash the
