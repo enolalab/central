@@ -181,22 +181,41 @@ pub fn decide(
                     .verify
                     .clone()
                     .expect("approved plans passed validation");
-                // Existing tasks are never mutated on approval: a Running
-                // or Succeeded task must not silently adopt new criteria.
-                // Only genuinely new tasks are inserted (as Pending).
-                next.tasks.entry(plan_task.id).or_insert_with(|| Task {
-                    id: plan_task.id,
-                    plan_hash: plan_hash.clone(),
-                    kind: plan_task.kind.clone(),
-                    objective: plan_task.objective.clone(),
-                    status: TaskStatus::Pending,
-                    depends_on: plan_task.depends_on.clone(),
-                    data_depends_on: plan_task.data_depends_on.clone(),
-                    verify: verify.clone(),
-                    profile_id: plan_task.profile_id,
-                    max_repair_rounds: plan_task.max_repair_rounds,
-                    repair_rounds_used: 0,
-                });
+                // Pending tasks have no attempt/output to assess, so their
+                // definition is refreshed from the newly approved plan
+                // (status and repair_rounds_used are preserved). Non-Pending
+                // tasks are never mutated: a Running or Succeeded task must
+                // not silently adopt new criteria.
+                match next.tasks.entry(plan_task.id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(Task {
+                            id: plan_task.id,
+                            plan_hash: plan_hash.clone(),
+                            kind: plan_task.kind.clone(),
+                            objective: plan_task.objective.clone(),
+                            status: TaskStatus::Pending,
+                            depends_on: plan_task.depends_on.clone(),
+                            data_depends_on: plan_task.data_depends_on.clone(),
+                            verify,
+                            profile_id: plan_task.profile_id,
+                            max_repair_rounds: plan_task.max_repair_rounds,
+                            repair_rounds_used: 0,
+                        });
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut entry) => {
+                        let task = entry.get_mut();
+                        if task.status == TaskStatus::Pending {
+                            task.plan_hash = plan_hash.clone();
+                            task.kind = plan_task.kind.clone();
+                            task.objective = plan_task.objective.clone();
+                            task.depends_on = plan_task.depends_on.clone();
+                            task.data_depends_on = plan_task.data_depends_on.clone();
+                            task.verify = verify;
+                            task.profile_id = plan_task.profile_id;
+                            task.max_repair_rounds = plan_task.max_repair_rounds;
+                        }
+                    }
+                }
             }
             Ok(finish(
                 next.clone(),

@@ -207,6 +207,60 @@ fn approval_does_not_mutate_existing_non_pending_task() {
 }
 
 #[test]
+fn approval_refreshes_pending_task_definition() {
+    let (mut state, h1) = approved_run();
+    // Task A is Pending after first approval; give it repair history that
+    // must survive a refresh (status and repair_rounds_used are preserved).
+    {
+        let task = state.tasks.get_mut(&task_a()).expect("task A exists");
+        assert_eq!(task.status, TaskStatus::Pending);
+        assert_eq!(task.plan_hash, h1);
+        task.repair_rounds_used = 1;
+    }
+
+    let mut revised = valid_plan();
+    revised.tasks[0].objective = "Rewritten A objective".to_string();
+    revised.tasks[0].verify.as_mut().unwrap().criteria = vec!["Rewritten A criteria".to_string()];
+    revised.tasks[0].depends_on = vec![task_b()];
+    revised.tasks[0].data_depends_on = vec![task_b()];
+    // Task C depends on A (order + data); keep DAG acyclic: B -> A -> C.
+
+    let proposed = decide(
+        &state,
+        &leader(),
+        &Command::ProposePlan { plan: revised },
+        support::later(),
+    )
+    .expect("propose revised plan")
+    .next;
+    let h2 = proposed.pending_plan.clone().expect("pending revised plan");
+    assert_ne!(h1, h2);
+    let approved = decide(
+        &proposed,
+        &user(),
+        &Command::ApprovePlan {
+            plan_hash: h2.clone(),
+        },
+        support::later(),
+    )
+    .expect("approve revised plan")
+    .next;
+
+    assert_eq!(approved.active_plan, Some(h2.clone()));
+    let refreshed = &approved.tasks[&task_a()];
+    assert_eq!(refreshed.status, TaskStatus::Pending);
+    assert_eq!(refreshed.repair_rounds_used, 1);
+    assert_eq!(refreshed.plan_hash, h2);
+    assert_eq!(refreshed.objective, "Rewritten A objective");
+    assert_eq!(
+        refreshed.verify.criteria,
+        vec!["Rewritten A criteria".to_string()]
+    );
+    assert_eq!(refreshed.depends_on, vec![task_b()]);
+    assert_eq!(refreshed.data_depends_on, vec![task_b()]);
+}
+
+#[test]
 fn empty_plan_rejected() {
     let empty = PlanDocumentV1 {
         version: 1,
