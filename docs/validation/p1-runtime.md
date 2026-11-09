@@ -87,8 +87,10 @@ Date: 2026-11-09. Toolchain: Rust 1.99.1 GNU portable
   evidence comes from the application-level dispatch tests, while
   the daemon gate proves zero-dispatch-before-resume and workflow
   continuation over HTTP.
-- Token storage is a plaintext file inside the state directory
-  (owner-only by directory placement); OS ACL hardening is future
-  work. The daemon inherits the CLI's inheritable handles at spawn;
+- Token storage is a plaintext file inside the state directory,
+  protected by an OS-owner-only ACL on the state directory,
+  `daemon.token`, `owner.json`, and `server.json` (protected DACL on
+  Windows, mode `0700`/`0600` on Unix). `--listen` is parsed and any
+  non-loopback address is rejected before binding. The daemon inherits the CLI's inheritable handles at spawn;
   callers must not wait on a captured CLI pipe (the recovery script
   documents the `Start-Process` + `WaitForExit()` pattern).

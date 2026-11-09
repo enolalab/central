@@ -7,4 +7,4 @@ pub mod fake_agent {
     include!("../../../tests/fixtures/fake_agent.rs");
 }
 
-pub use bootstrap::{run, BootstrapError, DaemonConfig};
+pub use bootstrap::{parse_listen_addr, run, BootstrapError, DaemonConfig};

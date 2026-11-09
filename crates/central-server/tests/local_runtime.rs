@@ -78,18 +78,22 @@ impl Drop for Server {
     }
 }
 
-fn spawn_server(dir: &std::path::Path) -> Command {
+fn spawn_server_with_listen(dir: &std::path::Path, listen: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_central-server"));
     cmd.args([
         "--state-dir",
         dir.to_str().expect("utf8 dir"),
         "--listen",
-        "127.0.0.1:0",
+        listen,
         "--fake-agent",
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
     cmd
+}
+
+fn spawn_server(dir: &std::path::Path) -> Command {
+    spawn_server_with_listen(dir, "127.0.0.1:0")
 }
 
 fn start_server(dir: &std::path::Path) -> Server {
@@ -396,6 +400,126 @@ fn storage_failure_is_not_success() {
         http("GET", &addr, "/healthz", None, None).0
     };
     assert_ne!(db_failure_status, 200);
+}
+
+#[test]
+fn non_loopback_listen_is_rejected() {
+    for listen in ["0.0.0.0:0", "[::]:0"] {
+        let dir = state_dir("non-loopback");
+        let mut child = spawn_server_with_listen(&dir, listen)
+            .spawn()
+            .expect("spawn non-loopback server");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let code = loop {
+            if let Ok(Some(status)) = child.try_wait() {
+                break status.code();
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("server with --listen {listen} kept running instead of rejecting it");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_ne!(code, Some(0), "--listen {listen} must be rejected");
+        assert_ne!(
+            code,
+            Some(AlreadyRunning),
+            "--listen {listen} rejection reason"
+        );
+    }
+    // Loopback is accepted (every other test binds 127.0.0.1:0).
+    let dir = state_dir("loopback-ok");
+    let server = start_server(&dir);
+    let (status, _) = http("GET", &server.addr, "/healthz", None, None);
+    assert_eq!(status, 200);
+}
+
+#[cfg(windows)]
+fn acl_dump(path: &std::path::Path) -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let output = Command::new(format!("{root}\\System32\\icacls.exe"))
+        .arg(path)
+        .output()
+        .expect("run icacls");
+    assert!(
+        output.status.success(),
+        "icacls failed on {}",
+        path.display()
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+#[test]
+fn credentials_are_owner_only() {
+    let dir = state_dir("owner-only");
+    let server = start_server(&dir);
+    for path in [
+        dir.clone(),
+        dir.join("daemon.token"),
+        dir.join("server.json"),
+    ] {
+        #[cfg(windows)]
+        {
+            let acl = acl_dump(&path);
+            for other in [
+                "Everyone",
+                "BUILTIN\\Users",
+                "Authenticated Users",
+                "BUILTIN\\Administrators",
+                "NT AUTHORITY\\SYSTEM",
+                "BUILTIN\\Power Users",
+            ] {
+                assert!(
+                    !acl.contains(other),
+                    "{} must not grant {other}; icacls:\n{acl}",
+                    path.display()
+                );
+            }
+            assert!(
+                acl.contains("(F)")
+                    || acl.contains("(M)")
+                    || acl.to_ascii_uppercase().contains("FULL"),
+                "{} must grant the owner access; icacls:\n{acl}",
+                path.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let expected = if path.is_dir() { 0o700 } else { 0o600 };
+            assert_eq!(mode, expected, "{} mode", path.display());
+        }
+        let _ = &server;
+    }
+}
+
+#[test]
+fn resume_response_reports_dispatch_outcome() {
+    let dir = state_dir("dispatch-visible");
+    let mut server = start_server(&dir);
+    let run = create_run(&server, 900);
+    approve_plan(&server, &run);
+    server.crash();
+    let restored = start_server(&dir);
+    let (status, receipt) = post_command(&restored, Some(&run), 912, serde_json::json!("Resume"));
+    assert_eq!(status, 200, "resume: {receipt}");
+    // The committed receipt stays, and the post-commit dispatch step is
+    // reported explicitly instead of being silently swallowed.
+    assert!(receipt["command_id"].is_string(), "receipt kept: {receipt}");
+    assert_eq!(
+        receipt["dispatch"]["status"], "ok",
+        "dispatch field: {receipt}"
+    );
+    assert!(
+        receipt["dispatch"]["dispatched"].is_u64(),
+        "dispatch summary: {receipt}"
+    );
 }
 
 #[test]

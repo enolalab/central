@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use central_infrastructure::process::ALREADY_RUNNING_EXIT_CODE;
-use central_server::{run, BootstrapError, DaemonConfig};
+use central_server::{parse_listen_addr, run, BootstrapError, DaemonConfig};
 
 fn parse_args() -> Result<DaemonConfig, String> {
     let mut state_dir: Option<PathBuf> = None;
@@ -32,6 +32,9 @@ fn parse_args() -> Result<DaemonConfig, String> {
             other => return Err(format!("unknown argument: {other}")),
         }
     }
+    // Reject a non-loopback bind here as well as in bootstrap, so a
+    // bad address fails before any state directory is touched.
+    parse_listen_addr(&listen).map_err(|error| error.to_string())?;
     Ok(DaemonConfig {
         state_dir: state_dir.ok_or("--state-dir is required")?,
         listen,

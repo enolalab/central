@@ -60,24 +60,56 @@ pub async fn post_command(
     // Stop drains its cancel intents; every other command leaves
     // dispatch to the explicit dispatch endpoint. dispatch_once keeps
     // its own gate, so this can never send for a parked run.
-    if matches!(envelope.command, Command::Resume | Command::Stop) {
-        let _ = runtime.dispatch_once(run_id).await.map_err(|error| {
-            // The command already committed; a dispatch failure is
-            // reported in the body instead of rewriting history.
-            tracing_dispatch_note(&error)
-        });
-    }
+    let dispatch = if matches!(envelope.command, Command::Resume | Command::Stop) {
+        // The command already committed, so a dispatch failure cannot
+        // roll it back or turn the receipt into a non-2xx lie. It is
+        // reported in the body's `dispatch` field (status "error")
+        // alongside the truthful receipt.
+        Some(dispatch_field(runtime.dispatch_once(run_id).await))
+    } else {
+        None
+    };
 
-    Ok(Json(serde_json::to_value(&receipt).map_err(|error| {
+    let receipt = serde_json::to_value(&receipt).map_err(|error| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cannot encode receipt: {error}"),
         )
-    })?))
+    })?;
+    Ok(Json(attach_dispatch(receipt, dispatch)))
 }
 
-fn tracing_dispatch_note(error: &central_application::contracts::AppError) {
-    eprintln!("central-server: post-command dispatch note: {error}");
+/// The caller-visible outcome of the post-commit dispatch step.
+fn dispatch_field(
+    result: Result<
+        central_application::contracts::DispatchSummary,
+        central_application::contracts::AppError,
+    >,
+) -> serde_json::Value {
+    match result {
+        Ok(summary) => serde_json::json!({
+            "status": "ok",
+            "dispatched": summary.dispatched,
+            "unknown": summary.unknown,
+            "still_pending": summary.still_pending,
+        }),
+        Err(error) => serde_json::json!({
+            "status": "error",
+            "error": error.to_string(),
+        }),
+    }
+}
+
+/// Merge the dispatch outcome into the receipt object, keeping every
+/// committed receipt field intact.
+fn attach_dispatch(
+    mut receipt: serde_json::Value,
+    dispatch: Option<serde_json::Value>,
+) -> serde_json::Value {
+    if let (Some(dispatch), Some(object)) = (dispatch, receipt.as_object_mut()) {
+        object.insert("dispatch".to_string(), dispatch);
+    }
+    receipt
 }
 
 pub async fn dispatch(
@@ -113,4 +145,41 @@ pub async fn shutdown(
         }
     }
     Ok(Json(serde_json::json!({ "status": "shutting down" })))
+}
+
+#[cfg(test)]
+mod tests {
+    use central_application::contracts::{AppError, DispatchSummary};
+
+    use super::{attach_dispatch, dispatch_field};
+
+    #[test]
+    fn dispatch_failure_is_visible_in_response_field() {
+        let field = dispatch_field(Err(AppError::Storage("store exploded".to_string())));
+        assert_eq!(field["status"], "error");
+        assert!(
+            field["error"]
+                .as_str()
+                .expect("error text")
+                .contains("store exploded"),
+            "dispatch error must be visible to the caller: {field}"
+        );
+        // The committed receipt is preserved next to the dispatch field.
+        let receipt = serde_json::json!({"command_id": "c1", "revision": 3});
+        let merged = attach_dispatch(receipt, Some(field));
+        assert_eq!(merged["command_id"], "c1");
+        assert_eq!(merged["dispatch"]["status"], "error");
+    }
+
+    #[test]
+    fn dispatch_success_is_visible_in_response_field() {
+        let field = dispatch_field(Ok(DispatchSummary {
+            dispatched: 2,
+            unknown: 1,
+            still_pending: 0,
+        }));
+        assert_eq!(field["status"], "ok");
+        assert_eq!(field["dispatched"], 2);
+        assert_eq!(field["unknown"], 1);
+    }
 }
