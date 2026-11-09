@@ -2,7 +2,8 @@ mod support;
 
 use central_domain::{
     decide, decide_envelope, validate_plan, Attempt, AttemptId, AttemptStatus, Command,
-    CommandEnvelope, CommandId, DomainError, PlanDocumentV1, Revision, RunControl, TaskId,
+    CommandEnvelope, CommandId, DomainError, PlanDocumentV1, PlanStatus, Revision, RunControl,
+    TaskId, TaskStatus,
 };
 use support::{
     approved_run, created_run, leader, now, proposed_run, task_a, task_b, user, valid_plan,
@@ -134,6 +135,75 @@ fn pause_preserves_running_attempt() {
         .next;
     assert_eq!(paused.control, RunControl::Paused);
     assert_eq!(paused.attempts[&a].status, AttemptStatus::Running);
+}
+
+#[test]
+fn reproposing_approved_plan_does_not_downgrade_it() {
+    let (state, h1) = approved_run();
+    assert_eq!(state.active_plan, Some(h1.clone()));
+    assert_eq!(state.plans[&h1].status, PlanStatus::Approved);
+
+    let result = decide(
+        &state,
+        &leader(),
+        &Command::ProposePlan { plan: valid_plan() },
+        support::later(),
+    );
+    assert!(
+        matches!(result, Err(DomainError::InvalidTransition(_))),
+        "re-proposing the approved plan must be rejected, got {result:?}"
+    );
+}
+
+#[test]
+fn approval_does_not_mutate_existing_non_pending_task() {
+    let (mut state, _h1) = approved_run();
+    let running_before = {
+        let task = state.tasks.get_mut(&task_a()).expect("task A exists");
+        task.status = TaskStatus::Running;
+        task.repair_rounds_used = 1;
+        task.clone()
+    };
+
+    let mut revised = valid_plan();
+    revised.tasks[0].objective = "Rewritten A objective".to_string();
+    revised.tasks[0].verify.as_mut().unwrap().criteria = vec!["Rewritten A criteria".to_string()];
+    let new_task_id = TaskId::from_u128(4);
+    let mut new_task = revised.tasks[0].clone();
+    new_task.id = new_task_id;
+    new_task.objective = "Brand new task D".to_string();
+    new_task.depends_on = Vec::new();
+    new_task.data_depends_on = Vec::new();
+    revised.tasks.push(new_task);
+
+    let proposed = decide(
+        &state,
+        &leader(),
+        &Command::ProposePlan { plan: revised },
+        support::later(),
+    )
+    .expect("propose revised plan")
+    .next;
+    let h2 = proposed.pending_plan.clone().expect("pending revised plan");
+    let approved = decide(
+        &proposed,
+        &user(),
+        &Command::ApprovePlan {
+            plan_hash: h2.clone(),
+        },
+        support::later(),
+    )
+    .expect("approve revised plan")
+    .next;
+
+    assert_eq!(approved.active_plan, Some(h2.clone()));
+    // The Running task must not silently adopt the new plan's criteria.
+    assert_eq!(approved.tasks[&task_a()], running_before);
+    // Genuinely new tasks are still inserted as Pending.
+    let inserted = &approved.tasks[&new_task_id];
+    assert_eq!(inserted.status, TaskStatus::Pending);
+    assert_eq!(inserted.plan_hash, h2);
+    assert_eq!(inserted.objective, "Brand new task D");
 }
 
 #[test]

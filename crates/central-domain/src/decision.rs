@@ -95,6 +95,16 @@ pub fn decide(
                 ));
             }
             let hash = validate_plan(plan)?;
+            if state.active_plan.as_ref() == Some(&hash)
+                || matches!(
+                    state.plans.get(&hash).map(|p| p.status),
+                    Some(PlanStatus::Approved)
+                )
+            {
+                return Err(DomainError::InvalidTransition(
+                    "plan is already approved".to_string(),
+                ));
+            }
             let mut next = state.clone();
             if let Some(previous_hash) = next.pending_plan.take() {
                 if previous_hash != hash {
@@ -171,31 +181,22 @@ pub fn decide(
                     .verify
                     .clone()
                     .expect("approved plans passed validation");
-                next.tasks
-                    .entry(plan_task.id)
-                    .and_modify(|task| {
-                        task.plan_hash = plan_hash.clone();
-                        task.kind = plan_task.kind.clone();
-                        task.objective = plan_task.objective.clone();
-                        task.depends_on = plan_task.depends_on.clone();
-                        task.data_depends_on = plan_task.data_depends_on.clone();
-                        task.verify = verify.clone();
-                        task.profile_id = plan_task.profile_id;
-                        task.max_repair_rounds = plan_task.max_repair_rounds;
-                    })
-                    .or_insert_with(|| Task {
-                        id: plan_task.id,
-                        plan_hash: plan_hash.clone(),
-                        kind: plan_task.kind.clone(),
-                        objective: plan_task.objective.clone(),
-                        status: TaskStatus::Pending,
-                        depends_on: plan_task.depends_on.clone(),
-                        data_depends_on: plan_task.data_depends_on.clone(),
-                        verify: verify.clone(),
-                        profile_id: plan_task.profile_id,
-                        max_repair_rounds: plan_task.max_repair_rounds,
-                        repair_rounds_used: 0,
-                    });
+                // Existing tasks are never mutated on approval: a Running
+                // or Succeeded task must not silently adopt new criteria.
+                // Only genuinely new tasks are inserted (as Pending).
+                next.tasks.entry(plan_task.id).or_insert_with(|| Task {
+                    id: plan_task.id,
+                    plan_hash: plan_hash.clone(),
+                    kind: plan_task.kind.clone(),
+                    objective: plan_task.objective.clone(),
+                    status: TaskStatus::Pending,
+                    depends_on: plan_task.depends_on.clone(),
+                    data_depends_on: plan_task.data_depends_on.clone(),
+                    verify: verify.clone(),
+                    profile_id: plan_task.profile_id,
+                    max_repair_rounds: plan_task.max_repair_rounds,
+                    repair_rounds_used: 0,
+                });
             }
             Ok(finish(
                 next.clone(),
