@@ -412,6 +412,8 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
         clock,
         ids,
         agent,
+        // Fresh per process: secrets never survive a restart by construction.
+        secrets: Arc::new(central_application::inbox::SecretVault::new()),
         fake_agent_enabled: config.fake_agent && cfg!(feature = "test-support"),
         fake_counts,
         shutdown: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),

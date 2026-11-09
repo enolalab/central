@@ -19,4 +19,14 @@ pub trait AgentGateway: Send + Sync {
     async fn answer(&self, answer: ExternalAnswer) -> Result<(), DispatchError>;
     async fn cancel(&self, target: &ExecutionRef) -> Result<CancelObservation, AppError>;
     async fn reconcile(&self, target: &ExecutionRef) -> Result<ReconcileEvidence, AppError>;
+    /// Normalized harness requests (approvals/questions) bound to this
+    /// session that Central has not persisted yet. Draining removes them
+    /// from the gateway: the caller must persist them before any UI notice.
+    /// The default is empty for gateways without a request table.
+    async fn drain_requests(
+        &self,
+        _session: &SessionRef,
+    ) -> Result<Vec<crate::contracts::ExternalRequest>, AppError> {
+        Ok(Vec::new())
+    }
 }

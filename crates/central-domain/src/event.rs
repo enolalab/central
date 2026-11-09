@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorId, AttemptId, PlanHash, RunId, Timestamp};
+use crate::{ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, RunId, Timestamp};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
@@ -38,11 +38,56 @@ pub enum Event {
         by: ActorId,
         at: Timestamp,
     },
+    /// One harness request persisted before any UI notice. The event names
+    /// the canonical key only; the full entry (with its redacted preview)
+    /// lives in the snapshot.
+    InboxRequestRecorded {
+        run_id: RunId,
+        key: String,
+        kind: InboxKind,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A pending entry was answered; the response travels as an outbox
+    /// intent. The event carries no answer payload: secrets stay memory-only.
+    InboxAnswered {
+        run_id: RunId,
+        key: String,
+        outcome: InboxOutcome,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// An answered entry was confirmed by a harness observation.
+    InboxResolved {
+        run_id: RunId,
+        key: String,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One harness observation persisted; passive reconcile input.
+    ObservationRecorded {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        dedup_key: String,
+        at: Timestamp,
+    },
 }
 
 /// Intended side effects for the application layer to persist as outbox
 /// intents. Domain decision itself performs zero IO.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Effect {
-    CancelAttempt { attempt_id: AttemptId },
+    CancelAttempt {
+        attempt_id: AttemptId,
+    },
+    /// Send one external answer to the harness. A `Secret` payload carries a
+    /// random memory-only reference, never the credential, so the durable
+    /// intent is safe to persist; the application resolves the reference at
+    /// dispatch and sends nothing when the vault no longer holds it.
+    RespondToRequest {
+        key: crate::InboxKey,
+        payload: crate::AnswerPayload,
+        scope: crate::AnswerScope,
+        attempt_id: Option<AttemptId>,
+    },
 }

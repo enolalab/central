@@ -224,7 +224,7 @@ pub fn sanitize_value(value: &Value) -> Value {
     }
 }
 
-fn is_secret_key(key: &str) -> bool {
+pub(crate) fn is_secret_key(key: &str) -> bool {
     let lower = key.to_lowercase();
     lower.contains("token")
         || lower.contains("secret")
@@ -236,6 +236,19 @@ fn is_secret_key(key: &str) -> bool {
         || lower.contains("cookie")
         || lower.contains("set-cookie")
         || lower.contains("bearer")
+}
+
+/// True when any object key in the value looks secret-bearing, at any depth.
+/// Used by inbox normalization to flag requests whose stored preview needs
+/// the hardened path even when the harness did not declare a secret.
+pub(crate) fn is_secret_key_in(value: &Value) -> bool {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .any(|(key, nested)| is_secret_key(key) || is_secret_key_in(nested)),
+        Value::Array(items) => items.iter().any(is_secret_key_in),
+        _ => false,
+    }
 }
 
 /// Secret-bearing key names matched inside free text (case-insensitive).

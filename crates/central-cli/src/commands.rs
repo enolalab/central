@@ -84,6 +84,25 @@ pub fn execute(cli: Cli) -> i32 {
         Commands::Pause { run } => simple(&state_dir, run, Command::Pause),
         Commands::Stop { run } => simple(&state_dir, run, Command::Stop),
         Commands::Resume { run } => simple(&state_dir, run, Command::Resume),
+        Commands::Inbox { run } => inbox(&state_dir, run),
+        Commands::Approve {
+            run,
+            key,
+            preview_hash,
+        } => inbox_approve(&state_dir, run, key, preview_hash),
+        Commands::Decline {
+            run,
+            key,
+            preview_hash,
+            reason,
+        } => inbox_decline(&state_dir, run, key, preview_hash, reason),
+        Commands::Answer {
+            run,
+            key,
+            preview_hash,
+            message,
+            secret,
+        } => inbox_answer(&state_dir, run, key, preview_hash, message, secret),
     }
 }
 
@@ -204,6 +223,92 @@ fn plan(state_dir: &Path, command: &PlanCommands) -> i32 {
                 Err(message) => fail(&message),
             }
         }
+    }
+}
+
+/// List the durable inbox entries of a run: pending, answered, resolved
+/// and stale requests with the preview hash the user must quote back.
+fn inbox(state_dir: &Path, run: &RunId) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.get(&format!("/v1/runs/{run}/inbox")) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Approve a pending action approval. The key is a canonical inbox key,
+/// never a plan hash: plans approve through `central plan approve` only.
+fn inbox_approve(state_dir: &Path, run: &RunId, key: &str, preview_hash: &str) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.post_json(
+        &format!("/v1/runs/{run}/inbox/approve"),
+        &serde_json::json!({ "key": key, "preview_hash": preview_hash }),
+    ) {
+        Ok(receipt) => {
+            print_json(&receipt);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Decline a pending action approval with a reason for the harness.
+fn inbox_decline(
+    state_dir: &Path,
+    run: &RunId,
+    key: &str,
+    preview_hash: &str,
+    reason: &Option<String>,
+) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.post_json(
+        &format!("/v1/runs/{run}/inbox/decline"),
+        &serde_json::json!({ "key": key, "preview_hash": preview_hash, "reason": reason }),
+    ) {
+        Ok(receipt) => {
+            print_json(&receipt);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Answer a pending question. Exactly one of message (plain) or secret
+/// (memory-only, never persisted) is sent; the daemon rejects both or
+/// neither before anything is committed.
+fn inbox_answer(
+    state_dir: &Path,
+    run: &RunId,
+    key: &str,
+    preview_hash: &str,
+    message: &Option<String>,
+    secret: &Option<String>,
+) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.post_json(
+        &format!("/v1/runs/{run}/inbox/answer"),
+        &serde_json::json!({ "key": key, "preview_hash": preview_hash, "message": message, "secret": secret }),
+    ) {
+        Ok(receipt) => {
+            print_json(&receipt);
+            0
+        }
+        Err(message) => fail(&message),
     }
 }
 

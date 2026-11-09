@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod commands;
+pub mod inbox;
 pub mod runs;
 
 use std::sync::Arc;
@@ -26,6 +27,9 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub ids: Arc<dyn IdSource>,
     pub agent: Arc<dyn AgentGateway>,
+    /// Memory-only secret vault shared by the answer endpoint and dispatch.
+    /// Never persisted, never logged: a restart drops every reference.
+    pub secrets: Arc<central_application::inbox::SecretVault>,
     pub fake_agent_enabled: bool,
     pub fake_counts: Option<FakeCounts>,
     pub shutdown: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
@@ -41,6 +45,11 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs", get(runs::list_runs))
         .route("/v1/runs/{id}", get(runs::get_run))
         .route("/v1/runs/{id}/dispatch", post(commands::dispatch))
+        .route("/v1/runs/{id}/inbox", get(inbox::get_inbox))
+        .route("/v1/runs/{id}/inbox/approve", post(inbox::post_approve))
+        .route("/v1/runs/{id}/inbox/decline", post(inbox::post_decline))
+        .route("/v1/runs/{id}/inbox/answer", post(inbox::post_answer))
+        .route("/v1/runs/{id}/inbox/reconcile", post(inbox::post_reconcile))
         .route("/v1/shutdown", post(commands::shutdown))
         .route("/v1/test/fake-sends", get(fake_sends))
         .fallback(ui_not_built)

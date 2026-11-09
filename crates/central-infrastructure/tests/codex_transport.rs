@@ -580,6 +580,133 @@ async fn request_timeout_is_outcome_unknown_never_resends() {
     assert_eq!(seen, 1, "exactly one write, never resent");
 }
 
+/// T3 carry-over: buffered events bound to a live session drain into
+/// Observations instead of erroring; only overflow/closed (and sessions no
+/// live attempt owns) stay reconcile-required Transport errors. The request
+/// table behind the drain routes exactly one answer per request.
+#[tokio::test]
+async fn buffered_events_drain_to_bound_observations() {
+    use central_application::contracts::{ExternalAnswer, OpenSession};
+    use central_domain::{AnswerPayload, AnswerScope, AttemptId, Timestamp};
+
+    struct OpeningSupervisor;
+
+    #[async_trait]
+    impl ProcessSupervisor for OpeningSupervisor {
+        async fn spawn(&self, _spec: &ProcessSpec) -> Result<ProcessIdentity, AppError> {
+            Ok(ProcessIdentity {
+                pid: 4242,
+                created_at: Timestamp(1_700_000_000_000),
+                ownership_id: "test-job".to_string(),
+            })
+        }
+
+        async fn inspect(&self, _identity: &ProcessIdentity) -> Result<ProcessState, AppError> {
+            Ok(ProcessState::Running)
+        }
+
+        async fn terminate(&self, _identity: &ProcessIdentity) -> Result<(), AppError> {
+            Ok(())
+        }
+    }
+
+    let gateway = CodexGateway::new(Arc::new(OpeningSupervisor), CodexConfig::default());
+    let session = gateway
+        .open(OpenSession {
+            attempt_id: AttemptId::from_u128(42),
+            profile: profile(),
+            workspace: "C:\\fixture\\workspace".to_string(),
+            resume_from: None,
+        })
+        .await
+        .expect("open registers the attempt binding");
+
+    let approval = format!(
+        "{{\"id\":0,\"method\":\"item/commandExecution/requestApproval\",\"params\":{{\"kind\":\"command\",\"threadId\":\"{}\",\"turnId\":\"turn-1\",\"itemId\":\"exec-1\",\"command\":\"pwsh -NoProfile -Command demo\",\"availableDecisions\":[\"accept\",\"cancel\"]}}}}\n",
+        session.thread_id,
+    );
+    gateway.ingest_wire_frame(&approval);
+
+    // Bound events drain to attempt-scoped Observations: no Transport error
+    // merely because the buffer is non-empty.
+    let observations = gateway.observe(&session).await.expect("bound events drain");
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].attempt_id, AttemptId::from_u128(42));
+    assert_eq!(observations[0].provider_epoch, gateway.epoch());
+    assert!(
+        observations[0].dedup_key.contains("exec-1"),
+        "dedup names the item: {}",
+        observations[0].dedup_key
+    );
+
+    // The same wire request feeds the durable inbox exactly once, bound to
+    // the owning attempt; a replay is not a second entry.
+    let drained = gateway
+        .drain_requests(&session)
+        .await
+        .expect("drain persists once");
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].attempt_id, Some(AttemptId::from_u128(42)));
+    assert_eq!(
+        drained[0].key.session.instance_epoch,
+        gateway.epoch().to_string()
+    );
+    assert!(drained[0].preview.contains("demo"));
+    gateway.ingest_wire_frame(&approval);
+    let replay = gateway
+        .drain_requests(&session)
+        .await
+        .expect("replay drains nothing new");
+    assert!(replay.is_empty());
+
+    // Exactly one answer routes; the second use and a stale epoch refuse.
+    let key = drained[0].key.clone();
+    gateway
+        .answer(ExternalAnswer {
+            key: key.clone(),
+            payload: AnswerPayload::Plain("approved".to_string()),
+            scope: AnswerScope::Once,
+        })
+        .await
+        .expect("first answer routes");
+    let again = gateway
+        .answer(ExternalAnswer {
+            key: key.clone(),
+            payload: AnswerPayload::Plain("approved".to_string()),
+            scope: AnswerScope::Once,
+        })
+        .await
+        .expect_err("Once scope refuses a second reply");
+    assert!(
+        matches!(
+            again,
+            central_application::contracts::DispatchError::Rejected(_)
+        ),
+        "second reply is rejected, got {again:?}"
+    );
+    let stale = gateway
+        .answer(ExternalAnswer {
+            key: central_application::contracts::ExternalRequestKey {
+                session: SessionRef {
+                    provider: "codex".to_string(),
+                    instance_epoch: "epoch-0".to_string(),
+                    thread_id: session.thread_id.clone(),
+                },
+                turn_id: drained[0].key.turn_id.clone(),
+                item_id: drained[0].key.item_id.clone(),
+                request_id: drained[0].key.request_id.clone(),
+            },
+            payload: AnswerPayload::Plain("approved".to_string()),
+            scope: AnswerScope::Once,
+        })
+        .await
+        .expect_err("stale epoch never replays");
+    assert!(
+        format!("{stale:?}").contains("stale"),
+        "stale epoch is rejected, got {stale:?}"
+    );
+}
+
 /// Oversize frames close the transport instead of parsing partial events.
 #[tokio::test]
 async fn oversize_frame_closes_transport() {

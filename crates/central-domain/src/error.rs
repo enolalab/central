@@ -11,7 +11,10 @@ pub enum DomainError {
     UnsupportedPlanVersion(u32),
     EmptyPlan,
     DuplicateTaskId(TaskId),
-    MissingDependency { task: TaskId, dependency: TaskId },
+    MissingDependency {
+        task: TaskId,
+        dependency: TaskId,
+    },
     DependencyCycle,
     MissingVerification(TaskId),
     InvalidPlan(String),
@@ -19,6 +22,15 @@ pub enum DomainError {
     InvalidTransition(String),
     RunNotCreated,
     RunAlreadyCreated,
+    /// The reply targets a request that is no longer live: wrong epoch,
+    /// wrong preview, already answered, resolved, or stale. Never accept.
+    StaleRequest,
+    /// No inbox entry exists for this key. A plan hash is never an inbox
+    /// key: plan approval goes through `ApprovePlan`.
+    UnknownRequest(String),
+    /// The same request id was reused inside one epoch with different
+    /// content. Not a replay; refuse instead of overwriting.
+    RequestConflict(String),
 }
 
 impl fmt::Display for DomainError {
@@ -45,6 +57,19 @@ impl fmt::Display for DomainError {
             Self::InvalidTransition(msg) => write!(f, "invalid transition: {msg}"),
             Self::RunNotCreated => write!(f, "run has not been created"),
             Self::RunAlreadyCreated => write!(f, "run has already been created"),
+            Self::StaleRequest => write!(
+                f,
+                "stale request: the reply is not for the live request (wrong epoch, \
+                 preview, or the entry is already answered, resolved or stale)"
+            ),
+            Self::UnknownRequest(key) => write!(
+                f,
+                "unknown inbox request: {key} (plan hashes are not inbox keys)"
+            ),
+            Self::RequestConflict(key) => write!(
+                f,
+                "request id reused in one epoch with different content: {key}"
+            ),
         }
     }
 }

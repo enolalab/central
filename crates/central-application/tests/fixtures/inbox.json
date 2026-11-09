@@ -1,0 +1,75 @@
+{
+  "provenance": "Logical shapes distilled from spikes/codex-app-server captures (out-of-order.jsonl): approval carries threadId/turnId/itemId/command, question carries threadId/turnId/itemId/questions[] with per-question isSecret. No auth material.",
+  "requests": [
+    {
+      "name": "approval",
+      "kind": "Approval",
+      "epoch": "epoch-1",
+      "thread_id": "11111111-2222-4333-8444-555555555555",
+      "turn_id": "22222222-3333-4444-8555-666666666666",
+      "item_id": "exec-aaaa0000-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "request_id": "0",
+      "preview": "\"C:\\fixture\\tools\\pwsh.exe\" -NoProfile -Command \"& 'C:\\fixture\\tools\\node.exe' 'C:\\fixture\\workspace\\approval-helper.cjs'\"",
+      "is_secret": false
+    },
+    {
+      "name": "question",
+      "kind": "Question",
+      "epoch": "epoch-1",
+      "thread_id": "33333333-4444-4555-8666-777777777777",
+      "turn_id": "44444444-5555-4666-8777-888888888888",
+      "item_id": "call_fixture000000000000000000000001",
+      "request_id": "1",
+      "preview": "Which test label should I use? [Alpha: Use the Alpha label. | Beta: Use the Beta label.]",
+      "is_secret": false
+    },
+    {
+      "name": "question_secret",
+      "kind": "Question",
+      "epoch": "epoch-1",
+      "thread_id": "33333333-4444-4555-8666-777777777777",
+      "turn_id": "44444444-5555-4666-8777-888888888888",
+      "item_id": "call_fixture000000000000000000000002",
+      "request_id": "2",
+      "preview": "[redacted-secret]",
+      "is_secret": true
+    },
+    {
+      "name": "decline_example",
+      "kind": "Approval",
+      "epoch": "epoch-1",
+      "thread_id": "11111111-2222-4333-8444-555555555555",
+      "turn_id": "22222222-3333-4444-8555-666666666666",
+      "item_id": "exec-decline-0000-4ccc-8ddd-eeeeeeeeeeee",
+      "request_id": "3",
+      "preview": "rm -rf C:\\fixture\\workspace\\scratch",
+      "is_secret": false
+    },
+    {
+      "name": "cancel_example",
+      "kind": "Approval",
+      "epoch": "epoch-1",
+      "thread_id": "11111111-2222-4333-8444-555555555555",
+      "turn_id": "22222222-3333-4444-8555-666666666666",
+      "item_id": "exec-cancel-0000-4ccc-8ddd-eeeeeeeeeeee",
+      "request_id": "4",
+      "preview": "shutdown /s /t 0",
+      "is_secret": false
+    },
+    {
+      "name": "restart_approval_same_id",
+      "kind": "Approval",
+      "epoch": "epoch-2",
+      "thread_id": "99999999-8888-4777-8666-555555555555",
+      "turn_id": "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+      "item_id": "exec-restart-0000-4ccc-8ddd-eeeeeeeeeeee",
+      "request_id": "0",
+      "preview": "\"C:\\fixture\\tools\\pwsh.exe\" -NoProfile -Command \"& 'C:\\fixture\\tools\\node.exe' 'C:\\fixture\\workspace\\approval-helper.cjs'\"",
+      "is_secret": false
+    }
+  ],
+  "resolved_observation": {
+    "provider_epoch": "epoch-1",
+    "outcome": null
+  }
+}

@@ -5,10 +5,12 @@ use central_domain::{
 };
 
 use crate::contracts::{
-    command_payload_hash, AppError, CommitBatch, DispatchSummary, ExecutionRef, OutboxIntent,
-    OutboxStatus, Receipt, RecoverySummary, SessionRef,
+    command_payload_hash, AppError, CommitBatch, DispatchError, DispatchSummary, ExecutionRef,
+    ExternalAnswer, OutboxIntent, OutboxStatus, Receipt, RecoverySummary, SessionRef,
 };
+use crate::inbox::SecretVault;
 use crate::ports::{AgentGateway, Clock, IdSource, Store};
+use central_domain::AnswerPayload;
 
 /// Application command handler for one run. It validates through the pure
 /// domain decision, then commits state, events, outbox intents and the
@@ -20,6 +22,7 @@ pub struct Runtime {
     clock: Arc<dyn Clock>,
     ids: Arc<dyn IdSource>,
     agent: Arc<dyn AgentGateway>,
+    secrets: Arc<SecretVault>,
     run_id: RunId,
 }
 
@@ -36,8 +39,32 @@ impl Runtime {
             clock,
             ids,
             agent,
+            secrets: Arc::new(SecretVault::new()),
             run_id,
         }
+    }
+
+    /// Share a memory-only secret vault with this runtime. Dispatch resolves
+    /// secret references through it; a runtime with a fresh (empty) vault
+    /// sends nothing and waits for re-entry instead of replaying secrets.
+    pub fn with_secrets(self, secrets: Arc<SecretVault>) -> Self {
+        Self { secrets, ..self }
+    }
+
+    pub(crate) fn store(&self) -> &Arc<dyn Store> {
+        &self.store
+    }
+
+    pub(crate) fn agent(&self) -> &Arc<dyn AgentGateway> {
+        &self.agent
+    }
+
+    pub(crate) fn ids(&self) -> &Arc<dyn IdSource> {
+        &self.ids
+    }
+
+    pub(crate) fn secrets(&self) -> &Arc<SecretVault> {
+        &self.secrets
     }
 
     /// A runtime for a brand-new run whose id comes from the id source.
@@ -53,6 +80,7 @@ impl Runtime {
             clock,
             ids,
             agent,
+            secrets: Arc::new(SecretVault::new()),
             run_id,
         }
     }
@@ -156,8 +184,19 @@ impl Runtime {
                         )
                         .await?
                 {
-                    let Effect::CancelAttempt { attempt_id } = intent.effect;
-                    unknown_attempts.insert(attempt_id);
+                    // Both intent kinds describe one dispatch for an
+                    // attempt; a dispatch interrupted mid-flight is unknown,
+                    // never resent blindly — including a queued answer.
+                    match intent.effect {
+                        Effect::CancelAttempt { attempt_id } => {
+                            unknown_attempts.insert(attempt_id);
+                        }
+                        Effect::RespondToRequest { attempt_id, .. } => {
+                            if let Some(attempt_id) = attempt_id {
+                                unknown_attempts.insert(attempt_id);
+                            }
+                        }
+                    }
                 }
             }
             for attempt in next.attempts.values_mut() {
@@ -182,6 +221,25 @@ impl Runtime {
             }
         }
         Ok(summary)
+    }
+
+    /// Whether an intent may be claimed for sending right now. Cancels
+    /// follow the run gate above; answers additionally require a Running
+    /// run and — for secrets — a live memory-only reference. A `false`
+    /// here leaves the intent Pending without claiming it.
+    fn sendable_now(&self, state: &RunState, intent: &OutboxIntent) -> bool {
+        match &intent.effect {
+            Effect::CancelAttempt { .. } => true,
+            Effect::RespondToRequest { payload, .. } => {
+                if state.control != RunControl::Running {
+                    return false;
+                }
+                match payload {
+                    AnswerPayload::Plain(_) => true,
+                    AnswerPayload::Secret(reference) => self.secrets.lookup(reference).is_some(),
+                }
+            }
+        }
     }
 
     /// Dispatch pending outbox intents for one run, one guarded
@@ -210,6 +268,15 @@ impl Runtime {
         let mut next_state = state.clone();
         let mut state_changed = false;
         for intent in &pending {
+            // Answers only go out while the run is Running, and a secret
+            // answer needs its memory-only reference to still resolve.
+            // Skipped intents are never claimed, so they stay Pending:
+            // answering opens no inference before explicit resume, a
+            // stopped run never answers, and a missing secret waits for
+            // re-entry instead of sending.
+            if !self.sendable_now(&state, intent) {
+                continue;
+            }
             // Claim the intent. If the guard fails another dispatcher
             // already owns it; skip without sending.
             let claimed = self
@@ -221,6 +288,103 @@ impl Runtime {
             }
             summary.still_pending -= 1;
             match &intent.effect {
+                Effect::RespondToRequest {
+                    key,
+                    payload,
+                    scope,
+                    attempt_id,
+                } => {
+                    // The plaintext resolves without opening inference:
+                    // secrets come only from the memory-only vault, whose
+                    // presence was checked before the claim above.
+                    let text = match payload {
+                        AnswerPayload::Plain(text) => text.clone(),
+                        AnswerPayload::Secret(reference) => {
+                            match self.secrets.lookup(reference) {
+                                Some(secret) => secret,
+                                None => {
+                                    // Lost between gate and claim: release
+                                    // back to Pending for re-entry.
+                                    self.store
+                                        .transition_outbox(
+                                            intent.id,
+                                            OutboxStatus::Dispatching,
+                                            OutboxStatus::Pending,
+                                        )
+                                        .await?;
+                                    summary.still_pending += 1;
+                                    continue;
+                                }
+                            }
+                        }
+                    };
+                    let answer = ExternalAnswer {
+                        key: crate::contracts::ExternalRequestKey {
+                            session: SessionRef {
+                                provider: key.provider.clone(),
+                                instance_epoch: key.epoch.clone(),
+                                thread_id: key.thread_id.clone(),
+                            },
+                            turn_id: key.turn_id.clone(),
+                            item_id: key.item_id.clone(),
+                            request_id: key.request_id.clone(),
+                        },
+                        payload: AnswerPayload::Plain(text),
+                        scope: *scope,
+                    };
+                    match self.agent.answer(answer).await {
+                        Ok(()) => {
+                            self.store
+                                .transition_outbox(
+                                    intent.id,
+                                    OutboxStatus::Dispatching,
+                                    OutboxStatus::Completed,
+                                )
+                                .await?;
+                            summary.dispatched += 1;
+                            if let AnswerPayload::Secret(reference) = payload {
+                                self.secrets.consume(reference);
+                            }
+                            // The inbox entry stays Answered until a harness
+                            // observation confirms it: resolution is passive.
+                        }
+                        Err(DispatchError::Rejected(message)) => {
+                            // The harness refused the reply (unknown or
+                            // already-used key): never resend.
+                            let _ = message;
+                            self.store
+                                .transition_outbox(
+                                    intent.id,
+                                    OutboxStatus::Dispatching,
+                                    OutboxStatus::Failed,
+                                )
+                                .await?;
+                            summary.unknown += 1;
+                            if let Some(attempt_id) = attempt_id {
+                                if let Some(attempt) = next_state.attempts.get_mut(attempt_id) {
+                                    attempt.status = AttemptStatus::UnknownOutcome;
+                                    state_changed = true;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            self.store
+                                .transition_outbox(
+                                    intent.id,
+                                    OutboxStatus::Dispatching,
+                                    OutboxStatus::UnknownOutcome,
+                                )
+                                .await?;
+                            summary.unknown += 1;
+                            if let Some(attempt_id) = attempt_id {
+                                if let Some(attempt) = next_state.attempts.get_mut(attempt_id) {
+                                    attempt.status = AttemptStatus::UnknownOutcome;
+                                    state_changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
                 Effect::CancelAttempt { attempt_id } => {
                     let target = ExecutionRef {
                         attempt_id: *attempt_id,

@@ -1,6 +1,7 @@
 use crate::{
-    validate_plan, Actor, ActorKind, AttemptStatus, Command, CommandEnvelope, DomainError, Effect,
-    Event, PlanRevision, PlanStatus, RunControl, RunState, Task, TaskStatus, Timestamp,
+    inbox, validate_plan, Actor, ActorKind, AnswerPayload, AttemptStatus, Command, CommandEnvelope,
+    DomainError, Effect, Event, InboxEntry, InboxKey, InboxKind, InboxOutcome, InboxStatus,
+    PlanRevision, PlanStatus, RunControl, RunState, Task, TaskStatus, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -276,6 +277,13 @@ pub fn decide(
                     });
                 }
             }
+            // A stopped run answers nothing: live entries go stale so no
+            // reply can be accepted after the stop.
+            for entry in next.inbox.values_mut() {
+                if matches!(entry.status, InboxStatus::Pending | InboxStatus::Answered) {
+                    entry.status = InboxStatus::Stale;
+                }
+            }
             Ok(finish(
                 next.clone(),
                 vec![Event::RunStopped {
@@ -312,7 +320,269 @@ pub fn decide(
                 Vec::new(),
             ))
         }
+
+        Command::RecordExternalRequest { request } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            if state.control == RunControl::Stopped {
+                return Err(DomainError::InvalidTransition(
+                    "cannot record external requests for a stopped run".to_string(),
+                ));
+            }
+            let canonical = request.key.canonical();
+            if let Some(existing) = state.inbox.get(&canonical) {
+                // Same key, same text: a harness replay, not a new entry.
+                if existing.preview_hash == request.preview_hash {
+                    let next = state.clone();
+                    return Ok(finish(next, Vec::new(), Vec::new()));
+                }
+                // Same key, different text inside one epoch: protocol
+                // violation, never an overwrite.
+                return Err(DomainError::RequestConflict(canonical));
+            }
+            let mut next = state.clone();
+            next.inbox.insert(
+                canonical.clone(),
+                InboxEntry {
+                    key: canonical.clone(),
+                    attempt_id: request.attempt_id,
+                    kind: request.kind,
+                    status: InboxStatus::Pending,
+                    preview_hash: request.preview_hash.clone(),
+                    preview: inbox::truncate_preview(&request.preview),
+                    requested_by: actor.id,
+                    requested_at: now,
+                    provider: request.key.provider.clone(),
+                    epoch: request.key.epoch.clone(),
+                    thread_id: request.key.thread_id.clone(),
+                    turn_id: request.key.turn_id.clone(),
+                    item_id: request.key.item_id.clone(),
+                    request_id: request.key.request_id.clone(),
+                    is_secret: request.is_secret,
+                },
+            );
+            // The attempt parks in a waiting state; recording alone never
+            // answers and never dispatches.
+            if let Some(attempt_id) = request.attempt_id {
+                if let Some(attempt) = next.attempts.get_mut(&attempt_id) {
+                    if attempt.status == AttemptStatus::Running {
+                        attempt.status = match request.kind {
+                            InboxKind::Approval => AttemptStatus::WaitingForApproval,
+                            InboxKind::Question => AttemptStatus::WaitingForInput,
+                        };
+                    }
+                }
+            }
+            Ok(finish(
+                next.clone(),
+                vec![Event::InboxRequestRecorded {
+                    run_id: next.id,
+                    key: canonical,
+                    kind: request.kind,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::RecordObservation { observation } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            let mut next = state.clone();
+            let mut events = Vec::new();
+            if !next
+                .observations
+                .iter()
+                .any(|known| known.dedup_key == observation.dedup_key)
+            {
+                if next.observations.len() >= MAX_OBSERVATIONS {
+                    next.observations.remove(0);
+                }
+                next.observations.push(observation.clone());
+                events.push(Event::ObservationRecorded {
+                    run_id: next.id,
+                    attempt_id: observation.attempt_id,
+                    dedup_key: observation.dedup_key.clone(),
+                    at: now,
+                });
+            }
+            // Passive reconcile: observations confirm answered entries of the
+            // same attempt. Nothing auto-answers; resolution only follows an
+            // explicit user reply plus harness evidence.
+            let mut resolved_any = false;
+            for entry in next.inbox.values_mut() {
+                if entry.status == InboxStatus::Answered
+                    && entry.attempt_id == Some(observation.attempt_id)
+                {
+                    entry.status = InboxStatus::Resolved;
+                    events.push(Event::InboxResolved {
+                        run_id: next.id,
+                        key: entry.key.clone(),
+                        by: actor.id,
+                        at: now,
+                    });
+                    resolved_any = true;
+                }
+            }
+            if resolved_any {
+                if let Some(attempt) = next.attempts.get_mut(&observation.attempt_id) {
+                    if matches!(
+                        attempt.status,
+                        AttemptStatus::WaitingForApproval | AttemptStatus::WaitingForInput
+                    ) {
+                        attempt.status = AttemptStatus::Running;
+                    }
+                }
+            }
+            Ok(finish(next.clone(), events, Vec::new()))
+        }
+
+        Command::AnswerQuestion {
+            key,
+            preview_hash,
+            payload,
+        } => {
+            require_user(actor)?;
+            answer_inbox(
+                state,
+                actor,
+                key,
+                preview_hash,
+                InboxKind::Question,
+                InboxOutcome::Answered,
+                payload.clone(),
+                now,
+            )
+        }
+
+        Command::ApproveAction { key, preview_hash } => {
+            require_user(actor)?;
+            answer_inbox(
+                state,
+                actor,
+                key,
+                preview_hash,
+                InboxKind::Approval,
+                InboxOutcome::Approved,
+                AnswerPayload::Plain("approved".to_string()),
+                now,
+            )
+        }
+
+        Command::DeclineAction {
+            key,
+            preview_hash,
+            reason,
+        } => {
+            require_user(actor)?;
+            if reason.trim().is_empty() {
+                return Err(DomainError::InvalidCommand(
+                    "a decline needs a reason for the harness".to_string(),
+                ));
+            }
+            answer_inbox(
+                state,
+                actor,
+                key,
+                preview_hash,
+                InboxKind::Approval,
+                InboxOutcome::Declined,
+                AnswerPayload::Plain(format!("declined: {}", reason.trim())),
+                now,
+            )
+        }
     }
+}
+
+/// Bound on stored harness observations; oldest drops first.
+const MAX_OBSERVATIONS: usize = 4096;
+
+/// Shared reply path: only a live Pending entry answers, scoped to its key
+/// (epoch included) and to the exact preview the user saw. The reply becomes
+/// a durable outbox intent; dispatch sends it only while the run is Running.
+#[allow(clippy::too_many_arguments)]
+fn answer_inbox(
+    state: &RunState,
+    actor: &Actor,
+    key: &InboxKey,
+    preview_hash: &crate::ContentHash,
+    expected_kind: InboxKind,
+    outcome: InboxOutcome,
+    payload: AnswerPayload,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_created(state)?;
+    let canonical = key.canonical();
+    let entry = match state.inbox.get(&canonical) {
+        Some(entry) => entry,
+        None => {
+            // Same harness request under another epoch (for example a
+            // restart that reused the request id): the reply is stale, not
+            // unknown. Anything else names nothing at all — a plan hash is
+            // never an inbox key.
+            let rotated = state.inbox.values().any(|entry| {
+                entry.provider == key.provider
+                    && entry.thread_id == key.thread_id
+                    && entry.turn_id == key.turn_id
+                    && entry.item_id == key.item_id
+                    && entry.request_id == key.request_id
+            });
+            if rotated {
+                return Err(DomainError::StaleRequest);
+            }
+            return Err(DomainError::UnknownRequest(canonical.clone()));
+        }
+    };
+    if entry.kind != expected_kind {
+        return Err(DomainError::InvalidTransition(match expected_kind {
+            InboxKind::Question => "entry is an action approval; answer questions with AnswerQuestion, approve or decline approvals"
+                .to_string(),
+            InboxKind::Approval => "entry is a question; answer it with AnswerQuestion, approvals use ApproveAction or DeclineAction"
+                .to_string(),
+        }));
+    }
+    if entry.status != InboxStatus::Pending
+        || entry.epoch != key.epoch
+        || entry.preview_hash != *preview_hash
+    {
+        // Covers answered, resolved and stale entries, epoch rotations and
+        // preview mismatches: an old accept never applies, even to the same
+        // text under a new key.
+        return Err(DomainError::StaleRequest);
+    }
+    match &payload {
+        AnswerPayload::Plain(text) if text.trim().is_empty() => {
+            return Err(DomainError::InvalidCommand(
+                "an answer must not be empty".to_string(),
+            ));
+        }
+        AnswerPayload::Secret(reference) if reference.as_str().trim().is_empty() => {
+            return Err(DomainError::InvalidCommand(
+                "a secret answer needs a volatile reference".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    let mut next = state.clone();
+    let stored = next.inbox.get_mut(&canonical).expect("entry checked above");
+    stored.status = InboxStatus::Answered;
+    Ok(finish(
+        next.clone(),
+        vec![Event::InboxAnswered {
+            run_id: next.id,
+            key: canonical.clone(),
+            outcome,
+            by: actor.id,
+            at: now,
+        }],
+        vec![Effect::RespondToRequest {
+            key: key.clone(),
+            payload,
+            scope: crate::AnswerScope::Once,
+            attempt_id: entry.attempt_id,
+        }],
+    ))
 }
 
 /// Envelope path: expected-revision is checked separately here, before the

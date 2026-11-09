@@ -10,11 +10,16 @@
 //! `0.167.0-alpha.3.2`; see `contracts/codex/0.167.0-alpha.3.2/`.
 
 pub mod gateway;
+pub mod requests;
 pub mod stdio;
 pub mod version;
 pub mod wire;
 
 pub use gateway::{CodexConfig, CodexGateway};
+pub use requests::{
+    method_kind, normalize_request, observation_for, NormalizedRequest, PendingRequestTable,
+    SECRET_PREVIEW_PLACEHOLDER,
+};
 pub use stdio::{BufferedEvent, EventBuffer, IncomingEvent, RpcClient};
 pub use version::{
     check_model_match, check_supported_version, parse_cli_version, CliVersion, VersionError,

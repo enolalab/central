@@ -50,6 +50,46 @@ pub enum Commands {
         #[command(subcommand)]
         command: PlanCommands,
     },
+    /// Show pending approval/question entries for a run.
+    Inbox {
+        #[arg(long)]
+        run: RunId,
+    },
+    /// Approve a pending action approval by inbox key. A plan hash is not
+    /// a key: plans approve through `central plan approve` only.
+    Approve {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        preview_hash: String,
+    },
+    /// Decline a pending action approval by inbox key.
+    Decline {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        preview_hash: String,
+        #[arg(long)]
+        reason: Option<String>,
+    },
+    /// Answer a pending question by inbox key. Exactly one of --message
+    /// (plain) or --secret (memory-only; never persisted) is required.
+    Answer {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        preview_hash: String,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        secret: Option<String>,
+    },
     /// Pause a running run (in-flight attempts finish).
     Pause {
         #[arg(long)]

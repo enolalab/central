@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorId, CommandId, PlanDocumentV1, PlanHash, Revision};
+use crate::{
+    ActorId, AnswerPayload, CommandId, ContentHash, InboxKey, InboxRequest, Observation,
+    PlanDocumentV1, PlanHash, Revision,
+};
 
 /// Internal identity kind. The actor is derived from auth/session mapping,
 /// never trusted from a request body claiming to be one of these.
@@ -37,12 +40,49 @@ impl Actor {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Command {
-    CreateRun { goal: String, repository: String },
-    ProposePlan { plan: PlanDocumentV1 },
-    ApprovePlan { plan_hash: PlanHash },
+    CreateRun {
+        goal: String,
+        repository: String,
+    },
+    ProposePlan {
+        plan: PlanDocumentV1,
+    },
+    ApprovePlan {
+        plan_hash: PlanHash,
+    },
     Pause,
     Stop,
     Resume,
+    /// Persist one normalized harness request before any UI notice. Replay
+    /// of the same request is a duplicate, not a second entry. Recording
+    /// never triggers inference.
+    RecordExternalRequest {
+        request: InboxRequest,
+    },
+    /// Persist one harness observation; passively resolves the Answered
+    /// entries of the same attempt. Never fabricates answers.
+    RecordObservation {
+        observation: Observation,
+    },
+    /// Answer a pending question. Secret answers carry a random
+    /// `VolatileAnswerRef`, never the credential.
+    AnswerQuestion {
+        key: InboxKey,
+        preview_hash: ContentHash,
+        payload: AnswerPayload,
+    },
+    /// Approve a pending action approval. Plan hashes are not inbox keys:
+    /// plan approval goes through `ApprovePlan` only.
+    ApproveAction {
+        key: InboxKey,
+        preview_hash: ContentHash,
+    },
+    /// Decline a pending action approval with a user reason.
+    DeclineAction {
+        key: InboxKey,
+        preview_hash: ContentHash,
+        reason: String,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

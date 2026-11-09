@@ -15,11 +15,13 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use central_application::contracts::{
     AppError, CancelObservation, Capabilities, DispatchError, ExecutionRef, ExternalAnswer,
-    OpenSession, ProcessIdentity, ProcessSpec, ReconcileEvidence, SendTurn, SessionRef, TurnRef,
+    ExternalRequest, OpenSession, ProcessIdentity, ProcessSpec, ReconcileEvidence, SendTurn,
+    SessionRef, TurnRef,
 };
 use central_application::ports::{AgentGateway, ProcessSupervisor};
-use central_domain::{AttemptId, AttemptStatus, Observation, ResolvedProfile};
+use central_domain::{AnswerPayload, AttemptId, AttemptStatus, Observation, ResolvedProfile};
 
+use super::requests::{normalize_request, observation_for, PendingRequestTable};
 use super::stdio::EventBuffer;
 use super::version::{check_model_match, check_supported_version, parse_cli_version, VersionError};
 use super::wire::{parse_frame, sanitize_text, IncomingFrame, FRAME_CAP_BYTES};
@@ -84,6 +86,10 @@ struct GatewayState {
     closed: bool,
     closed_reason: Option<String>,
     sessions: HashMap<AttemptId, ManagedSession>,
+    /// Gateway-side harness requests. The application drains these into the
+    /// durable inbox (persist-before-notice); answers route through this
+    /// table with a Once scope.
+    requests: PendingRequestTable,
 }
 
 /// Codex app-server adapter. One instance per supervised process; the
@@ -106,6 +112,7 @@ impl CodexGateway {
                 closed: false,
                 closed_reason: None,
                 sessions: HashMap::new(),
+                requests: PendingRequestTable::new(),
             }),
             config,
         }
@@ -154,12 +161,19 @@ impl CodexGateway {
                 });
             }
             Ok(IncomingFrame::ServerRequest { id, method, params }) => {
-                state.buffer.push(super::stdio::BufferedEvent {
+                let event = super::stdio::BufferedEvent {
                     id: Some(id),
                     method,
                     params,
                     is_request: true,
-                });
+                };
+                // Inbox traffic normalizes into the gateway-side request
+                // table here; a replay keeps the first copy, never a second
+                // entry. The application persists it before any UI notice.
+                if let Some(normalized) = normalize_request(&self.epoch, &event) {
+                    state.requests.record(normalized);
+                }
+                state.buffer.push(event);
             }
             Ok(IncomingFrame::Response { .. }) => {
                 // No outstanding request table exists before T2 wiring; an
@@ -290,7 +304,7 @@ impl AgentGateway for CodexGateway {
         ))
     }
 
-    async fn observe(&self, _session: &SessionRef) -> Result<Vec<Observation>, AppError> {
+    async fn observe(&self, session: &SessionRef) -> Result<Vec<Observation>, AppError> {
         self.ensure_compatible()?;
         let mut state = self.state.lock().expect("gateway state");
         if state.closed {
@@ -306,15 +320,78 @@ impl AgentGateway for CodexGateway {
                     .to_string(),
             ));
         }
-        if !state.buffer.is_empty() {
+        if state.buffer.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Bind buffered events to the attempt that owns this session. Events
+        // for other threads stay buffered for their own session; events no
+        // live session owns are reconcile-required evidence, never silent
+        // drops and never fabricated Observations.
+        let attempt_id = state
+            .sessions
+            .iter()
+            .find(|(_, managed)| {
+                managed.session.thread_id == session.thread_id
+                    && managed.session.instance_epoch == session.instance_epoch
+            })
+            .map(|(attempt_id, _)| *attempt_id);
+        let Some(attempt_id) = attempt_id else {
             let pending = state.buffer.len();
             return Err(AppError::Transport(format!(
-                "reconcile-required: {pending} unattributed notification(s); attempt binding \
-                 arrives with the T3 inbox, Central never fabricates Observations"
+                "reconcile-required: {pending} unattributed notification(s) for an unknown \
+                 session; Central never fabricates Observations"
+            )));
+        };
+        let epoch = self.epoch.clone();
+        let mut matched = Vec::new();
+        let mut rest = Vec::new();
+        for event in state.buffer.drain() {
+            let thread = event
+                .params
+                .get("threadId")
+                .or_else(|| event.params.get("thread_id"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if thread == session.thread_id {
+                matched.push(observation_for(&epoch, attempt_id, &event));
+            } else {
+                rest.push(event);
+            }
+        }
+        if matched.is_empty() {
+            for event in rest {
+                state.buffer.push(event);
+                if state.buffer.overflowed() {
+                    break;
+                }
+            }
+            if state.buffer.overflowed() {
+                return Err(AppError::Transport(
+                    "reconcile-required: notification buffer overflowed; events may have been \
+                     dropped, full reconcile instead of silent resumption"
+                        .to_string(),
+                ));
+            }
+            let pending = state.buffer.len();
+            return Err(AppError::Transport(format!(
+                "reconcile-required: {pending} unattributed notification(s) for an unknown \
+                 session; Central never fabricates Observations"
             )));
         }
-        let _ = &mut state;
-        Ok(Vec::new())
+        for event in rest {
+            state.buffer.push(event);
+            if state.buffer.overflowed() {
+                break;
+            }
+        }
+        if state.buffer.overflowed() {
+            return Err(AppError::Transport(
+                "reconcile-required: notification buffer overflowed; events may have been \
+                 dropped, full reconcile instead of silent resumption"
+                    .to_string(),
+            ));
+        }
+        Ok(matched)
     }
 
     async fn answer(&self, answer: ExternalAnswer) -> Result<(), DispatchError> {
@@ -329,11 +406,43 @@ impl AgentGateway for CodexGateway {
                 answer.key.session.instance_epoch, self.epoch
             )));
         }
-        if answer.answer.is_empty() {
-            return Err(DispatchError::Rejected("empty external answer".to_string()));
+        match &answer.payload {
+            AnswerPayload::Plain(text) if text.is_empty() => {
+                return Err(DispatchError::Rejected("empty external answer".to_string()));
+            }
+            AnswerPayload::Plain(_) => {}
+            AnswerPayload::Secret(_) => {
+                // The gateway never sees credentials: the application resolves
+                // the memory-only reference before calling.
+                return Err(DispatchError::Rejected(
+                    "secret answers must be resolved to plain text by the caller".to_string(),
+                ));
+            }
         }
-        // The pending-request table that routes this answer arrives with T3.
-        Ok(())
+        // Once scope: the table refuses unknown, not-yet-persisted and
+        // already-answered keys instead of resending.
+        self.state
+            .lock()
+            .expect("gateway state")
+            .requests
+            .consume_answer(&answer.key)
+            .map_err(|error: AppError| DispatchError::Rejected(error.to_string()))
+    }
+
+    async fn drain_requests(&self, session: &SessionRef) -> Result<Vec<ExternalRequest>, AppError> {
+        self.ensure_compatible()?;
+        let mut state = self.state.lock().expect("gateway state");
+        let attempt_id = state
+            .sessions
+            .iter()
+            .find(|(_, managed)| {
+                managed.session.thread_id == session.thread_id
+                    && managed.session.instance_epoch == session.instance_epoch
+            })
+            .map(|(attempt_id, _)| *attempt_id);
+        Ok(state
+            .requests
+            .drain_for_thread(&session.thread_id, attempt_id))
     }
 
     async fn cancel(&self, target: &ExecutionRef) -> Result<CancelObservation, AppError> {

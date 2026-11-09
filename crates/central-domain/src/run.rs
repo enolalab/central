@@ -110,20 +110,7 @@ pub struct Attempt {
     pub created_at: Timestamp,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum InboxStatus {
-    Pending,
-    Answered,
-    Resolved,
-    Stale,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InboxEntry {
-    pub key: String,
-    pub attempt_id: Option<AttemptId>,
-    pub status: InboxStatus,
-}
+pub use crate::inbox::{InboxEntry, InboxStatus};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Artifact {
@@ -158,6 +145,10 @@ pub struct RunState {
     pub tasks: BTreeMap<TaskId, Task>,
     pub attempts: BTreeMap<AttemptId, Attempt>,
     pub inbox: BTreeMap<String, InboxEntry>,
+    /// Deduplicated harness observations (by `dedup_key`), newest last.
+    /// Passive reconcile input: resolving inbox entries reads these, and
+    /// the audit trail lives in events. Bounded by decision, not by callers.
+    pub observations: Vec<Observation>,
     pub artifacts: BTreeMap<ArtifactId, Artifact>,
     pub usage: UsageLedger,
     pub holds: BTreeSet<HoldReason>,
@@ -179,6 +170,7 @@ impl RunState {
             tasks: BTreeMap::new(),
             attempts: BTreeMap::new(),
             inbox: BTreeMap::new(),
+            observations: Vec::new(),
             artifacts: BTreeMap::new(),
             usage: UsageLedger::default(),
             holds: BTreeSet::new(),

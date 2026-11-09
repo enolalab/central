@@ -1,8 +1,9 @@
 use std::fmt;
 
 use central_domain::{
-    ActorId, AttemptId, AttemptStatus, CommandEnvelope, CommandId, ContentHash, DomainError,
-    Effect, Event, IntentId, ResolvedProfile, Revision, RunId, RunState, Timestamp,
+    ActorId, AnswerPayload, AnswerScope, AttemptId, AttemptStatus, CommandEnvelope, CommandId,
+    ContentHash, DomainError, Effect, Event, InboxKind, IntentId, ResolvedProfile, Revision, RunId,
+    RunState, Timestamp,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -40,10 +41,13 @@ impl From<DomainError> for AppError {
     fn from(error: DomainError) -> Self {
         match error {
             DomainError::Forbidden => Self::Forbidden(error.to_string()),
-            DomainError::StaleRevision | DomainError::PlanHashMismatch => {
-                Self::Conflict(error.to_string())
+            DomainError::StaleRevision
+            | DomainError::PlanHashMismatch
+            | DomainError::StaleRequest
+            | DomainError::RequestConflict(_) => Self::Conflict(error.to_string()),
+            DomainError::UnknownPlan(_) | DomainError::UnknownRequest(_) => {
+                Self::NotFound(error.to_string())
             }
-            DomainError::UnknownPlan(_) => Self::NotFound(error.to_string()),
             other => Self::Validation(other.to_string()),
         }
     }
@@ -186,10 +190,28 @@ pub struct SendTurn {
     pub command_id: CommandId,
 }
 
+/// One answer to an external harness request. The scope is always
+/// [`AnswerScope::Once`]: a reply is consumed by a single send and never
+/// replayed. A `Secret` payload here is already resolved to plain text by the
+/// caller — the durable intent is what carries the memory-only reference.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExternalAnswer {
     pub key: ExternalRequestKey,
-    pub answer: String,
+    pub payload: AnswerPayload,
+    pub scope: AnswerScope,
+}
+
+/// One normalized harness request waiting for a user reply. The preview is
+/// redacted and truncated at the source; secret-bearing requests carry a
+/// placeholder preview and `is_secret`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalRequest {
+    pub key: ExternalRequestKey,
+    pub kind: InboxKind,
+    pub preview: String,
+    pub preview_hash: ContentHash,
+    pub attempt_id: Option<AttemptId>,
+    pub is_secret: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

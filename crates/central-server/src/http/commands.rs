@@ -25,6 +25,8 @@ fn runtime_for(state: &AppState, run_id: RunId) -> Runtime {
         Arc::clone(&state.agent),
         run_id,
     )
+    // Shares the daemon vault so secret answers dispatch from memory.
+    .with_secrets(Arc::clone(&state.secrets))
 }
 
 pub async fn post_command(

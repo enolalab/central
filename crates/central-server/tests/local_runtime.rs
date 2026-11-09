@@ -655,6 +655,7 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
         clock: std::sync::Arc::new(central_server::bootstrap::SystemClock),
         ids: std::sync::Arc::new(central_server::bootstrap::UuidIds),
         agent: std::sync::Arc::new(central_server::bootstrap::UnavailableGateway),
+        secrets: std::sync::Arc::new(central_application::inbox::SecretVault::new()),
         fake_agent_enabled: false,
         fake_counts: None,
         shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
