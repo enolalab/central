@@ -687,7 +687,8 @@ pub fn decide(
         Command::DeferRetry {
             attempt,
             not_before,
-        } => defer_retry(state, actor, *attempt, *not_before, now),
+            max_retries,
+        } => defer_retry(state, actor, *attempt, *not_before, *max_retries, now),
 
         Command::SetLimits { limits } => {
             require_user(actor)?;
@@ -1215,13 +1216,16 @@ fn reopen_task(
 }
 
 /// Defer one safe retry of a definitely-unsent attempt. The retry budget
-/// is bounded: an exhausted attempt parks as failed (recoverable via
-/// `ReopenTask`, same as a refused send) instead of retrying forever.
+/// is bounded by the command's carried `max_retries` (the configured
+/// policy bound, default 3): an exhausted attempt parks as failed
+/// (recoverable via `ReopenTask`, same as a refused send) instead of
+/// retrying forever.
 fn defer_retry(
     state: &RunState,
     actor: &Actor,
     attempt: crate::AttemptId,
     not_before: Timestamp,
+    max_retries: u32,
     now: Timestamp,
 ) -> Result<Decision, DomainError> {
     require_user_or_system(actor)?;
@@ -1244,7 +1248,7 @@ fn defer_retry(
         )));
     }
     let used = retry_used(state, attempt);
-    if used >= crate::MAX_RETRIES_DEFAULT {
+    if used >= max_retries {
         // Retry budget exhausted: park recoverably, like a refused send.
         let mut next = state.clone();
         let task_id = next.attempts.get(&attempt).expect("checked above").task_id;

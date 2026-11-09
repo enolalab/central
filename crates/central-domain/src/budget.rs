@@ -26,7 +26,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorId, AttemptId, HoldReason, RunState, Timestamp};
+use crate::{is_confirmed_terminal, ActorId, AttemptId, HoldReason, RunState, Timestamp};
 
 /// Source marker whose reports never add to the ledger: a cached read is
 /// not new consumption.
@@ -133,6 +133,9 @@ pub struct UsageAuditEntry {
 pub struct UsageLimits {
     pub max_tokens: Option<u64>,
     pub max_cost_minor: Option<u64>,
+    /// Maximum live (non-terminal) attempts before new attempts hold.
+    /// Terminal attempts never consume this cap, so recovery requeues
+    /// always fit under a cap hit only by history.
     pub max_attempts: Option<u64>,
     pub max_duration_ms: Option<i64>,
     /// Metrics beyond `tokens`/`cost` that carry an explicit cap.
@@ -219,7 +222,18 @@ pub fn budget_exceeded(state: &RunState, now: Timestamp) -> bool {
         }
     }
     if let Some(max) = state.usage.limits.max_attempts {
-        if state.attempts.len() as u64 >= max {
+        // The cap counts live (non-terminal) attempts, not history:
+        // terminal attempts (Completed/Failed/Cancelled) no longer
+        // consume budget, so a tight cap hit only by terminal attempts
+        // never blocks the post-reopen recovery queue. Unresolved
+        // `UnknownOutcome` attempts still count: they may have consumed
+        // a send and still hold their resource claims.
+        let live = state
+            .attempts
+            .values()
+            .filter(|attempt| !is_confirmed_terminal(attempt.status))
+            .count() as u64;
+        if live >= max {
             return true;
         }
     }
@@ -494,6 +508,73 @@ mod tests {
         assert_eq!(
             admission(&state, &req, Timestamp(1)),
             Admission::Held(HoldReason::UsageUnknown)
+        );
+    }
+
+    fn attempt(id: u128, status: crate::AttemptStatus) -> crate::Attempt {
+        crate::Attempt {
+            id: AttemptId::from_u128(id),
+            task_id: crate::TaskId::from_u128(1),
+            plan_hash: crate::PlanHash::from_hex("plan"),
+            status,
+            profile_id: None,
+            created_at: Timestamp(1),
+        }
+    }
+
+    #[test]
+    fn attempt_cap_counts_live_attempts_only() {
+        // `max_attempts` caps live (non-terminal) attempts, not history:
+        // terminal attempts must never block the post-reopen recovery
+        // queue. An unresolved UnknownOutcome still counts — it may have
+        // consumed a send and still holds its claims.
+        let mut state = RunState::new(crate::RunId::from_u128(7));
+        state.usage.limits.max_attempts = Some(1);
+        let req = WorkRequest {
+            role: WorkRole::Worker,
+        };
+        state.attempts.insert(
+            AttemptId::from_u128(1),
+            attempt(1, crate::AttemptStatus::Failed),
+        );
+        assert!(
+            !budget_exceeded(&state, Timestamp(1)),
+            "one failed terminal attempt must not trip a cap of 1"
+        );
+        assert_eq!(admission(&state, &req, Timestamp(1)), Admission::Allowed);
+
+        state.attempts.insert(
+            AttemptId::from_u128(2),
+            attempt(2, crate::AttemptStatus::Queued),
+        );
+        assert!(
+            budget_exceeded(&state, Timestamp(1)),
+            "one live queued attempt trips a cap of 1"
+        );
+        assert_eq!(
+            admission(&state, &req, Timestamp(1)),
+            Admission::Held(HoldReason::BudgetExceeded)
+        );
+
+        state
+            .attempts
+            .get_mut(&AttemptId::from_u128(2))
+            .expect("queued attempt")
+            .status = crate::AttemptStatus::Failed;
+        assert_eq!(
+            admission(&state, &req, Timestamp(1)),
+            Admission::Allowed,
+            "settling the live attempt reopens the gate"
+        );
+
+        state.attempts.insert(
+            AttemptId::from_u128(3),
+            attempt(3, crate::AttemptStatus::UnknownOutcome),
+        );
+        assert_eq!(
+            admission(&state, &req, Timestamp(1)),
+            Admission::Held(HoldReason::BudgetExceeded),
+            "an unresolved unknown attempt still consumes the cap"
         );
     }
 

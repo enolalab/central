@@ -606,3 +606,100 @@ async fn cumulative_usage_not_double_counted() {
         .await;
     assert_eq!(harness.load(run_a).usage.observed_tokens, 120);
 }
+
+#[tokio::test]
+async fn terminal_attempts_do_not_block_recovery_queue() {
+    // A tight `max_attempts` cap hit only by terminal attempts must not
+    // make the reopen recoverability guarantee illusory: after the
+    // failed attempt parks and the task reopens, the follow-up queue
+    // succeeds because the cap counts live attempts, not history.
+    let harness = Harness::new();
+    let run = RunId::from_u128(10);
+    let task = TaskId::from_u128(1);
+    harness.approved_run_on(run, &[task]).await;
+    harness
+        .execute_on(
+            run,
+            user(),
+            Command::SetLimits {
+                limits: UsageLimits {
+                    max_tokens: None,
+                    max_cost_minor: None,
+                    max_attempts: Some(1),
+                    max_duration_ms: None,
+                    extra_caps: BTreeSet::new(),
+                    updated_by: None,
+                },
+            },
+        )
+        .await;
+
+    // Queue the one live attempt the cap allows, then fail it.
+    let first = harness.ids.next_attempt_id();
+    harness
+        .execute_on(
+            run,
+            system(),
+            Command::QueueAttempt {
+                attempt: first,
+                task,
+                input: "implement task".to_string(),
+                resources: Vec::new(),
+                max_parallel: 2,
+            },
+        )
+        .await;
+    harness
+        .execute_on(run, system(), Command::StartDispatch { attempt: first })
+        .await;
+    harness
+        .execute_on(run, system(), Command::AttemptFailed { attempt: first })
+        .await;
+    assert_eq!(
+        harness
+            .load(run)
+            .attempts
+            .get(&first)
+            .expect("attempt")
+            .status,
+        AttemptStatus::Failed
+    );
+
+    // Reopen, then queue the recovery attempt: the gate must let it
+    // through even though one terminal attempt exists under a cap of 1.
+    harness
+        .execute_on(run, user(), Command::ReopenTask { task })
+        .await;
+    let second = harness.ids.next_attempt_id();
+    harness
+        .execute_on(
+            run,
+            system(),
+            Command::QueueAttempt {
+                attempt: second,
+                task,
+                input: "implement task".to_string(),
+                resources: Vec::new(),
+                max_parallel: 2,
+            },
+        )
+        .await;
+    let attempts = harness.attempts_of(run);
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(
+        harness
+            .load(run)
+            .attempts
+            .get(&second)
+            .expect("attempt")
+            .status,
+        AttemptStatus::Queued
+    );
+    // The recovery attempt itself is live, so it now occupies the single
+    // slot and anything further holds. The fix is that terminal history
+    // alone never blocks the recovery queue.
+    assert_eq!(
+        harness.admission_of(run),
+        Admission::Held(HoldReason::BudgetExceeded)
+    );
+}

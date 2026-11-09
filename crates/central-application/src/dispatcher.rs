@@ -379,6 +379,7 @@ impl Dispatcher {
             Some(not_before) => Command::DeferRetry {
                 attempt: attempt_id,
                 not_before,
+                max_retries: self.retry_policy.max_retries,
             },
             // Exhausted: park like a refused send; `ReopenTask`
             // recovers it explicitly.

@@ -25,8 +25,8 @@ use central_application::Runtime;
 use central_domain::{
     Actor, ActorId, ActorKind, Attempt, AttemptId, AttemptStatus, Command, CommandEnvelope,
     CommandId, ContentHash, IntentId, Observation, PlanDocumentV1, PlanTaskV1, ProfileId,
-    ResolvedProfile, Revision, RunId, RunState, TaskId, TaskKind, TaskStatus, Timestamp,
-    UsageLimits, UsageObservation, VerifySpec,
+    ResolvedProfile, RetryPolicy, Revision, RunId, RunState, TaskId, TaskKind, TaskStatus,
+    Timestamp, UsageLimits, UsageObservation, VerifySpec,
 };
 
 // ---------- deterministic fakes ----------
@@ -434,6 +434,23 @@ impl Harness {
         .with_fallback_registry(registry())
     }
 
+    fn scheduler_with_retry_policy(&self, retry_policy: RetryPolicy) -> Scheduler {
+        Scheduler::new(
+            self.store.clone() as Arc<dyn Store>,
+            self.clock.clone() as Arc<dyn Clock>,
+            self.ids.clone() as Arc<dyn IdSource>,
+            self.gateway.clone() as Arc<dyn AgentGateway>,
+            SchedulerConfig {
+                retry_policy,
+                ..SchedulerConfig::default()
+            },
+            Arc::new(|_| Some(primary_profile())),
+            system(),
+        )
+        .expect("valid scheduler config")
+        .with_fallback_registry(registry())
+    }
+
     async fn execute(&self, actor: Actor, command: Command) {
         let envelope = CommandEnvelope {
             id: self.ids.next_command_id(),
@@ -775,4 +792,76 @@ async fn outcome_unknown_never_retries() {
         AttemptStatus::UnknownOutcome
     );
     assert!(harness.load().retry_used.is_empty());
+}
+
+#[tokio::test]
+async fn configured_max_retries_above_default_allows_fifth_retry() {
+    // A deployment-configured bound of 5 must schedule all 5 retries
+    // (initial send + 5 = 6 sends). The domain used to hardcode the
+    // default 3, silently capping any larger policy at the third retry.
+    let harness = Harness::new();
+    let task = harness.single_task_run().await;
+    harness.gateway.set_script(SendScript::NotSent);
+    let scheduler = harness.scheduler_with_retry_policy(RetryPolicy {
+        max_retries: 5,
+        delays_ms: vec![2_000, 10_000, 30_000, 30_000, 30_000],
+    });
+
+    for (step, gap) in [0, 2_000, 10_000, 30_000, 30_000, 30_000]
+        .iter()
+        .enumerate()
+    {
+        harness.clock.advance(*gap);
+        scheduler.tick(harness.run_id).await.expect("tick");
+        assert_eq!(
+            harness.gateway.send_count(),
+            (step + 1) as u64,
+            "send {} must go out under a max_retries=5 policy",
+            step + 1
+        );
+    }
+    let state = harness.load();
+    assert_eq!(
+        state.retry_used.get(&harness.attempts_of(task)[0].id),
+        Some(&5),
+        "all 5 configured retries must be recorded, not capped at 3"
+    );
+    assert_eq!(
+        harness.attempts_of(task)[0].status,
+        AttemptStatus::Failed,
+        "the configured bound exhausts after the 5th retry, parking recoverably"
+    );
+
+    // Exhaustion stays recoverable: reopening reopens the task.
+    harness.execute(user(), Command::ReopenTask { task }).await;
+    assert_eq!(harness.task_status(task), TaskStatus::Ready);
+}
+
+#[tokio::test]
+async fn configured_max_retries_below_default_parks_early() {
+    // A tighter bound of 1 must park after the first retry (2 sends
+    // total), not ride the default 3.
+    let harness = Harness::new();
+    let task = harness.single_task_run().await;
+    harness.gateway.set_script(SendScript::NotSent);
+    let scheduler = harness.scheduler_with_retry_policy(RetryPolicy {
+        max_retries: 1,
+        delays_ms: vec![2_000],
+    });
+
+    scheduler.tick(harness.run_id).await.expect("tick 1");
+    assert_eq!(harness.gateway.send_count(), 1);
+    harness.clock.advance(2_000);
+    scheduler.tick(harness.run_id).await.expect("tick 2");
+    assert_eq!(harness.gateway.send_count(), 2);
+    assert_eq!(
+        harness.attempts_of(task)[0].status,
+        AttemptStatus::Failed,
+        "a max_retries=1 policy parks after the first retry"
+    );
+
+    // A parked attempt never resends, however far the clock jumps.
+    harness.clock.advance(120_000);
+    scheduler.tick(harness.run_id).await.expect("tick 3");
+    assert_eq!(harness.gateway.send_count(), 2);
 }

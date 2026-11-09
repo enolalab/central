@@ -117,7 +117,7 @@ pub enum Commands {
         /// Maximum total cost in minor units before new attempts hold.
         #[arg(long)]
         max_cost_minor: Option<u64>,
-        /// Maximum total attempts before new attempts hold.
+        /// Maximum live (non-terminal) attempts before new attempts hold.
         #[arg(long)]
         max_attempts: Option<u64>,
         /// Maximum window duration in ms before new attempts hold.

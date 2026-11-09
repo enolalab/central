@@ -1,8 +1,8 @@
 //! Classified retry policy: safe retries, never blind ones (P3 Task 3).
 //!
 //! Only a send the harness proves never happened (`DefinitelyNotSent`)
-//! may retry, at most [`MAX_RETRIES_DEFAULT`] times with backoff delays
-//! of [`DEFAULT_DELAYS_MS`]. An ambiguous send (`OutcomeUnknown`) never
+//! may retry, at most the policy bound (default [`MAX_RETRIES_DEFAULT`])
+//! with backoff delays of [`DEFAULT_DELAYS_MS`]. An ambiguous send (`OutcomeUnknown`) never
 //! retries: the attempt parks until reconciliation proves what happened.
 //! Quota/auth refusals never retry either — they belong to the fallback
 //! chain (application `fallback` module), not to a retry storm.

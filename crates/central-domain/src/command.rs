@@ -134,10 +134,15 @@ pub enum Command {
     /// Defer one safe retry of a definitely-unsent attempt to a
     /// virtual-clock deadline. Records the retry against the attempt's
     /// bounded budget; an exhausted budget parks the attempt as failed
-    /// (recoverable via `ReopenTask`) instead of storming.
+    /// (recoverable via `ReopenTask`) instead of storming. `max_retries`
+    /// travels with the command so the decision enforces the
+    /// deployment-configured bound on fresh state under the commit CAS,
+    /// like `max_parallel` on `QueueAttempt` — the domain never
+    /// re-applies a hardcoded default over it.
     DeferRetry {
         attempt: AttemptId,
         not_before: Timestamp,
+        max_retries: u32,
     },
     /// Set the run's shared count/token/time limits (plus the optional
     /// user-configured monetary estimate cap). User only; the actor is
