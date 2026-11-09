@@ -1,5 +1,5 @@
 [workspace]
-members = ["spikes/duckdb-runtime-gate"]
+members = ["spikes/duckdb-runtime-gate", "crates/central-domain"]
 resolver = "2"
 
 [profile.release]
