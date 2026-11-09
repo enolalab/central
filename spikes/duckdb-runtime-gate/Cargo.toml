@@ -1,0 +1,9 @@
+[package]
+name = "duckdb-runtime-gate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+duckdb = { version = "=1.20000.1", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

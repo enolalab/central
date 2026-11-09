@@ -1,0 +1,8 @@
+# Pinned release: 1.99.1. On this machine the available host is
+# x86_64-pc-windows-gnu (no MSVC); scripts/test-duckdb-gate.ps1 selects the
+# installed stable-x86_64-pc-windows-gnu toolchain, which is exactly 1.99.1.
+# See docs/validation/duckdb-gate.md for the recorded deviation.
+[toolchain]
+channel = "1.99.1"
+targets = ["x86_64-pc-windows-gnu"]
+profile = "minimal"
