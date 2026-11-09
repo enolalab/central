@@ -451,3 +451,46 @@ async fn corrupt_snapshot_is_not_empty_run() {
         .expect_err("future snapshot must error");
     assert!(matches!(err, AppError::Storage(_)), "got {err:?}");
 }
+
+#[tokio::test]
+async fn non_pending_intent_insert_is_rejected() {
+    let store = DuckDbStore::open(&temp_db("non-pending")).expect("open store");
+    let mut bad = batch("a");
+    bad.intents[0].status = OutboxStatus::Completed;
+    let err = store.commit(bad).await.expect_err("non-pending insert");
+    assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+    assert_eq!(store.load(run_id()).await.expect("load"), None);
+}
+
+#[tokio::test]
+async fn guarded_outbox_transitions_require_dispatch_evidence() {
+    use central_application::ports::Store as _;
+    let store = DuckDbStore::open(&temp_db("guarded")).expect("open store");
+    store.commit(batch("a")).await.expect("commit");
+    let intent = IntentId::from_u128(700);
+
+    // Pending -> Completed skips dispatch: rejected outright.
+    let err = store
+        .transition_outbox(intent, OutboxStatus::Pending, OutboxStatus::Completed)
+        .await
+        .expect_err("direct completion must be rejected");
+    assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
+
+    // The evidence path works exactly once per guard.
+    assert!(store
+        .transition_outbox(intent, OutboxStatus::Pending, OutboxStatus::Dispatching)
+        .await
+        .expect("claim"));
+    assert!(!store
+        .transition_outbox(intent, OutboxStatus::Pending, OutboxStatus::Dispatching)
+        .await
+        .expect("second claim loses the guard"));
+    assert!(store
+        .transition_outbox(intent, OutboxStatus::Dispatching, OutboxStatus::Completed)
+        .await
+        .expect("evidence completes"));
+    assert_eq!(store.pending(run_id()).await.expect("pending").len(), 0);
+    let all = store.outbox(run_id()).await.expect("outbox");
+    assert_eq!(all.len(), 1);
+    assert_eq!(all[0].status, OutboxStatus::Completed);
+}

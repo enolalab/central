@@ -15,7 +15,9 @@ use central_domain::{ActorId, CommandId, Event, IntentId, RunId, RunState};
 use duckdb::Connection;
 use tokio::sync::{mpsc, oneshot};
 
-use super::writer::{self, FailPoint, SharedFailPoint};
+#[cfg(feature = "test-support")]
+use super::writer::FailPoint;
+use super::writer::{self, SharedFailPoint};
 
 pub const SCHEMA_VERSION: i64 = 1;
 const MIGRATION_SQL: &str = include_str!("migrations/001_runtime.sql");
@@ -50,10 +52,31 @@ enum WriterMessage {
         status: OutboxStatus,
         reply: Reply<()>,
     },
+    ListRuns {
+        reply: Reply<Vec<RunId>>,
+    },
+    Outbox {
+        id: RunId,
+        reply: Reply<Vec<OutboxIntent>>,
+    },
+    TransitionOutbox {
+        id: IntentId,
+        expected: OutboxStatus,
+        next: OutboxStatus,
+        reply: Reply<bool>,
+    },
+    ReplaceState {
+        state: Box<RunState>,
+        expected_revision: central_domain::Revision,
+        reply: Reply<()>,
+    },
 }
 
 pub struct DuckDbStore {
     sender: Option<mpsc::Sender<WriterMessage>>,
+    // Read only by the test-support failure injector; the writer thread
+    // holds its own clone either way.
+    #[allow(dead_code)]
     fail_point: SharedFailPoint,
     writer_thread: Option<JoinHandle<()>>,
 }
@@ -97,7 +120,10 @@ impl DuckDbStore {
     }
 
     /// Test support: make the next commit fail at the given statement and
-    /// roll back. One-shot; consumed when it fires.
+    /// roll back. One-shot; consumed when it fires. Gated behind the
+    /// `test-support` feature so production code (the daemon) cannot
+    /// reach failure injection at all.
+    #[cfg(feature = "test-support")]
     pub fn inject_commit_failure(&self, point: FailPoint) {
         if let Ok(mut guard) = self.fail_point.lock() {
             *guard = Some(point);
@@ -112,9 +138,10 @@ impl DuckDbStore {
             .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
     }
 
-    /// Move an outbox intent to a new status (for example `UnknownOutcome`
-    /// after an ambiguous dispatch — never straight to `Completed` without
-    /// dispatch evidence).
+    /// Raw status write kept for store-level tests and repairs.
+    /// Dispatch and recovery code must NOT use this primitive: they go
+    /// through the guarded `Store::transition_outbox`, which only
+    /// allows evidence-based transitions.
     pub async fn mark_outbox_status(
         &self,
         id: IntentId,
@@ -191,6 +218,27 @@ fn writer_loop(
             WriterMessage::MarkOutbox { id, status, reply } => {
                 let _ = reply.send(writer::mark_outbox_status(&conn, id, status));
             }
+            WriterMessage::ListRuns { reply } => {
+                let _ = reply.send(writer::list_run_ids(&conn));
+            }
+            WriterMessage::Outbox { id, reply } => {
+                let _ = reply.send(writer::outbox(&conn, id));
+            }
+            WriterMessage::TransitionOutbox {
+                id,
+                expected,
+                next,
+                reply,
+            } => {
+                let _ = reply.send(writer::transition_outbox(&conn, id, expected, next));
+            }
+            WriterMessage::ReplaceState {
+                state,
+                expected_revision,
+                reply,
+            } => {
+                let _ = reply.send(writer::replace_state(&conn, &state, expected_revision));
+            }
         }
     }
 }
@@ -254,6 +302,54 @@ impl Store for DuckDbStore {
     async fn pending(&self, id: RunId) -> Result<Vec<OutboxIntent>, AppError> {
         let (reply, wait) = oneshot::channel();
         self.send(WriterMessage::Pending { id, reply }).await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn list_run_ids(&self) -> Result<Vec<RunId>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::ListRuns { reply }).await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn outbox(&self, id: RunId) -> Result<Vec<OutboxIntent>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::Outbox { id, reply }).await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn transition_outbox(
+        &self,
+        id: IntentId,
+        expected: OutboxStatus,
+        next: OutboxStatus,
+    ) -> Result<bool, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::TransitionOutbox {
+            id,
+            expected,
+            next,
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn replace_state(
+        &self,
+        state: &RunState,
+        expected_revision: central_domain::Revision,
+    ) -> Result<(), AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::ReplaceState {
+            state: Box::new(state.clone()),
+            expected_revision,
+            reply,
+        })
+        .await?;
         wait.await
             .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
     }

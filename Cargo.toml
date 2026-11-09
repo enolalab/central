@@ -4,6 +4,8 @@ members = [
     "crates/central-domain",
     "crates/central-application",
     "crates/central-infrastructure",
+    "crates/central-server",
+    "crates/central-cli",
 ]
 resolver = "2"
 

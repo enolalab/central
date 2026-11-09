@@ -67,6 +67,15 @@ fn validate_batch(batch: &CommitBatch) -> Result<(), AppError> {
             "outbox intent run id does not match the next state",
         ));
     }
+    // New intents are born Pending. Anything else would smuggle a
+    // dispatch outcome into the atomic commit without evidence.
+    if batch
+        .intents
+        .iter()
+        .any(|intent| intent.status != OutboxStatus::Pending)
+    {
+        return Err(invalid("new outbox intents must be Pending"));
+    }
     Ok(())
 }
 
@@ -167,6 +176,122 @@ pub fn mark_outbox_status(
         return Err(AppError::Storage(format!(
             "outbox status update affected {changed} rows"
         )));
+    }
+    Ok(())
+}
+
+pub fn list_run_ids(conn: &Connection) -> Result<Vec<RunId>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM runs ORDER BY id")
+        .map_err(storage_error)?;
+    let mut rows = stmt.query([]).map_err(storage_error)?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let raw: String = row.get(0).map_err(storage_error)?;
+        let id = raw
+            .parse::<RunId>()
+            .map_err(|_| AppError::Storage(format!("corrupt run id in store: {raw}")))?;
+        ids.push(id);
+    }
+    Ok(ids)
+}
+
+pub fn outbox(conn: &Connection, id: RunId) -> Result<Vec<OutboxIntent>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT intent_json FROM outbox WHERE run_id = ? ORDER BY id")
+        .map_err(storage_error)?;
+    let mut rows = stmt.query(params![id.to_string()]).map_err(storage_error)?;
+    let mut intents = Vec::new();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let json: String = row.get(0).map_err(storage_error)?;
+        intents.push(codec::decode_intent(&json)?);
+    }
+    Ok(intents)
+}
+
+/// The only status changes dispatch/recovery may make. Anything else
+/// (for example `Pending -> Completed` without a dispatch in between)
+/// is rejected, so an intent can never be completed without evidence.
+fn guarded_transition_allowed(expected: OutboxStatus, next: OutboxStatus) -> bool {
+    matches!(
+        (expected, next),
+        (OutboxStatus::Pending, OutboxStatus::Dispatching)
+            | (OutboxStatus::Dispatching, OutboxStatus::Completed)
+            | (OutboxStatus::Dispatching, OutboxStatus::UnknownOutcome)
+            | (OutboxStatus::Dispatching, OutboxStatus::Failed)
+    )
+}
+
+pub fn transition_outbox(
+    conn: &Connection,
+    intent_id: central_domain::IntentId,
+    expected: OutboxStatus,
+    next: OutboxStatus,
+) -> Result<bool, AppError> {
+    if !guarded_transition_allowed(expected, next) {
+        return Err(AppError::Validation(format!(
+            "outbox transition {} -> {} is not allowed",
+            expected.as_str(),
+            next.as_str()
+        )));
+    }
+    let mut stmt = conn
+        .prepare("SELECT intent_json FROM outbox WHERE id = ?")
+        .map_err(storage_error)?;
+    let json: Option<String> = stmt
+        .query_row(params![intent_id.to_string()], |row| row.get(0))
+        .optional()
+        .map_err(storage_error)?;
+    let Some(json) = json else {
+        return Err(AppError::NotFound(format!(
+            "outbox intent {intent_id} not found"
+        )));
+    };
+    let mut intent = codec::decode_intent(&json)?;
+    if intent.status != expected {
+        return Ok(false);
+    }
+    intent.status = next;
+    let encoded = codec::encode_intent(&intent)?;
+    // The status column is part of the guard: the row only changes if
+    // it is still in the expected status.
+    let changed = conn
+        .execute(
+            "UPDATE outbox SET intent_json = ?, status = ? WHERE id = ? AND status = ?",
+            params![
+                encoded,
+                next.as_str(),
+                intent_id.to_string(),
+                expected.as_str()
+            ],
+        )
+        .map_err(storage_error)?;
+    Ok(changed == 1)
+}
+
+pub fn replace_state(
+    conn: &Connection,
+    state: &RunState,
+    expected_revision: Revision,
+) -> Result<(), AppError> {
+    if state.revision != expected_revision {
+        return Err(AppError::Validation(
+            "recovered state revision must equal the expected revision".to_string(),
+        ));
+    }
+    let snapshot_json = codec::encode_state(state)?;
+    let expected = i64::try_from(expected_revision.0)
+        .map_err(|_| AppError::Validation("expected revision out of range".to_string()))?;
+    let changed = conn
+        .execute(
+            "UPDATE runs SET snapshot_json = ? WHERE id = ? AND revision = ?",
+            params![snapshot_json, state.id.to_string(), expected],
+        )
+        .map_err(storage_error)?;
+    if changed != 1 {
+        return Err(AppError::Conflict(
+            "snapshot compare-and-swap failed during recovery".to_string(),
+        ));
     }
     Ok(())
 }
