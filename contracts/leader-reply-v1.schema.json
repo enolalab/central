@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "central/leader-reply-v1.schema.json",
+  "title": "LeaderReplyV1",
+  "description": "Structured leader reply. Chat text never mutates a run: only a schema-valid reply carrying a proposal is committed (as pending, never approved), and only the user approves a plan hash. The embedded proposal is validated again by domain validate_plan; this schema only gates the envelope.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "message"],
+  "properties": {
+    "version": { "const": 1 },
+    "message": { "type": "string", "minLength": 1 },
+    "proposal": { "type": "object" }
+  }
+}

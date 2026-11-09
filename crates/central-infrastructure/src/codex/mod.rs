@@ -9,7 +9,9 @@
 //! Schema provenance: spike-captured (`spikes/codex-app-server`), CLI
 //! `0.167.0-alpha.3.2`; see `contracts/codex/0.167.0-alpha.3.2/`.
 
+pub mod bridge;
 pub mod gateway;
+pub mod prompts;
 pub mod requests;
 pub mod stdio;
 pub mod version;

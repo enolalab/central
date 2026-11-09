@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "central/worker-result-v1.schema.json",
+  "title": "WorkerResultV1",
+  "description": "Structured worker report for one attempt. Carries hashes and paths, never approval: a candidate becomes task input only after independent verification (P2/T5). candidatePath must be run-relative with no parent escapes; enforced again in Rust.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "attemptId", "inputHash", "candidatePath", "candidateHash", "evidencePaths", "summary"],
+  "properties": {
+    "version": { "const": 1 },
+    "attemptId": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    },
+    "inputHash": { "type": "string", "minLength": 1 },
+    "candidatePath": { "type": "string", "minLength": 1 },
+    "candidateHash": { "type": "string", "minLength": 1 },
+    "evidencePaths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "summary": { "type": "string", "minLength": 1 }
+  }
+}

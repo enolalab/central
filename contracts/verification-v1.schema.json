@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "central/verification-v1.schema.json",
+  "title": "VerificationV1",
+  "description": "Independent verifier verdict. Binds the verdict to an exact subject (candidate hash), exact criteria hash, and evidence ids; a verdict never rewrites the candidate or the criteria (P2/T5).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "subjectHash", "criteriaHash", "outcome", "evidenceIds", "findings"],
+  "properties": {
+    "version": { "const": 1 },
+    "subjectHash": { "type": "string", "minLength": 1 },
+    "criteriaHash": { "type": "string", "minLength": 1 },
+    "outcome": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+    "evidenceIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "findings": { "type": "string", "minLength": 1 }
+  }
+}

@@ -11,7 +11,7 @@ use central_domain::{
 use central_infrastructure::process::{spawn_detached, DetachPlacement, ALREADY_RUNNING_EXIT_CODE};
 
 use crate::client::{health_ok, read_server_info, resolve_state_dir, DaemonClient};
-use crate::{Cli, Commands, DaemonCommands, PlanCommands};
+use crate::{Cli, Commands, DaemonCommands, HandoverCommands, PlanCommands, ResultCommands};
 
 fn print_json(value: &serde_json::Value) {
     println!(
@@ -81,6 +81,8 @@ pub fn execute(cli: Cli) -> i32 {
             }
         }
         Commands::Plan { command } => plan(&state_dir, command),
+        Commands::Result { command } => result(&state_dir, command),
+        Commands::Handover { command } => handover_cmd(&state_dir, command),
         Commands::Pause { run } => simple(&state_dir, run, Command::Pause),
         Commands::Stop { run } => simple(&state_dir, run, Command::Stop),
         Commands::Resume { run } => simple(&state_dir, run, Command::Resume),
@@ -184,6 +186,7 @@ fn plan(state_dir: &Path, command: &PlanCommands) -> i32 {
             ) {
                 Ok(receipt) => {
                     print_json(&serde_json::json!({
+                        "schema": "central/plan-v1",
                         "plan_hash": hash.to_string(),
                         "receipt": receipt,
                     }));
@@ -224,6 +227,89 @@ fn plan(state_dir: &Path, command: &PlanCommands) -> i32 {
             }
         }
     }
+}
+
+/// Validate a worker-result file: schema, attempt scope against the flag
+/// and the run state, contained paths. Prints the content hash; the report
+/// proposes a candidate only — committing it lands in P2/T5 verification.
+fn result(state_dir: &Path, command: &ResultCommands) -> i32 {
+    let ResultCommands::Import { run, attempt, file } = command;
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) => return fail(&format!("cannot read result file: {error}")),
+    };
+    let result = match central_application::handover::parse_worker_result(&text) {
+        Ok(result) => result,
+        Err(error) => return fail(&format!("invalid worker result: {error}")),
+    };
+    if result.attempt_id != *attempt {
+        return fail(&format!(
+            "result names attempt {} but --attempt is {attempt}",
+            result.attempt_id,
+        ));
+    }
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.get(&format!("/v1/runs/{run}")) {
+        Ok(view) => {
+            if view["state"]["attempts"][attempt.to_string()].is_null() {
+                return fail(&format!(
+                    "foreign candidate: attempt {attempt} does not belong to run {run}"
+                ));
+            }
+        }
+        Err(message) => return fail(&message),
+    }
+    print_json(&serde_json::json!({
+        "schema": central_application::handover::WORKER_RESULT_SCHEMA,
+        "attempt_id": attempt.to_string(),
+        "candidate_path": result.candidate_path,
+        "candidate_hash": result.candidate_hash.as_str(),
+        "result_hash": central_application::handover::worker_result_hash(&result).as_str(),
+        "status": "validated; committing the candidate lands in P2/T5 verification",
+    }));
+    0
+}
+
+/// Validate a handover file: schema, contained artifact paths, and the
+/// verified/unverified separation. Prints the content hash for the new
+/// session to quote when it resumes.
+fn handover_cmd(state_dir: &Path, command: &HandoverCommands) -> i32 {
+    let HandoverCommands::Import { run, file } = command;
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) => return fail(&format!("cannot read handover file: {error}")),
+    };
+    let handover = match central_application::handover::parse_handover(&text) {
+        Ok(handover) => handover,
+        Err(error) => return fail(&format!("invalid handover: {error}")),
+    };
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.get(&format!("/v1/runs/{run}")) {
+        Ok(view) => {
+            if view["state"]["attempts"][handover.predecessor.to_string()].is_null() {
+                return fail(&format!(
+                    "foreign handover: predecessor {} does not belong to run {run}",
+                    handover.predecessor,
+                ));
+            }
+        }
+        Err(message) => return fail(&message),
+    }
+    print_json(&serde_json::json!({
+        "schema": central_application::handover::HANDOVER_SCHEMA,
+        "predecessor": handover.predecessor.to_string(),
+        "handover_hash": central_application::handover::handover_hash(&handover).as_str(),
+        "verified_facts": handover.verified_facts.len(),
+        "unverified_notes": handover.unverified_notes.len(),
+        "status": "validated; the new session must inspect evidence before writing",
+    }));
+    0
 }
 
 /// List the durable inbox entries of a run: pending, answered, resolved

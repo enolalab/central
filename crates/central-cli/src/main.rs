@@ -4,7 +4,7 @@ mod commands;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use central_domain::{PlanHash, RunId};
+use central_domain::{AttemptId, PlanHash, RunId};
 use clap::{Parser, Subcommand};
 
 /// Central local runtime CLI. Every run operation talks to the single
@@ -49,6 +49,17 @@ pub enum Commands {
     Plan {
         #[command(subcommand)]
         command: PlanCommands,
+    },
+    /// Worker-result operations (validated import route when the live
+    /// structured channel is unavailable; committing lands in P2/T5).
+    Result {
+        #[command(subcommand)]
+        command: ResultCommands,
+    },
+    /// Handover operations (validated import route for new sessions).
+    Handover {
+        #[command(subcommand)]
+        command: HandoverCommands,
     },
     /// Show pending approval/question entries for a run.
     Inbox {
@@ -139,6 +150,33 @@ pub enum PlanCommands {
         run: RunId,
         #[arg(long)]
         hash: Option<PlanHashArg>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ResultCommands {
+    /// Validate a worker-result JSON file against its schema: version,
+    /// attempt scope (flag and run state), contained paths, content hash.
+    /// Prints the hash; committing the candidate lands in P2/T5 verification.
+    Import {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        attempt: AttemptId,
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum HandoverCommands {
+    /// Validate a handover JSON file against its schema: version, contained
+    /// artifact paths, verified/unverified separation, content hash.
+    Import {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        file: PathBuf,
     },
 }
 
