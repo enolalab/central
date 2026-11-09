@@ -238,12 +238,181 @@ fn is_secret_key(key: &str) -> bool {
         || lower.contains("bearer")
 }
 
-/// Redact bearer-looking material inside free text (tokens, not paths).
+/// Secret-bearing key names matched inside free text (case-insensitive).
+/// Longest first so `set-cookie` wins over `cookie` at the same position.
+const SECRET_HINTS: &[&str] = &[
+    "authorization",
+    "set-cookie",
+    "credential",
+    "password",
+    "secret",
+    "bearer",
+    "token",
+    "api_key",
+    "api-key",
+    "apikey",
+    "cookie",
+];
+
+/// Redact secret material inside free text (tokens, not paths).
+///
+/// Beyond whole-string hex blobs, this scrubs `sk-...` style tokens,
+/// `key=value` / `key: value` shapes for secret-bearing keys
+/// (case-insensitive), `Bearer <credential>` pairs, and long opaque runs.
+/// Ordinary prose passes through untouched.
 pub fn sanitize_text(text: &str) -> std::borrow::Cow<'_, str> {
     if text.len() > 64 && text.chars().all(|c| c.is_ascii_hexdigit()) {
         return std::borrow::Cow::Owned("[redacted-hex]".to_string());
     }
-    std::borrow::Cow::Borrowed(text)
+    match redact_free_text(text) {
+        Some(redacted) => std::borrow::Cow::Owned(redacted),
+        None => std::borrow::Cow::Borrowed(text),
+    }
+}
+
+/// Scan for secret patterns, returning the redacted string when at least one
+/// match is found. All match boundaries sit on ASCII bytes, so slicing the
+/// UTF-8 input at them is always safe.
+fn redact_free_text(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out: Option<String> = None;
+    let mut plain_start = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut hit = None;
+        if i == 0 || !bytes[i - 1].is_ascii_alphanumeric() {
+            hit = sk_token_len(&bytes[i..]);
+            if hit.is_none() {
+                hit = secret_assignment_len(&bytes[i..]);
+            }
+        }
+        if hit.is_none() && (i == 0 || !is_token_byte(bytes[i - 1])) {
+            hit = opaque_run_len(&bytes[i..]);
+        }
+        match hit {
+            Some(len) => {
+                let out = out.get_or_insert_with(String::new);
+                out.push_str(&text[plain_start..i]);
+                out.push_str("[redacted-secret]");
+                i += len;
+                plain_start = i;
+            }
+            None => i += 1,
+        }
+    }
+    out.map(|mut redacted| {
+        redacted.push_str(&text[plain_start..]);
+        redacted
+    })
+}
+
+/// Length of an `sk-...` style token at the start of `rest`, if any.
+fn sk_token_len(rest: &[u8]) -> Option<usize> {
+    if rest.len() > 3
+        && rest[0].eq_ignore_ascii_case(&b's')
+        && rest[1].eq_ignore_ascii_case(&b'k')
+        && rest[2] == b'-'
+    {
+        let tail = rest[3..]
+            .iter()
+            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'-' || **b == b'_')
+            .count();
+        if tail >= 8 {
+            return Some(3 + tail);
+        }
+    }
+    None
+}
+
+/// Length of a `key=value` / `key: value` / `Bearer <credential>` match at the
+/// start of `rest` (the caller guarantees a word boundary before it).
+fn secret_assignment_len(rest: &[u8]) -> Option<usize> {
+    for hint in SECRET_HINTS {
+        let key = hint.as_bytes();
+        if rest.len() < key.len() || !rest[..key.len()].eq_ignore_ascii_case(key) {
+            continue;
+        }
+        // `tokens=` (plural) is not `token=`; require a boundary after the key.
+        if rest.len() > key.len()
+            && (rest[key.len()].is_ascii_alphanumeric() || rest[key.len()] == b'_')
+        {
+            continue;
+        }
+        let mut j = key.len() + skip_set(&rest[key.len()..], b" \t\"'`");
+        let paired = j < rest.len() && (rest[j] == b'=' || rest[j] == b':');
+        if paired {
+            j += 1 + skip_set(&rest[j + 1..], b" \t\"'`");
+        } else if *hint != "bearer" {
+            continue;
+        }
+        let mut end = j + secret_value_len(&rest[j..]);
+        if end == j {
+            continue;
+        }
+        while end > j && matches!(rest[end - 1], b'.' | b'!' | b'?') {
+            end -= 1;
+        }
+        if end == j {
+            continue;
+        }
+        if rest[j..end].eq_ignore_ascii_case(b"bearer")
+            || rest[j..end].eq_ignore_ascii_case(b"basic")
+        {
+            let k = end + skip_set(&rest[end..], b" \t\"'`");
+            let more = secret_value_len(&rest[k..]);
+            if more > 0 {
+                end = k + more;
+            }
+        }
+        if !paired {
+            // Space-separated `Bearer <credential>` only counts when the
+            // credential itself looks token-shaped.
+            if end - j < 8 {
+                continue;
+            }
+        }
+        return Some(end);
+    }
+    None
+}
+
+/// Length of a long opaque run at the start of `rest` (the caller guarantees
+/// a run start). UUID-shaped runs are left alone: they identify, not conceal.
+fn opaque_run_len(rest: &[u8]) -> Option<usize> {
+    let len = rest.iter().take_while(|b| is_token_byte(**b)).count();
+    if len >= 32 && !is_uuid_shaped(&rest[..len]) {
+        Some(len)
+    } else {
+        None
+    }
+}
+
+fn is_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.' | b'=')
+}
+
+fn is_uuid_shaped(run: &[u8]) -> bool {
+    const DASHES: [usize; 4] = [8, 13, 18, 23];
+    run.len() == 36
+        && DASHES.iter().all(|&p| run[p] == b'-')
+        && run
+            .iter()
+            .enumerate()
+            .all(|(i, b)| DASHES.contains(&i) || b.is_ascii_hexdigit())
+}
+
+fn skip_set(rest: &[u8], set: &[u8]) -> usize {
+    rest.iter().take_while(|b| set.contains(b)).count()
+}
+
+fn secret_value_len(rest: &[u8]) -> usize {
+    rest.iter()
+        .take_while(|b| is_secret_value_byte(**b))
+        .count()
+}
+
+fn is_secret_value_byte(b: u8) -> bool {
+    !b.is_ascii_whitespace() && !matches!(b, b'"' | b'\'' | b'`' | b',' | b';' | b'}' | b']' | b')')
 }
 
 #[cfg(test)]
@@ -287,5 +456,48 @@ mod tests {
         assert_eq!(clean["nested"]["authorization"], json!("[redacted]"));
         assert_eq!(clean["nested"]["cwd"], json!("C:\\fixture"));
         assert_eq!(sanitize_text(&"e".repeat(65)), "[redacted-hex]");
+    }
+
+    #[test]
+    fn free_text_server_errors_do_not_leak_secrets() {
+        let token = "sk-live-abcDEF1234567890abcdef1234567890";
+        let frame = format!(
+            "{{\"id\":7,\"error\":{{\"code\":-32000,\"message\":\"invalid token {token}; retry with a fresh credential\"}}}}"
+        );
+        match parse_frame(&frame) {
+            Ok(IncomingFrame::Response {
+                result: Err(error), ..
+            }) => {
+                assert!(
+                    !error.message.contains(token),
+                    "prose token leaked: {}",
+                    error.message
+                );
+                assert!(
+                    error.message.contains("[redacted"),
+                    "prose token redacted: {}",
+                    error.message
+                );
+            }
+            other => panic!("expected error response, got {other:?}"),
+        }
+
+        let kv = sanitize_text(r#"auth failed: api_key="AKIAIOSFODNN7EXAMPLE" for host"#);
+        assert!(
+            !kv.contains("AKIAIOSFODNN7EXAMPLE"),
+            "key=value leaked: {kv}"
+        );
+        assert!(kv.contains("[redacted"), "key=value redacted: {kv}");
+
+        let bearer = sanitize_text("authorization: Bearer abcdef1234567890XYZ");
+        assert!(
+            !bearer.contains("abcdef1234567890XYZ"),
+            "bearer credential leaked: {bearer}"
+        );
+
+        // Ordinary prose is untouched: no `=`/`:` after the keyword, and no
+        // token-shaped material.
+        let prose = sanitize_text("see the cookie policy before retrying");
+        assert_eq!(prose, "see the cookie policy before retrying");
     }
 }

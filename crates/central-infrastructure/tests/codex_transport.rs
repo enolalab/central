@@ -15,9 +15,10 @@ use central_application::contracts::{
 };
 use central_application::ports::{AgentGateway, ProcessSupervisor};
 use central_domain::{ContentHash, ProfileId, ResolvedProfile};
+use central_infrastructure::codex::wire::{parse_frame, IncomingFrame};
 use central_infrastructure::codex::{
     check_model_match, check_supported_version, parse_cli_version, CodexConfig, CodexGateway,
-    IncomingEvent, RpcClient, RpcError, SUPPORTED_CLI_VERSION,
+    IncomingEvent, RpcClient, RpcError, RpcId, SUPPORTED_CLI_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::duplex;
@@ -256,6 +257,190 @@ fn result_frame(id: &Value, result: &Value) -> String {
 
 fn canonical(value: &Value) -> String {
     format!("{value}\n")
+}
+
+/// initialize.jsonl replays through parse_frame: the initialize answer is a
+/// Response echoing the CLI version, the sent `initialized` frame is a
+/// Notification, and the status broadcast is a Notification.
+#[test]
+fn initialize_fixture_classifies_handshake_frames() {
+    let entries = fixture_messages("initialize.jsonl");
+    assert_eq!(entries.len(), 4, "handshake transcript has 4 frames");
+
+    // Sent `initialize` request (id + method) classifies as a server-bound
+    // request shape.
+    let (dir, message) = &entries[0];
+    assert_eq!(dir, "sent");
+    match parse_frame(&canonical(message)).expect("initialize parses") {
+        IncomingFrame::ServerRequest { id, method, .. } => {
+            assert_eq!(id, RpcId::Num(100));
+            assert_eq!(method, "initialize");
+        }
+        other => panic!("initialize must be a request, got {other:?}"),
+    }
+
+    // Received initialize answer: a Response whose user agent echoes the
+    // allowlisted CLI version.
+    let (dir, message) = &entries[1];
+    assert_eq!(dir, "received");
+    match parse_frame(&canonical(message)).expect("initialize answer parses") {
+        IncomingFrame::Response { id, result } => {
+            assert_eq!(id, RpcId::Num(100));
+            let result = result.expect("initialize succeeds");
+            let agent = result["userAgent"].as_str().expect("user agent echo");
+            assert!(
+                agent.contains(SUPPORTED_CLI_VERSION),
+                "CLI version echo: {agent}"
+            );
+        }
+        other => panic!("initialize answer must be a response, got {other:?}"),
+    }
+
+    // Sent `initialized` (method only) is a one-way notification.
+    let (dir, message) = &entries[2];
+    assert_eq!(dir, "sent");
+    match parse_frame(&canonical(message)).expect("initialized parses") {
+        IncomingFrame::Notification { method, .. } => {
+            assert_eq!(method, "initialized");
+        }
+        other => panic!("initialized must be a notification, got {other:?}"),
+    }
+
+    // Received status broadcast is a one-way notification.
+    let (dir, message) = &entries[3];
+    assert_eq!(dir, "received");
+    match parse_frame(&canonical(message)).expect("status broadcast parses") {
+        IncomingFrame::Notification { method, .. } => {
+            assert_eq!(method, "remoteControl/status/changed");
+        }
+        other => panic!("status broadcast must be a notification, got {other:?}"),
+    }
+}
+
+/// chunked.jsonl delivered in small fragments still reassembles: responses
+/// correlate by id and the interleaved request/notification frames surface
+/// in wire order with byte-identical payloads.
+#[tokio::test]
+async fn chunked_fixture_survives_fragmented_delivery() {
+    let entries = fixture_messages("chunked.jsonl");
+    let received: Vec<Value> = entries
+        .iter()
+        .filter(|(dir, _)| *dir == "received")
+        .map(|(_, message)| message.clone())
+        .collect();
+    assert_eq!(received.len(), 6, "chunked transcript has 6 inbound frames");
+
+    let (client_io, peer_io) = duplex(64 * 1024);
+    // 7-byte writes: the client must reassemble every frame.
+    let mut peer = RpcClient::new(ChunkedWriter::new(peer_io, 7));
+    let peer_frames = received.clone();
+    let peer_task = tokio::spawn(async move {
+        for message in &peer_frames {
+            peer.send_raw(&canonical(message))
+                .await
+                .expect("peer writes");
+        }
+    });
+
+    let mut client = RpcClient::new(client_io);
+    let thread = client
+        .recv_response(101, Duration::from_secs(5))
+        .await
+        .expect("thread/start answer");
+    assert_eq!(
+        thread["thread"]["id"],
+        received[0]["result"]["thread"]["id"]
+    );
+    assert_eq!(
+        thread["thread"]["cliVersion"],
+        json!(SUPPORTED_CLI_VERSION),
+        "thread/start echoes the CLI version"
+    );
+    let turn = client
+        .recv_response(102, Duration::from_secs(5))
+        .await
+        .expect("turn/start answer");
+    assert_eq!(turn, received[2]["result"]);
+
+    let expected = [
+        "thread/started",
+        "thread/status/changed",
+        "item/commandExecution/requestApproval",
+        "serverRequest/resolved",
+    ];
+    for method in expected {
+        match client
+            .poll_event(Duration::from_secs(5))
+            .await
+            .expect("queued event")
+        {
+            IncomingEvent::Notification {
+                method: got,
+                params,
+            } => {
+                assert_eq!(got, method);
+                let want = received
+                    .iter()
+                    .find(|m| m.get("method").and_then(Value::as_str) == Some(method))
+                    .expect("fixture holds event");
+                assert_eq!(&params, &want["params"], "payload intact for {method}");
+            }
+            IncomingEvent::Request {
+                id,
+                method: got,
+                params,
+            } => {
+                assert_eq!(got, method);
+                assert_eq!(id, RpcId::Num(0));
+                let want = received
+                    .iter()
+                    .find(|m| m.get("method").and_then(Value::as_str) == Some(method))
+                    .expect("fixture holds event");
+                assert_eq!(&params, &want["params"], "payload intact for {method}");
+            }
+        }
+    }
+
+    peer_task.await.expect("peer done");
+}
+
+/// A prose server error carrying a secret reaches the caller redacted: the
+/// Rejected message keeps the code but not the credential.
+#[tokio::test]
+async fn rejected_server_error_is_redacted_end_to_end() {
+    let token = "sk-live-e2eFAIL1234567890abcdef1234567890";
+    let (client_io, peer_io) = duplex(64 * 1024);
+    let mut peer = RpcClient::new(peer_io);
+    let peer_task = tokio::spawn(async move {
+        match peer
+            .poll_event(Duration::from_secs(5))
+            .await
+            .expect("peer reads request")
+        {
+            IncomingEvent::Request { id, .. } => {
+                let line = format!(
+                    "{{\"id\":{id},\"error\":{{\"code\":-32001,\"message\":\"invalid token {token}\"}}}}\n"
+                );
+                peer.send_raw(&line).await.expect("peer answers");
+            }
+            other => panic!("peer expected a client request, got {other:?}"),
+        }
+    });
+
+    let mut client = RpcClient::new(client_io);
+    let err = client
+        .request("thread/start", json!({}), Duration::from_secs(5))
+        .await
+        .expect_err("server rejects the request");
+    match err {
+        RpcError::Rejected(message) => {
+            assert!(!message.contains(token), "secret leaked: {message}");
+            assert!(message.contains("[redacted"), "secret redacted: {message}");
+            assert!(message.contains("-32001"), "code preserved: {message}");
+        }
+        other => panic!("expected rejection, got {other:?}"),
+    }
+    peer_task.await.expect("peer done");
 }
 
 /// A CLI version outside the allowlist is an actionable capability error,
