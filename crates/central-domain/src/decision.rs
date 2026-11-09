@@ -1,10 +1,11 @@
 use std::collections::BTreeSet;
 
 use crate::{
-    blocking_dependencies, covering_attempt, inbox, live_attempt_count, release_settled_claims,
-    validate_plan, Actor, ActorKind, AnswerPayload, Attempt, AttemptStatus, Command,
-    CommandEnvelope, DomainError, Effect, Event, InboxEntry, InboxKey, InboxKind, InboxOutcome,
-    InboxStatus, PlanRevision, PlanStatus, RunControl, RunState, Task, TaskStatus, Timestamp,
+    blocking_dependencies, check_report, covering_attempt, decide_quality, inbox,
+    live_attempt_count, release_settled_claims, validate_plan, Actor, ActorKind, AnswerPayload,
+    Attempt, AttemptStatus, Command, CommandEnvelope, DomainError, Effect, Event, InboxEntry,
+    InboxKey, InboxKind, InboxOutcome, InboxStatus, PlanRevision, PlanStatus, QualityDecision,
+    RunControl, RunState, Task, TaskStatus, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -679,7 +680,347 @@ pub fn decide(
                 Vec::new(),
             ))
         }
+
+        Command::SubmitVerification {
+            task,
+            attempt,
+            report,
+        } => submit_verification(state, actor, *task, *attempt, report, now),
+
+        Command::DisputeVerification { task, reason } => {
+            if !matches!(
+                actor.kind,
+                ActorKind::User | ActorKind::Worker | ActorKind::Leader
+            ) {
+                return Err(DomainError::Forbidden);
+            }
+            require_created(state)?;
+            if reason.trim().is_empty() {
+                return Err(DomainError::InvalidCommand(
+                    "a dispute needs a reason for the next reviewer".to_string(),
+                ));
+            }
+            let task_state = state
+                .tasks
+                .get(task)
+                .ok_or(DomainError::UnknownTask(*task))?;
+            if task_state.status != TaskStatus::AwaitingVerification {
+                return Err(DomainError::InvalidTransition(format!(
+                    "task {task} is not awaiting verification (it is {:?}); \
+                     only live verification can be disputed",
+                    task_state.status,
+                )));
+            }
+            let mut next = state.clone();
+            let disputes_used = next
+                .verification_disputes
+                .get(task)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            next.verification_disputes.insert(*task, disputes_used);
+            Ok(finish(
+                next.clone(),
+                vec![Event::VerificationDisputed {
+                    run_id: next.id,
+                    task: *task,
+                    reason: reason.clone(),
+                    disputes_used,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::QueueRepairAttempt {
+            attempt,
+            task,
+            predecessor,
+            input,
+            resources,
+            max_parallel,
+        } => queue_repair_attempt(
+            state,
+            actor,
+            *attempt,
+            *task,
+            *predecessor,
+            input,
+            resources,
+            *max_parallel,
+            now,
+        ),
     }
+}
+
+/// Judge one independent verifier verdict (P3 Task 2).
+///
+/// Only a verifier — or the user carrying a same-session override — may
+/// submit. The leader, workers and the system are refused: the leader can
+/// never force a pass, and a verdict never rewrites history.
+fn submit_verification(
+    state: &RunState,
+    actor: &Actor,
+    task: crate::TaskId,
+    attempt: crate::AttemptId,
+    report: &crate::VerificationReport,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    if !matches!(actor.kind, ActorKind::Verifier | ActorKind::User) {
+        return Err(DomainError::Forbidden);
+    }
+    require_created(state)?;
+    let task_state = state
+        .tasks
+        .get(&task)
+        .cloned()
+        .ok_or(DomainError::UnknownTask(task))?;
+    let attempt_task = state
+        .attempts
+        .get(&attempt)
+        .map(|record| record.task_id)
+        .ok_or(DomainError::QueueConflict(format!(
+            "attempt {attempt} is unknown to this run"
+        )))?;
+    if attempt_task != task {
+        return Err(DomainError::InvalidCommand(format!(
+            "attempt {attempt} does not belong to task {task}"
+        )));
+    }
+    if task_state.status != TaskStatus::AwaitingVerification {
+        return Err(DomainError::InvalidTransition(format!(
+            "task {task} is not awaiting verification (it is {:?}); \
+             stale verdict, reverify against the current seal",
+            task_state.status,
+        )));
+    }
+    check_report(&task_state, report)?;
+    // Verifier independence: the default verifier runs in its own session.
+    // A verdict from the worker's own session is refused unless the user
+    // overrode it for this task — and only a user-carried submission may
+    // carry that override.
+    if let Some(session) = state.attempt_sessions.get(&attempt) {
+        if session.thread_id == report.verifier_thread && !report.same_session_override {
+            return Err(DomainError::Forbidden);
+        }
+    }
+    if report.same_session_override && actor.kind != ActorKind::User {
+        return Err(DomainError::Forbidden);
+    }
+    let routing = decide_quality(&task_state, report.outcome);
+    let mut next = state.clone();
+    // The candidate-producing attempt is done producing: the verdict is
+    // the evidence its output exists. Marking it completed also releases
+    // its resource claims below, freeing the repair or downstream work.
+    if let Some(record) = next.attempts.get_mut(&attempt) {
+        record.status = AttemptStatus::Completed;
+    }
+    match &routing {
+        QualityDecision::Accepted => {
+            if let Some(task_record) = next.tasks.get_mut(&task) {
+                task_record.status = TaskStatus::Succeeded;
+            }
+            next.verified_outputs
+                .insert(task, report.subject_hash.clone());
+            next.repair_base.remove(&task);
+        }
+        QualityDecision::Repair { round } => {
+            if let Some(task_record) = next.tasks.get_mut(&task) {
+                task_record.repair_rounds_used = *round;
+            }
+            // Anchor one repair attempt to this predecessor; the repair
+            // queue consumes the base, so a repair always chains from its
+            // verdict.
+            next.repair_base.insert(task, attempt);
+        }
+        QualityDecision::Blocked => {
+            if let Some(task_record) = next.tasks.get_mut(&task) {
+                task_record.status = TaskStatus::Blocked;
+            }
+            next.repair_base.remove(&task);
+        }
+        QualityDecision::AskLeader => {
+            // Repair budget exhausted: park for leader analysis through the
+            // normal scheduled gates. No silent retry, no pass, no bypass.
+            next.repair_base.remove(&task);
+        }
+        QualityDecision::Disputed => {}
+    }
+    release_settled_claims(&mut next);
+    Ok(finish(
+        next.clone(),
+        vec![Event::VerificationSubmitted {
+            run_id: next.id,
+            task,
+            attempt_id: attempt,
+            outcome: report.outcome,
+            decision: routing,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+/// Queue one quality-repair attempt linked to its predecessor (P3 Task 2).
+///
+/// The same scheduling gate as [`queue_attempt`]: a running run, no holds,
+/// a non-empty input, the active plan, satisfied dependencies, no covering
+/// attempt, exclusive resources and a free concurrency slot. Additionally
+/// the task must await verification and the predecessor must match the
+/// repair base the failed verdict recorded; the base is consumed and the
+/// link is stored, so a repair always chains from its verdict.
+#[allow(clippy::too_many_arguments)]
+fn queue_repair_attempt(
+    state: &RunState,
+    actor: &Actor,
+    attempt: crate::AttemptId,
+    task: crate::TaskId,
+    predecessor: crate::AttemptId,
+    input: &str,
+    resources: &[String],
+    max_parallel: usize,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user_or_system(actor)?;
+    require_created(state)?;
+    if state.control != RunControl::Running {
+        return Err(DomainError::QueueConflict(format!(
+            "the queue gate is closed while the run is {:?}",
+            state.control
+        )));
+    }
+    if !state.holds.is_empty() {
+        return Err(DomainError::QueueConflict(
+            "the queue gate is closed while the run is held".to_string(),
+        ));
+    }
+    if input.trim().is_empty() {
+        return Err(DomainError::InvalidCommand(
+            "a queued attempt needs a non-empty input".to_string(),
+        ));
+    }
+    let task_state = state
+        .tasks
+        .get(&task)
+        .ok_or(DomainError::UnknownTask(task))?;
+    let Some(active) = state.active_plan.as_ref() else {
+        return Err(DomainError::QueueConflict(
+            "the run has no active plan".to_string(),
+        ));
+    };
+    if task_state.plan_hash != *active {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is bound to a superseded plan"
+        )));
+    }
+    if task_state.status != TaskStatus::AwaitingVerification {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is not awaiting verification (it is {:?})",
+            task_state.status
+        )));
+    }
+    match state.repair_base.get(&task) {
+        Some(base) if *base == predecessor => {}
+        _ => {
+            return Err(DomainError::QueueConflict(format!(
+                "task {task} has no repair base for predecessor {predecessor}"
+            )));
+        }
+    }
+    let predecessor_task = state
+        .attempts
+        .get(&predecessor)
+        .map(|record| record.task_id)
+        .ok_or(DomainError::InvalidCommand(format!(
+            "predecessor attempt {predecessor} is unknown to this run"
+        )))?;
+    if predecessor_task != task {
+        return Err(DomainError::InvalidCommand(format!(
+            "predecessor attempt {predecessor} does not belong to task {task}"
+        )));
+    }
+    if state.attempts.contains_key(&attempt) {
+        return Err(DomainError::QueueConflict(format!(
+            "attempt {attempt} is already queued"
+        )));
+    }
+    let blocked = blocking_dependencies(task_state, state);
+    if !blocked.is_empty() {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} still waits on {} dependencies",
+            blocked.len()
+        )));
+    }
+    if let Some(covering) = covering_attempt(state, task) {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is already covered by attempt {covering}"
+        )));
+    }
+    let plan_hash = task_state.plan_hash.clone();
+    let profile_id = task_state.profile_id;
+
+    let mut next = state.clone();
+    release_settled_claims(&mut next);
+    let mut seen = BTreeSet::new();
+    for key in resources {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(DomainError::InvalidCommand(
+                "a resource claim needs a non-empty key".to_string(),
+            ));
+        }
+        if !seen.insert(key) {
+            return Err(DomainError::InvalidCommand(format!(
+                "resource {key} is listed twice for task {task}"
+            )));
+        }
+        if let Some(owner) = next.resource_claims.get(key) {
+            return Err(DomainError::QueueConflict(format!(
+                "resource {key} is held by attempt {owner}"
+            )));
+        }
+    }
+    if live_attempt_count(&next) >= max_parallel {
+        return Err(DomainError::QueueConflict(format!(
+            "the concurrency bound ({max_parallel}) is reached"
+        )));
+    }
+
+    let task_record = next.tasks.get_mut(&task).expect("task checked above");
+    task_record.status = TaskStatus::Running;
+    next.attempts.insert(
+        attempt,
+        Attempt {
+            id: attempt,
+            task_id: task,
+            plan_hash,
+            status: AttemptStatus::Queued,
+            profile_id,
+            created_at: now,
+        },
+    );
+    next.attempt_inputs.insert(attempt, input.to_string());
+    for key in resources {
+        next.resource_claims.insert(key.trim().to_string(), attempt);
+    }
+    // Consume the base and store the chain link: this repair repairs its
+    // predecessor, and no second repair can reuse the same base.
+    next.repair_base.remove(&task);
+    next.attempt_predecessor.insert(attempt, predecessor);
+    Ok(finish(
+        next.clone(),
+        vec![Event::RepairAttemptQueued {
+            run_id: next.id,
+            attempt_id: attempt,
+            task,
+            predecessor,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
 }
 
 /// Queue one attempt: the full scheduler gate as a pure decision. Every

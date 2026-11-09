@@ -7,6 +7,7 @@ pub mod ids;
 pub mod inbox;
 pub mod plan;
 pub mod profile;
+pub mod quality;
 pub mod run;
 pub mod scheduling;
 
@@ -31,6 +32,9 @@ pub use plan::{plan_hash, validate_plan, PlanDocumentV1, PlanTaskV1, TaskKind, V
 pub use profile::{
     apply_layers, compute_profile_hash, CapabilitySupport, Enforcement, ProfileError,
     ProfileLayers, ProfilePatch, ResolvedProfile,
+};
+pub use quality::{
+    check_report, criteria_hash_for, decide_quality, QualityDecision, VerificationReport,
 };
 pub use run::{
     Artifact, Attempt, AttemptSession, AttemptStatus, HoldReason, Observation, PlanRevision,

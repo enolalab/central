@@ -90,9 +90,14 @@ pub fn seal_candidate(
 }
 
 /// Independent verdicts judged only against sealed subjects.
+///
+/// Seals are keyed per `(TaskId, ContentHash)`: two tasks sealing
+/// identical bytes hold two independent seals, so a verdict for one task
+/// can never resolve to the other's candidate. Content addressing stays
+/// for blobs only; the seal identity always carries its task.
 #[derive(Clone, Debug, Default)]
 pub struct VerificationService {
-    sealed: HashMap<ContentHash, SealedCandidate>,
+    sealed: HashMap<(TaskId, ContentHash), SealedCandidate>,
     status: HashMap<TaskId, (TaskStatus, u8)>,
 }
 
@@ -103,14 +108,15 @@ impl VerificationService {
 
     /// Record a sealed worker candidate. Worker completion parks the task in
     /// `AwaitingVerification` — never `Succeeded`, no matter how the worker
-    /// or its checks exited.
+    /// or its checks exited. The seal is keyed per task, so identical
+    /// bytes sealed for two tasks never collide.
     pub fn note_worker_done(&mut self, seal: SealedCandidate) -> WorkerDone {
         let done = WorkerDone {
             task_id: seal.task_id,
             task_status: TaskStatus::AwaitingVerification,
         };
         self.sealed
-            .insert(seal.candidate_hash.clone(), seal.clone());
+            .insert((seal.task_id, seal.candidate_hash.clone()), seal.clone());
         self.status
             .entry(seal.task_id)
             .or_insert((TaskStatus::AwaitingVerification, 0));
@@ -125,20 +131,67 @@ impl VerificationService {
     /// must be re-verified — the service never edits the candidate or the
     /// criteria to make a verdict fit.
     ///
+    /// The subject alone resolves the seal only while exactly one task
+    /// holds it; when two tasks sealed identical bytes the lookup is
+    /// ambiguous and the caller must use [`accept_for`](Self::accept_for)
+    /// with the task. Ambiguity is refused, never guessed.
+    ///
     /// `Pass` marks the task `Succeeded`. `Fail` parks the task for a quality
     /// retry while repair rounds remain and escalates to `Failed` once they
     /// are exhausted. `Blocked` records `Blocked` without consuming a round.
     pub fn accept(&mut self, verdict: &VerificationV1) -> Result<VerificationReceipt, AppError> {
+        let matches: Vec<SealedCandidate> = self
+            .sealed
+            .iter()
+            .filter(|((_, candidate), _)| *candidate == verdict.subject_hash)
+            .map(|(_, seal)| seal.clone())
+            .collect();
+        let seal = match matches.as_slice() {
+            [] => {
+                return Err(AppError::NotFound(format!(
+                    "no sealed candidate for subject {}; reverify against the current seal",
+                    verdict.subject_hash,
+                )));
+            }
+            [only] => only.clone(),
+            _ => {
+                return Err(AppError::Conflict(format!(
+                    "subject {} is sealed for {} tasks; reverify with an explicit task binding",
+                    verdict.subject_hash,
+                    matches.len(),
+                )));
+            }
+        };
+        self.judge(&seal, verdict)
+    }
+
+    /// Judge one verifier verdict against one task's seal. Identical bytes
+    /// sealed for two tasks judge independently: each task reads only its
+    /// own seal, so verdicts can never cross between tasks.
+    pub fn accept_for(
+        &mut self,
+        task: TaskId,
+        verdict: &VerificationV1,
+    ) -> Result<VerificationReceipt, AppError> {
         let seal = self
             .sealed
-            .get(&verdict.subject_hash)
+            .get(&(task, verdict.subject_hash.clone()))
             .cloned()
             .ok_or_else(|| {
                 AppError::NotFound(format!(
-                    "no sealed candidate for subject {}; reverify against the current seal",
+                    "no sealed candidate for task {task} subject {}; \
+                     reverify against the current seal",
                     verdict.subject_hash,
                 ))
             })?;
+        self.judge(&seal, verdict)
+    }
+
+    fn judge(
+        &mut self,
+        seal: &SealedCandidate,
+        verdict: &VerificationV1,
+    ) -> Result<VerificationReceipt, AppError> {
         if seal.criteria_hash != verdict.criteria_hash {
             return Err(AppError::Conflict(format!(
                 "criteria changed since the seal (task {}); stale verdict, reverify",
@@ -176,6 +229,13 @@ impl VerificationService {
             task_status,
             repair_rounds_used,
         })
+    }
+
+    /// One task's seal for a subject, if that task sealed those bytes.
+    /// Backs the quality loop's task-bound report construction; content
+    /// addressing stays for blobs, identity always carries the task.
+    pub fn seal_for(&self, task: TaskId, subject: &ContentHash) -> Option<SealedCandidate> {
+        self.sealed.get(&(task, subject.clone())).cloned()
     }
 
     /// The task status this service currently records, if the task was sealed.

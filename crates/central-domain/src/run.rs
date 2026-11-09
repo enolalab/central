@@ -199,6 +199,21 @@ pub struct RunState {
     /// Harness session bindings for dispatched attempts (reconcile input).
     #[serde(default)]
     pub attempt_sessions: BTreeMap<AttemptId, AttemptSession>,
+    /// Disputes recorded per task by `DisputeVerification`. The application
+    /// layer gates independent re-reviews on the approved allowance; the
+    /// count here is the durable audit of that policy.
+    #[serde(default)]
+    pub verification_disputes: BTreeMap<TaskId, u8>,
+    /// Pending repair base per task: the predecessor attempt whose
+    /// candidate failed verification and may anchor one repair attempt.
+    /// Written by a `Repair` verdict, consumed by `QueueRepairAttempt`.
+    #[serde(default)]
+    pub repair_base: BTreeMap<TaskId, AttemptId>,
+    /// Repair chain: each repair attempt links to the predecessor attempt
+    /// whose candidate it repairs. Append-only; a repair never rewrites
+    /// the attempt it chains from.
+    #[serde(default)]
+    pub attempt_predecessor: BTreeMap<AttemptId, AttemptId>,
 }
 
 impl RunState {
@@ -225,6 +240,9 @@ impl RunState {
             resource_claims: BTreeMap::new(),
             attempt_inputs: BTreeMap::new(),
             attempt_sessions: BTreeMap::new(),
+            verification_disputes: BTreeMap::new(),
+            repair_base: BTreeMap::new(),
+            attempt_predecessor: BTreeMap::new(),
         }
     }
 

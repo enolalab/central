@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, RunId, TaskId, Timestamp};
+use crate::{
+    quality::QualityDecision, ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, RunId, TaskId,
+    Timestamp, VerificationOutcome,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
@@ -112,6 +115,38 @@ pub enum Event {
     AttemptFailed {
         run_id: RunId,
         attempt_id: AttemptId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One verifier verdict was judged: what was judged (exact subject),
+    /// how it routed, and where the task stands. Append-only: later
+    /// verdicts add events, never rewrite this one.
+    VerificationSubmitted {
+        run_id: RunId,
+        task: TaskId,
+        attempt_id: AttemptId,
+        outcome: VerificationOutcome,
+        decision: QualityDecision,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One verdict was disputed with a reason. The task stays parked for
+    /// verification; the count audits the approved-allowance policy.
+    VerificationDisputed {
+        run_id: RunId,
+        task: TaskId,
+        reason: String,
+        disputes_used: u8,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// One repair attempt queued, linked to the predecessor attempt whose
+    /// candidate failed verification.
+    RepairAttemptQueued {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        task: TaskId,
+        predecessor: AttemptId,
         by: ActorId,
         at: Timestamp,
     },

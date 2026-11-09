@@ -6,6 +6,7 @@ pub mod inbox;
 pub mod leader;
 pub mod ports;
 pub mod profiles;
+pub mod quality_loop;
 pub mod runtime;
 pub mod scheduler;
 pub mod verification;

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "central/verification-report-v1.schema.json",
+  "title": "VerificationReport",
+  "description": "Durable verifier verdict committed by SubmitVerification (P3/T2). Binds the exact subject, exact criteria hash and environment/check references; a fail names its failed criteria. Criteria change only through an approved plan revision; history is append-only.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["subjectHash", "criteriaHash", "outcome", "evidenceIds", "failedCriteria", "environment", "checkRefs", "verifierThread", "verifierWroteTrackedSource", "sameSessionOverride", "findings"],
+  "properties": {
+    "subjectHash": { "type": "string", "minLength": 1 },
+    "criteriaHash": { "type": "string", "minLength": 1 },
+    "outcome": { "type": "string", "enum": ["Pass", "Fail", "Blocked"] },
+    "evidenceIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "failedCriteria": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "environment": { "type": "string", "minLength": 1 },
+    "checkRefs": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "verifierThread": { "type": "string", "minLength": 1 },
+    "verifierWroteTrackedSource": { "type": "boolean" },
+    "sameSessionOverride": { "type": "boolean" },
+    "findings": { "type": "string", "minLength": 1 }
+  }
+}

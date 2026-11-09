@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActorId, AnswerPayload, AttemptId, AttemptSession, CommandId, ContentHash, InboxKey,
-    InboxRequest, Observation, PlanDocumentV1, PlanHash, Revision, TaskId,
+    quality::VerificationReport, ActorId, AnswerPayload, AttemptId, AttemptSession, CommandId,
+    ContentHash, InboxKey, InboxRequest, Observation, PlanDocumentV1, PlanHash, Revision, TaskId,
 };
 
 /// Internal identity kind. The actor is derived from auth/session mapping,
@@ -120,6 +120,41 @@ pub enum Command {
     /// the attempt's resource claims.
     AttemptFailed {
         attempt: AttemptId,
+    },
+    /// Judge one independent verifier verdict against a task awaiting
+    /// verification. Only a verifier (or the user, for a same-session
+    /// override) may submit; the leader can never force a pass. Pass
+    /// succeeds the task on the exact sealed subject, fail retries while
+    /// repair rounds remain then escalates to the leader, blocked records
+    /// `Blocked` without consuming a round. Criteria change only through
+    /// an approved plan revision — a report naming other criteria is
+    /// stale. History is append-only: this never rewrites a verdict.
+    SubmitVerification {
+        task: TaskId,
+        attempt: AttemptId,
+        report: VerificationReport,
+    },
+    /// Dispute a verdict awaiting verification. Records the objection for
+    /// an independent re-review of the same candidate inside the approved
+    /// allowance (otherwise the user decides); the task stays parked for
+    /// verification. A dispute never reviews the previous verifier's
+    /// report, so no verifier-of-verifier chain can form.
+    DisputeVerification {
+        task: TaskId,
+        reason: String,
+    },
+    /// Queue one quality-repair attempt linked to the predecessor attempt
+    /// whose candidate failed verification. Same scheduling gate as
+    /// `QueueAttempt`, plus the repair base the failed verdict recorded:
+    /// the predecessor must match, and the base is consumed, so a repair
+    /// always chains from its verdict and never re-queues silently.
+    QueueRepairAttempt {
+        attempt: AttemptId,
+        task: TaskId,
+        predecessor: AttemptId,
+        input: String,
+        resources: Vec<String>,
+        max_parallel: usize,
     },
 }
 

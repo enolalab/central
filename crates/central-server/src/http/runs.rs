@@ -72,5 +72,35 @@ pub async fn get_run(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("cannot encode events: {error}"),
         ))?,
+        "quality": quality_summary(&run_state),
     })))
+}
+
+/// Per-task verification summary (P3 Task 2): repair budget use, dispute
+/// count, verified output and pending repair linkage. Read-only projection
+/// of durable run state; judging and routing live in the domain.
+fn quality_summary(run_state: &central_domain::RunState) -> serde_json::Value {
+    let tasks = run_state
+        .tasks
+        .values()
+        .map(|task| {
+            serde_json::json!({
+                "task_id": task.id.to_string(),
+                "status": format!("{:?}", task.status),
+                "repair_rounds_used": task.repair_rounds_used,
+                "max_repair_rounds": task.max_repair_rounds,
+                "disputes": run_state
+                    .verification_disputes
+                    .get(&task.id)
+                    .copied()
+                    .unwrap_or(0),
+                "verified_output": run_state
+                    .verified_outputs
+                    .get(&task.id)
+                    .map(|hash| hash.to_string()),
+                "repair_pending": run_state.repair_base.contains_key(&task.id),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({ "tasks": tasks })
 }
