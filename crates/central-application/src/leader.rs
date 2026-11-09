@@ -20,7 +20,7 @@ use central_domain::{Actor, Command, CommandEnvelope, PlanDocumentV1, PlanHash, 
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::AppError;
-use crate::handover::parse_worker_result;
+use crate::handover::{accept_worker_result, parse_worker_result};
 use crate::Runtime;
 
 /// Schema identity for leader replies (see
@@ -193,13 +193,15 @@ impl LeaderService {
 
     /// Report through an agent token: the token must be report-scoped for
     /// exactly this run and attempt. The report is schema-validated and
-    /// checked against the loaded run; committing it belongs to P2/T5.
-    pub fn report_with_token(
+    /// checked against the loaded run (same membership gate as the CLI
+    /// import path); committing it belongs to P2/T5.
+    pub async fn report_with_token(
         &self,
         token: &AgentBridgeToken,
         run: RunId,
         text: &str,
     ) -> Result<BridgeResponse, AppError> {
+        self.check_run(run)?;
         if token.run_id != run || !token.allow_report {
             return Err(AppError::Forbidden(
                 "agent token is not scoped to report for this run".to_string(),
@@ -217,6 +219,13 @@ impl LeaderService {
                 result.attempt_id,
             )));
         }
+        let state = self
+            .runtime
+            .store()
+            .load(run)
+            .await?
+            .ok_or_else(|| AppError::Storage(format!("run {run} has no loaded state")))?;
+        accept_worker_result(&state, &result)?;
         Ok(BridgeResponse {
             status: 200,
             detail: format!(

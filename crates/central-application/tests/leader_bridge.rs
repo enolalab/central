@@ -286,6 +286,19 @@ fn reply_json(plan: &PlanDocumentV1) -> String {
     .to_string()
 }
 
+fn result_json(attempt: AttemptId) -> String {
+    serde_json::json!({
+        "version": 1,
+        "attemptId": attempt.to_string(),
+        "inputHash": "input-h1",
+        "candidatePath": "out/candidate.txt",
+        "candidateHash": "cc".repeat(32),
+        "evidencePaths": [],
+        "summary": "finished",
+    })
+    .to_string()
+}
+
 fn seed_attempt(store: &Arc<MemoryStore>, attempt: AttemptId) {
     let mut state = store
         .inner
@@ -557,4 +570,67 @@ async fn foreign_candidate_is_rejected() {
     .to_string();
     assert!(parse_worker_result(&escape).is_err());
     let _ = service;
+}
+
+#[tokio::test]
+async fn report_token_bound_to_serving_run() {
+    let (store, service) = setup();
+    created_run(&store, &service).await;
+    let attempt = AttemptId::from_u128(42);
+    seed_attempt(&store, attempt);
+
+    // The token matches the caller-supplied run, but this service instance
+    // serves a different run: the report must be refused.
+    let other = LeaderService::new(
+        Runtime::new(
+            store.clone() as Arc<dyn Store>,
+            Arc::new(FakeClock(AtomicI64::new(1_700_000_000_000))),
+            Arc::new(FakeIds(AtomicU64::new(0))),
+            Arc::new(FakeGateway) as Arc<dyn AgentGateway>,
+            RunId::from_u128(999),
+        ),
+        leader_actor(),
+    );
+    let token = AgentBridgeToken::report_only(run_id(), attempt);
+    let rejected = other
+        .report_with_token(&token, run_id(), &result_json(attempt))
+        .await;
+    assert!(
+        rejected.is_err(),
+        "report honored for a run this service does not serve"
+    );
+}
+
+#[tokio::test]
+async fn report_member_attempt_is_accepted() {
+    let (store, service) = setup();
+    created_run(&store, &service).await;
+    let attempt = AttemptId::from_u128(42);
+    seed_attempt(&store, attempt);
+
+    let token = AgentBridgeToken::report_only(run_id(), attempt);
+    let accepted = service
+        .report_with_token(&token, run_id(), &result_json(attempt))
+        .await
+        .expect("member report is accepted");
+    assert_eq!(accepted.status, 200);
+}
+
+#[tokio::test]
+async fn report_unknown_attempt_is_rejected() {
+    let (store, service) = setup();
+    created_run(&store, &service).await;
+    seed_attempt(&store, AttemptId::from_u128(42));
+
+    // Schema-valid report, token-scoped attempt, but the attempt is absent
+    // from the loaded run: must be rejected, never 200-accepted.
+    let unknown = AttemptId::from_u128(777);
+    let token = AgentBridgeToken::report_only(run_id(), unknown);
+    let rejected = service
+        .report_with_token(&token, run_id(), &result_json(unknown))
+        .await;
+    assert!(
+        rejected.is_err(),
+        "report for unknown attempt read as accepted"
+    );
 }
