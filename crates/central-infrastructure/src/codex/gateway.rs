@@ -1,21 +1,24 @@
 //! Versioned Codex app-server gateway: the [`AgentGateway`] implementation.
 //!
 //! T1 scope: versioned framing, correlation, bounded buffering and the
-//! no-silent-fallback policy are fully implemented. There is no live child
-//! process yet — spawning and the stdio handshake wait for the P2/T2
-//! supervisor, so [`CodexGateway::open`] and [`CodexGateway::send`] report
-//! honestly instead of pretending. The T2 reader loop feeds frames through
-//! [`CodexGateway::ingest_wire_frame`]; the T3 inbox binds attempts to events.
+//! no-silent-fallback policy are fully implemented. P2/T2 wires the real
+//! [`ProcessSupervisor`]: [`CodexGateway::open`] spawns the app-server as an
+//! owned, job-contained process and [`CodexGateway::cancel`] terminates it
+//! through the supervisor, so no session outlives Central and a recycled PID
+//! is never killed. Stdio RPC frames still ride the T1 path
+//! ([`CodexGateway::ingest_wire_frame`]); the T3 inbox binds attempts to
+//! events. Anything not yet attached reports honestly instead of pretending.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use central_application::contracts::{
     AppError, CancelObservation, Capabilities, DispatchError, ExecutionRef, ExternalAnswer,
-    OpenSession, ReconcileEvidence, SendTurn, SessionRef, TurnRef,
+    OpenSession, ProcessIdentity, ProcessSpec, ReconcileEvidence, SendTurn, SessionRef, TurnRef,
 };
 use central_application::ports::{AgentGateway, ProcessSupervisor};
-use central_domain::{AttemptStatus, Observation, ResolvedProfile};
+use central_domain::{AttemptId, AttemptStatus, Observation, ResolvedProfile};
 
 use super::stdio::EventBuffer;
 use super::version::{check_model_match, check_supported_version, parse_cli_version, VersionError};
@@ -38,6 +41,10 @@ pub struct CodexConfig {
     pub request_timeout_ms: u64,
     /// Must stay false: Central never enables provider model fallback.
     pub allow_provider_model_fallback: bool,
+    /// Arguments for spawning the app-server binary (default `app-server`).
+    /// Owned by P2/T2: `open` spawns `binary` with these args through the
+    /// real supervisor.
+    pub app_server_args: Vec<String>,
 }
 
 impl Default for CodexConfig {
@@ -50,14 +57,24 @@ impl Default for CodexConfig {
             notification_capacity: 256,
             request_timeout_ms: 30_000,
             allow_provider_model_fallback: false,
+            app_server_args: vec!["app-server".to_string()],
         }
     }
+}
+
+/// One live session: the correlation reference plus the owned process that
+/// backs it. The process is supervised (job-contained, identity-checked),
+/// so cancelling the session provably ends the process tree.
+struct ManagedSession {
+    session: SessionRef,
+    identity: ProcessIdentity,
 }
 
 struct GatewayState {
     buffer: EventBuffer,
     closed: bool,
     closed_reason: Option<String>,
+    sessions: HashMap<AttemptId, ManagedSession>,
 }
 
 /// Codex app-server adapter. One instance per supervised process; the
@@ -79,6 +96,7 @@ impl CodexGateway {
                 buffer: EventBuffer::new(config.notification_capacity),
                 closed: false,
                 closed_reason: None,
+                sessions: HashMap::new(),
             }),
             config,
         }
@@ -187,7 +205,7 @@ fn into_capability(error: VersionError) -> AppError {
 
 #[async_trait]
 impl AgentGateway for CodexGateway {
-    async fn capabilities(&self, _profile: &ResolvedProfile) -> Result<Capabilities, AppError> {
+    async fn capabilities(&self, profile: &ResolvedProfile) -> Result<Capabilities, AppError> {
         self.ensure_compatible()?;
         Ok(Capabilities {
             provider: "codex".to_string(),
@@ -201,18 +219,48 @@ impl AgentGateway for CodexGateway {
                 "item/commandExecution/requestApproval".to_string(),
                 "item/tool/requestUserInput".to_string(),
                 "serverRequest/resolved".to_string(),
+                // The profile this query was made for is the model the
+                // harness must serve: `resolve_profile` treats a missing
+                // entry as unavailable, never as a silent fallback.
+                format!("model:{}", profile.model),
             ],
         })
     }
 
-    async fn open(&self, _request: OpenSession) -> Result<SessionRef, AppError> {
+    async fn open(&self, request: OpenSession) -> Result<SessionRef, AppError> {
         self.ensure_compatible()?;
-        // No live stdio transport before the P2/T2 supervisor exists.
-        Err(AppError::Transport(
-            "live stdio transport not attached (waits for P2/T2 supervisor); \
-             cannot open session from fixtures"
-                .to_string(),
-        ))
+        // Spawn the app-server as an owned, job-contained process through
+        // the real supervisor. Stdio RPC attach rides on top of this in a
+        // later task; the session is correlation-bound to the process from
+        // birth so cancel/reconcile already operate on the right tree.
+        let identity = self
+            .supervisor
+            .spawn(&ProcessSpec {
+                program: self.config.binary.clone(),
+                args: self.config.app_server_args.clone(),
+                working_dir: None,
+            })
+            .await
+            .map_err(|error| match error {
+                AppError::Transport(message) => AppError::Transport(format!(
+                    "cannot spawn app-server '{}': {message}",
+                    self.config.binary
+                )),
+                other => other,
+            })?;
+        let session = SessionRef {
+            provider: "codex".to_string(),
+            instance_epoch: self.epoch.clone(),
+            thread_id: uuid::Uuid::new_v4().to_string(),
+        };
+        self.state.lock().expect("gateway state").sessions.insert(
+            request.attempt_id,
+            ManagedSession {
+                session: session.clone(),
+                identity,
+            },
+        );
+        Ok(session)
     }
 
     async fn send(&self, _request: SendTurn) -> Result<TurnRef, DispatchError> {
@@ -276,24 +324,70 @@ impl AgentGateway for CodexGateway {
 
     async fn cancel(&self, target: &ExecutionRef) -> Result<CancelObservation, AppError> {
         self.ensure_compatible()?;
+        let identity = {
+            let mut state = self.state.lock().expect("gateway state");
+            match state.sessions.remove(&target.attempt_id) {
+                Some(managed) => {
+                    // A cancel naming a stale epoch must never end the live
+                    // process: put the session back and refuse loudly.
+                    if target.session.instance_epoch != managed.session.instance_epoch {
+                        let epoch = target.session.instance_epoch.clone();
+                        state.sessions.insert(target.attempt_id, managed);
+                        return Err(AppError::Conflict(format!(
+                            "stale cancel: epoch '{epoch}' does not match the live session"
+                        )));
+                    }
+                    managed.identity
+                }
+                None => {
+                    return Ok(CancelObservation {
+                        cancelled: false,
+                        detail: format!(
+                            "no live session for attempt {}; nothing to cancel",
+                            target.attempt_id
+                        ),
+                    });
+                }
+            }
+        };
+        // Identity-checked: a recycled PID is never killed (the supervisor
+        // refuses stale identities instead of guessing).
+        self.supervisor.terminate(&identity).await?;
         Ok(CancelObservation {
-            cancelled: false,
+            cancelled: true,
             detail: format!(
-                "no live session for attempt {}; cancellation executes through the \
-                 P2/T2 supervisor",
-                target.attempt_id
+                "terminated owned app-server process {} for attempt {}",
+                identity.pid, target.attempt_id
             ),
         })
     }
 
     async fn reconcile(&self, target: &ExecutionRef) -> Result<ReconcileEvidence, AppError> {
         self.ensure_compatible()?;
+        let identity = {
+            let state = self.state.lock().expect("gateway state");
+            match state.sessions.get(&target.attempt_id) {
+                Some(managed) => managed.identity.clone(),
+                None => {
+                    return Ok(ReconcileEvidence {
+                        attempt_id: target.attempt_id,
+                        status: AttemptStatus::UnknownOutcome,
+                        detail: "no live session for attempt; outcome unknown, re-read \
+                                 thread state before reuse"
+                            .to_string(),
+                    });
+                }
+            }
+        };
+        let state = self.supervisor.inspect(&identity).await?;
         Ok(ReconcileEvidence {
             attempt_id: target.attempt_id,
             status: AttemptStatus::Reconciling,
-            detail: "gateway awaiting live transport; reconcile against thread/read once \
-                     the P2/T2 supervisor attaches stdio"
-                .to_string(),
+            detail: format!(
+                "owned app-server process {} is {state:?}; reconcile against thread/read; \
+                 stdio RPC attach arrives after P2/T2",
+                identity.pid
+            ),
         })
     }
 }

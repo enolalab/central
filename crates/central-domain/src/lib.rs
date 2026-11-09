@@ -16,7 +16,10 @@ pub use ids::{
     Revision, RunId, TaskId, Timestamp,
 };
 pub use plan::{plan_hash, validate_plan, PlanDocumentV1, PlanTaskV1, TaskKind, VerifySpec};
-pub use profile::ResolvedProfile;
+pub use profile::{
+    apply_layers, compute_profile_hash, CapabilitySupport, Enforcement, ProfileError,
+    ProfileLayers, ProfilePatch, ResolvedProfile,
+};
 pub use run::{
     Artifact, Attempt, AttemptStatus, HoldReason, InboxEntry, InboxStatus, Observation,
     PlanRevision, PlanStatus, RunControl, RunState, Task, TaskStatus, UsageLedger,

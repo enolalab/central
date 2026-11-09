@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use central_domain::{
     plan_hash, Command, CommandEnvelope, CommandId, PlanDocumentV1, Revision, RunId,
 };
-use central_infrastructure::process::{spawn_detached, ALREADY_RUNNING_EXIT_CODE};
+use central_infrastructure::process::{spawn_detached, DetachPlacement, ALREADY_RUNNING_EXIT_CODE};
 
 use crate::client::{health_ok, read_server_info, resolve_state_dir, DaemonClient};
 use crate::{Cli, Commands, DaemonCommands, PlanCommands};
@@ -237,10 +237,14 @@ fn daemon(state_dir: &Path, command: &DaemonCommands) -> i32 {
                 args.push("--fake-agent".to_string());
             }
             let log_path = state_dir.join("daemon.log");
-            let mut child = match spawn_detached(&server_exe, &args, &log_path) {
-                Ok(child) => child,
+            let detached = match spawn_detached(&server_exe, &args, &log_path) {
+                Ok(detached) => detached,
                 Err(error) => return fail(&format!("cannot spawn daemon: {error}")),
             };
+            if let DetachPlacement::JoinedParentJob(reason) = &detached.placement {
+                eprintln!("warning: daemon runs in the inherited job ({reason})");
+            }
+            let mut child = detached.child;
             let child_pid = child.id();
             let deadline = Instant::now() + Duration::from_secs(20);
             loop {
@@ -257,11 +261,16 @@ fn daemon(state_dir: &Path, command: &DaemonCommands) -> i32 {
                 }
                 if let Some(info) = read_server_info(state_dir) {
                     if info.pid == child_pid && health_ok(&info.addr) {
+                        let job = match &detached.placement {
+                            DetachPlacement::EscapedJob => "escaped",
+                            DetachPlacement::JoinedParentJob(_) => "inherited",
+                        };
                         print_json(&serde_json::json!({
                             "status": "started",
                             "addr": info.addr,
                             "pid": info.pid,
                             "fake_agent": info.fake_agent,
+                            "job": job,
                         }));
                         return 0;
                     }

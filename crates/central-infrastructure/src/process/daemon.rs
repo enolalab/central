@@ -74,30 +74,89 @@ impl OwnerLock {
 /// stdio, and no parent/child lifetime coupling, so closing the CLI
 /// never kills the daemon. Arguments are passed as an argv array —
 /// never through a shell string.
+///
+/// Where the detached daemon ended up relative to jobs. `EscapedJob` is
+/// the goal: no job ties the daemon to the CLI lifetime. `JoinedParentJob`
+/// is the honest fallback when the parent job forbids breakaway: the daemon
+/// runs, but it inherits the parent job and may die with it. The reason is
+/// published so callers can warn instead of assuming independence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DetachPlacement {
+    EscapedJob,
+    JoinedParentJob(String),
+}
+
+/// A detached daemon child plus where it landed relative to jobs.
+pub struct DetachedChild {
+    pub child: Child,
+    pub placement: DetachPlacement,
+}
+
+/// Spawn a daemon detached and hidden: no console window, no inherited
+/// stdio, and no parent/child lifetime coupling, so closing the CLI
+/// never kills the daemon. Arguments are passed as an argv array —
+/// never through a shell string.
+///
+/// On Windows the child first tries to break away from any job tied to the
+/// CLI lifetime (`CREATE_BREAKAWAY_FROM_JOB`): the daemon must not live in
+/// a job that dies with the CLI. When the parent job forbids breakaway
+/// (access denied), the spawn retries inside the inherited job and reports
+/// [`DetachPlacement::JoinedParentJob`] with the reason — running contained
+/// but never silently. Any other failure is a loud error.
 pub fn spawn_detached(
     program: &Path,
     args: &[String],
     log_path: &Path,
-) -> Result<Child, DaemonError> {
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log_path)?;
-    let log_err = log.try_clone()?;
-    let mut command = Command::new(program);
-    command
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NO_WINDOW: the daemon survives the
-        // CLI and never flashes a console.
-        const DETACHED_PROCESS: u32 = 0x0000_0008;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+) -> Result<DetachedChild, DaemonError> {
+    let spawn_with = |breakaway: bool| -> Result<Child, DaemonError> {
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)?;
+        let log_err = log.try_clone()?;
+        let mut command = Command::new(program);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(log_err));
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // DETACHED_PROCESS | CREATE_NO_WINDOW: the daemon survives the
+            // CLI and never flashes a console.
+            const DETACHED_PROCESS: u32 = 0x0000_0008;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+            let mut flags = DETACHED_PROCESS | CREATE_NO_WINDOW;
+            if breakaway {
+                // Keeps the daemon out of any job tied to the CLI lifetime.
+                flags |= CREATE_BREAKAWAY_FROM_JOB;
+            }
+            command.creation_flags(flags);
+        }
+        #[cfg(not(windows))]
+        let _ = breakaway;
+        Ok(command.spawn()?)
+    };
+    match spawn_with(true) {
+        Ok(child) => Ok(DetachedChild {
+            child,
+            placement: DetachPlacement::EscapedJob,
+        }),
+        Err(DaemonError::Io(error)) if error.raw_os_error() == Some(5) && cfg!(windows) => {
+            // ERROR_ACCESS_DENIED on the breakaway attempt: the parent job
+            // forbids leaving. Retry inside the inherited job and say so.
+            let child = spawn_with(false)?;
+            Ok(DetachedChild {
+                child,
+                placement: DetachPlacement::JoinedParentJob(
+                    "parent job forbids breakaway (access denied); daemon runs in the \
+                     inherited job and may die with the CLI lifetime"
+                        .to_string(),
+                ),
+            })
+        }
+        Err(other) => Err(other),
     }
-    Ok(command.spawn()?)
 }
