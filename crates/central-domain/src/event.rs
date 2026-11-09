@@ -131,12 +131,16 @@ pub enum Event {
         at: Timestamp,
     },
     /// One verdict was disputed with a reason. The task stays parked for
-    /// verification; the count audits the approved-allowance policy.
+    /// verification; the count audits the approved-allowance policy. The
+    /// routing answer is always [`QualityDecision::Disputed`]: the dispute
+    /// opens one independent re-review inside the approved allowance, else
+    /// the user decides (planned at the application layer).
     VerificationDisputed {
         run_id: RunId,
         task: TaskId,
         reason: String,
         disputes_used: u8,
+        decision: QualityDecision,
         by: ActorId,
         at: Timestamp,
     },

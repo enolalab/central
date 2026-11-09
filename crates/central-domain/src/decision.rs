@@ -726,6 +726,7 @@ pub fn decide(
                     task: *task,
                     reason: reason.clone(),
                     disputes_used,
+                    decision: QualityDecision::Disputed,
                     by: actor.id,
                     at: now,
                 }],
@@ -788,9 +789,15 @@ fn submit_verification(
             "attempt {attempt} does not belong to task {task}"
         )));
     }
-    if task_state.status != TaskStatus::AwaitingVerification {
+    // A Blocked task resumes here: after recovery the next verdict is a
+    // fresh verification that preserves the repair rounds the block never
+    // consumed. Any other non-open status is a stale verdict.
+    if !matches!(
+        task_state.status,
+        TaskStatus::AwaitingVerification | TaskStatus::Blocked
+    ) {
         return Err(DomainError::InvalidTransition(format!(
-            "task {task} is not awaiting verification (it is {:?}); \
+            "task {task} is not open for verification (it is {:?}); \
              stale verdict, reverify against the current seal",
             task_state.status,
         )));
@@ -827,6 +834,9 @@ fn submit_verification(
         }
         QualityDecision::Repair { round } => {
             if let Some(task_record) = next.tasks.get_mut(&task) {
+                // A resumption from Blocked reopens the task; a repair
+                // verdict never leaves it parked as Blocked.
+                task_record.status = TaskStatus::AwaitingVerification;
                 task_record.repair_rounds_used = *round;
             }
             // Anchor one repair attempt to this predecessor; the repair
@@ -843,6 +853,11 @@ fn submit_verification(
         QualityDecision::AskLeader => {
             // Repair budget exhausted: park for leader analysis through the
             // normal scheduled gates. No silent retry, no pass, no bypass.
+            // Set explicitly so a resumption from Blocked parks open rather
+            // than staying Blocked.
+            if let Some(task_record) = next.tasks.get_mut(&task) {
+                task_record.status = TaskStatus::AwaitingVerification;
+            }
             next.repair_base.remove(&task);
         }
         QualityDecision::Disputed => {}

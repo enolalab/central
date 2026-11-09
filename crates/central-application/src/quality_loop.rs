@@ -30,18 +30,25 @@ use crate::verification::{criteria_hash, SealedCandidate, VerificationService, W
 
 /// Route one verifier verdict to its quality decision.
 ///
-/// The verdict binds to the single task awaiting verification whose
-/// criteria hash it cites; anything else is stale (no task cites those
-/// criteria) or ambiguous (several do — reverify with a task binding).
+/// The verdict binds to the single open task whose sealed subject and
+/// criteria it cites: criteria alone never identify the task, since two
+/// tasks may share one verify spec. A verdict naming an unsealed subject
+/// is stale; one matching several sealed subjects is ambiguous (reverify
+/// with an explicit task binding). Blocked tasks stay routable so
+/// re-verification after recovery resumes on the preserved round budget.
 /// Routing itself is the domain budget rule: two repairs, then the leader.
 pub fn route_verification(
     state: &RunState,
+    seals: &VerificationService,
     verdict: &VerificationV1,
 ) -> Result<QualityDecision, DomainError> {
     let mut candidates = Vec::new();
     for task in state.tasks.values() {
-        if task.status == TaskStatus::AwaitingVerification
-            && criteria_hash(task) == verdict.criteria_hash
+        if matches!(
+            task.status,
+            TaskStatus::AwaitingVerification | TaskStatus::Blocked
+        ) && criteria_hash(task) == verdict.criteria_hash
+            && seals.seal_for(task.id, &verdict.subject_hash).is_some()
         {
             candidates.push(task);
         }
@@ -187,9 +194,12 @@ impl QualityLoop {
             .tasks
             .get(&task)
             .ok_or_else(|| AppError::NotFound(format!("task {task} is not part of this run")))?;
-        if task_state.status != TaskStatus::AwaitingVerification {
+        if !matches!(
+            task_state.status,
+            TaskStatus::AwaitingVerification | TaskStatus::Blocked
+        ) {
             return Err(AppError::Conflict(format!(
-                "task {task} is not awaiting verification (it is {:?}); \
+                "task {task} is not open for verification (it is {:?}); \
                  stale verdict, reverify against the current seal",
                 task_state.status,
             )));
@@ -269,7 +279,7 @@ impl QualityLoop {
         state: &RunState,
         verdict: &VerificationV1,
     ) -> Result<QualityDecision, AppError> {
-        route_verification(state, verdict).map_err(AppError::from)
+        route_verification(state, &self.service, verdict).map_err(AppError::from)
     }
 
     /// Plan where a dispute goes under the approved allowance.

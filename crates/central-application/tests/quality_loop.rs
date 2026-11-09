@@ -232,7 +232,7 @@ fn two_repairs_then_leader() {
     let mut routes = Vec::new();
     for now in [1, 2, 3] {
         let verdict = fail_verdict(criteria.clone());
-        routes.push(route_verification(&state, &verdict).expect("routes"));
+        routes.push(route_verification(&state, quality.service(), &verdict).expect("routes"));
         state = submit(
             &quality,
             &state,
@@ -266,13 +266,13 @@ fn blocked_does_not_consume_round() {
     let (mut state, task, attempt) = build_state();
     let criteria = criteria_hash(state.tasks.get(&task).expect("task"));
     let verdict = blocked_verdict(criteria);
-    assert_eq!(
-        route_verification(&state, &verdict).expect("routes"),
-        QualityDecision::Blocked
-    );
     let mut quality = QualityLoop::new(1);
     let reseal = seal(&state, attempt, candidate_hash());
     quality.note_worker_done(&mut state, reseal);
+    assert_eq!(
+        route_verification(&state, quality.service(), &verdict).expect("routes"),
+        QualityDecision::Blocked
+    );
     let after_blocked = submit(
         &quality,
         &state,
@@ -877,4 +877,164 @@ fn criteria_change_requires_plan_revision() {
         "committed verdicts are never rewritten"
     );
     let _ = BTreeMap::<TaskId, u8>::new();
+}
+
+#[test]
+fn wrong_subject_right_criteria_is_stale() {
+    // The verdict cites the exact criteria but a subject no seal covers:
+    // it must go stale, never route to the criteria-matching task.
+    let (mut state, task, attempt) = build_state();
+    let criteria = criteria_hash(state.tasks.get(&task).expect("task"));
+    let mut quality = QualityLoop::new(1);
+    let reseal = seal(&state, attempt, candidate_hash());
+    quality.note_worker_done(&mut state, reseal);
+    let wrong_subject = VerificationV1 {
+        subject_hash: other_hash(),
+        ..fail_verdict(criteria)
+    };
+    let stale = route_verification(&state, quality.service(), &wrong_subject);
+    assert!(
+        stale.is_err(),
+        "a verdict for an unsealed subject must go stale, got {stale:?}"
+    );
+}
+
+#[test]
+fn shared_criteria_verdict_binds_subject_task() {
+    // Two tasks share one verify spec (one criteria hash). A verdict must
+    // bind by its sealed subject, not by criteria alone: the verdict for
+    // task B's candidate routes on task B's repair budget.
+    let (mut state, task_a, attempt_a) = build_state();
+    let task_b = TaskId::from_u128(7_111);
+    let attempt_b = AttemptId::from_u128(7_211);
+    state.tasks.insert(
+        task_b,
+        Task {
+            id: task_b,
+            plan_hash: plan_hash(),
+            kind: TaskKind::Implementation,
+            objective: "second task sharing the verify spec".to_string(),
+            status: TaskStatus::AwaitingVerification,
+            depends_on: Vec::new(),
+            data_depends_on: Vec::new(),
+            verify: verify_spec(),
+            profile_id: None,
+            max_repair_rounds: 2,
+            repair_rounds_used: 1,
+        },
+    );
+    state.attempts.insert(
+        attempt_b,
+        Attempt {
+            id: attempt_b,
+            task_id: task_b,
+            plan_hash: plan_hash(),
+            status: AttemptStatus::Completed,
+            profile_id: None,
+            created_at: Timestamp::from_millis(0),
+        },
+    );
+    let criteria = criteria_hash(state.tasks.get(&task_a).expect("task"));
+    assert_eq!(
+        criteria,
+        criteria_hash(state.tasks.get(&task_b).expect("task")),
+        "the fixture must share one criteria hash"
+    );
+    let mut quality = QualityLoop::new(1);
+    let reseal_a = seal(&state, attempt_a, candidate_hash());
+    quality.note_worker_done(&mut state, reseal_a);
+    let reseal_b = seal(&state, attempt_b, other_hash());
+    quality.note_worker_done(&mut state, reseal_b);
+    let verdict = VerificationV1 {
+        subject_hash: other_hash(),
+        ..fail_verdict(criteria)
+    };
+    assert_eq!(
+        route_verification(&state, quality.service(), &verdict).expect("routes to task b"),
+        QualityDecision::Repair { round: 2 },
+        "the verdict must follow its sealed subject to task b's budget"
+    );
+}
+
+#[test]
+fn blocked_task_resubmits_with_rounds_intact() {
+    // A Blocked task has a resumption path: after recovery the same
+    // candidate re-verifies as a fresh verification, preserving the
+    // repair rounds the block never consumed.
+    let (mut state, task, attempt) = build_state();
+    let criteria = criteria_hash(state.tasks.get(&task).expect("task"));
+    let mut quality = QualityLoop::new(1);
+    let reseal = seal(&state, attempt, candidate_hash());
+    quality.note_worker_done(&mut state, reseal);
+    state = submit(
+        &quality,
+        &state,
+        &verifier(),
+        task,
+        attempt,
+        &blocked_verdict(criteria.clone()),
+        &ctx("verifier-1", Vec::new()),
+        1,
+    )
+    .expect("blocked submits");
+    assert_eq!(
+        state.tasks.get(&task).expect("task").status,
+        TaskStatus::Blocked
+    );
+    assert_eq!(state.tasks.get(&task).expect("task").repair_rounds_used, 0);
+    // Routing sees the blocked task: the fail verdict routes round 1.
+    let verdict = fail_verdict(criteria);
+    assert_eq!(
+        route_verification(&state, quality.service(), &verdict).expect("blocked task routes"),
+        QualityDecision::Repair { round: 1 }
+    );
+    state = submit(
+        &quality,
+        &state,
+        &verifier(),
+        task,
+        attempt,
+        &verdict,
+        &fail_ctx("verifier-1"),
+        2,
+    )
+    .expect("re-verification after recovery commits");
+    assert_eq!(
+        state.tasks.get(&task).expect("task").status,
+        TaskStatus::AwaitingVerification
+    );
+    assert_eq!(
+        state.tasks.get(&task).expect("task").repair_rounds_used,
+        1,
+        "the block consumed no round; the fail consumes round 1"
+    );
+}
+
+#[test]
+fn dispute_yields_disputed_decision() {
+    // The MVP contract requires QualityDecision::Disputed: committing a
+    // DisputeVerification through the domain decision must yield it.
+    let (state, task, _attempt) = build_state();
+    let disputed = decide(
+        &state,
+        &user(),
+        &Command::DisputeVerification {
+            task,
+            reason: "the approved check is flaky on a clean scratch".to_string(),
+        },
+        Timestamp::from_millis(1),
+    )
+    .expect("dispute commits");
+    assert!(
+        disputed.events.iter().any(|event| matches!(
+            event,
+            central_domain::Event::VerificationDisputed {
+                task: t,
+                decision: QualityDecision::Disputed,
+                ..
+            } if *t == task
+        )),
+        "a committed dispute must yield QualityDecision::Disputed, got {:?}",
+        disputed.events
+    );
 }
