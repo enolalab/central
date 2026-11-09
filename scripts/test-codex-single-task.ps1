@@ -1,17 +1,21 @@
 # One-task Codex gate for P2 Task 5.
-# Fake by default (no model, no network, fixture-owned temp scratch only).
-# -RealModel attempts one live smoke: at most 3 agent turns, stops on
-# quota/auth errors, never sends the real repo; without a codex CLI it
-# records SKIP (unknown), never a fake pass.
+# Fake-only: no model, no network, fixture-owned temp scratch only. This
+# script never drives a live model turn. A live smoke's turn budget, stop
+# rule and usage capture are manual host steps documented in
+# docs/validation/p2-codex.md. Passing -RealModel is rejected with guidance,
+# never a silent fake pass.
 param(
-    [switch]$RealModel,
-    [string]$Model = "gpt-6-luna",
-    [string]$Effort = "low",
-    [int]$MaxTurns = 3
+    [switch]$RealModel
 )
 $ErrorActionPreference = "Stop"
 $root = Split-Path $PSScriptRoot -Parent
 . (Join-Path $root ".toolchain\env.ps1")
+
+if ($RealModel) {
+    $codex = Get-Command codex -ErrorAction SilentlyContinue
+    $cliState = if ($codex) { "a codex CLI resolves here, but this gate still drives no live turns" } else { "no codex CLI resolves on PATH here" }
+    throw "REALMODEL REJECTED (fake-only gate): $cliState. This script never drives live model turns, so it cannot enforce a turn cap or a quota/auth stop. For the live smoke, follow the manual host steps in docs/validation/p2-codex.md (at most 3 turns, stop on quota/auth, record usage, never send the real repo). Re-run without -RealModel for the deterministic fake gate."
+}
 
 function Assert-True($condition, $message) {
     if (-not $condition) { throw "ASSERT FAILED: $message" }
@@ -45,22 +49,8 @@ def test_add():
     $inputHash = (Get-FileHash -Algorithm SHA256 -Path $calc).Hash.ToLower()
     Write-Output "input sha256: $inputHash"
 
-    # 2. Worker edit: one scripted change (fake) or one harness turn (real).
+    # 2. Worker edit: one scripted change (fake-only gate, no live turns).
     $usage = @{ model = "fake/none"; turns = 0; tokens = "unknown" }
-    if ($RealModel) {
-        $codex = Get-Command codex -ErrorAction SilentlyContinue
-        if (-not $codex) {
-            $usage["note"] = "SKIP: no codex CLI in this environment; live smoke unverified"
-            Write-Output "REALMODEL: SKIP (no codex CLI); worker edit falls back to scripted change"
-        }
-        else {
-            $version = (& codex --version 2>&1 | Out-String).Trim()
-            Write-Output "codex: $version"
-            $usage["model"] = "$Model/$Effort"
-            $usage["note"] = "live turn-driving needs a host run with auth; not attempted from this gate (max $MaxTurns turns)"
-            Write-Output "REALMODEL: recorded as unverified (auth/quota stop applies on host run)"
-        }
-    }
     # Scripted worker change: input validation that keeps add(1, 2) == 3.
     @'
 def add(a, b):
@@ -82,8 +72,9 @@ def add(a, b):
     $testText = Get-Content -Raw -Path $test
     Assert-True ($testText -match "assert add\(1, 2\) == 3") "one fixture test intact"
 
-    # 4. Approved check: exact program+argv allowlist enforced by the runner.
-    # cmd.exe /C with no args would NOT match; only this exact pair runs.
+    # 4. Approved check: exact program+argv allowlist for the bound plan,
+    # enforced by the runner. cmd.exe /C with no args would NOT match; only
+    # this exact pair runs, and only for the plan the runner was built with.
     $check = Start-Process -FilePath "cmd.exe" -ArgumentList @("/C", "exit 0") `
         -WorkingDirectory $scratch -NoNewWindow -PassThru -Wait
     Assert-True ($check.ExitCode -eq 0) "approved check exits zero (evidence, not a verdict)"
@@ -104,7 +95,7 @@ def add(a, b):
     # 7. Evidence record (never agent word alone: hashes + exit codes + counts).
     $evidence = @{
         task              = "P2 Task 5 one-task verification"
-        mode              = $(if ($RealModel) { "real-model-probe" } else { "fake" })
+        mode              = "fake"
         fixture           = "tests/fixtures/tiny-repo (one function, one test)"
         inputHash         = $inputHash
         candidateHash     = $candidateHash

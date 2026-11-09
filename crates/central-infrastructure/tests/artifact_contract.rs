@@ -149,6 +149,7 @@ async fn unapproved_program_is_forbidden() {
     let root = scratch_root("check-allowlist");
     std::fs::create_dir_all(&root).expect("work root");
     let runner = SupervisedCheckRunner::new(
+        central_domain::PlanHash::from_hex("plan TASK-5"),
         vec![ApprovedCommand {
             program: "cmd.exe".to_string(),
             args: vec!["/C".to_string(), "exit 0".to_string()],
@@ -195,10 +196,46 @@ async fn unapproved_program_is_forbidden() {
 
 #[cfg(windows)]
 #[tokio::test]
+async fn mismatched_plan_hash_is_rejected() {
+    let root = scratch_root("check-plan-hash");
+    std::fs::create_dir_all(&root).expect("work root");
+    let runner = SupervisedCheckRunner::new(
+        central_domain::PlanHash::from_hex("plan TASK-5"),
+        vec![ApprovedCommand {
+            program: "cmd.exe".to_string(),
+            args: vec!["/C".to_string(), "echo hi".to_string()],
+        }],
+        root.clone(),
+    )
+    .expect("runner");
+
+    // Same program, same argv, but a request naming a different plan: the
+    // runner must refuse without spawning anything.
+    let other_plan = runner
+        .run(CheckRequest {
+            approved_plan_hash: central_domain::PlanHash::from_hex("plan OTHER-PLAN"),
+            program: "cmd.exe".to_string(),
+            args: vec!["/C".to_string(), "echo hi".to_string()],
+            cwd: ".".to_string(),
+            timeout_ms: 10_000,
+            allowed_write_roots: Vec::new(),
+        })
+        .await;
+    assert!(
+        other_plan.is_err(),
+        "a request naming a different plan must be rejected even with identical argv"
+    );
+
+    std::fs::remove_dir_all(&root).expect("clean scratch");
+}
+
+#[cfg(windows)]
+#[tokio::test]
 async fn approved_check_captures_evidence() {
     let root = scratch_root("check-evidence");
     std::fs::create_dir_all(&root).expect("work root");
     let runner = SupervisedCheckRunner::new(
+        central_domain::PlanHash::from_hex("plan TASK-5"),
         vec![ApprovedCommand {
             program: "cmd.exe".to_string(),
             args: vec!["/C".to_string(), "echo hi".to_string()],

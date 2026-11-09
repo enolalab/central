@@ -1,8 +1,9 @@
 //! Approved-check runner (P2 Task 5): runs only approved program+argv.
 //!
-//! The runner is constructed with the exact commands the approved plan
-//! allows. A request must match one entry exactly — same program, same
-//! argv — or it is refused without spawning anything. The working directory
+//! The runner is constructed with the approved plan's hash and the exact
+//! commands that plan allows. A request must name that plan and match one
+//! entry exactly — same program, same argv — or it is refused without
+//! spawning anything. The working directory
 //! and every allowed write root must stay inside the runner's work root, and
 //! the child is killed on timeout. Stdout/stderr are captured, hashed and
 //! returned as evidence; evidence is never a verdict.
@@ -13,6 +14,7 @@ use async_trait::async_trait;
 use central_application::artifacts::content_hash;
 use central_application::contracts::AppError;
 use central_application::ports::checks::{CheckEvidence, CheckRequest, CheckRunner};
+use central_domain::PlanHash;
 
 /// One approved command: an exact program+argv pair. No globbing, no shell
 /// expansion, no model prose — the entry matches byte for byte or it refuses.
@@ -24,7 +26,10 @@ pub struct ApprovedCommand {
 
 /// [`CheckRunner`] over one work root. `work_root` is canonicalized at
 /// construction so junctions/symlinks cannot smuggle paths out later.
+/// `plan_hash` is the approved plan the allowlist came from: a request
+/// naming any other plan is refused even when its program+argv match.
 pub struct SupervisedCheckRunner {
+    plan_hash: PlanHash,
     approved: Vec<ApprovedCommand>,
     work_root: PathBuf,
 }
@@ -33,11 +38,16 @@ pub struct SupervisedCheckRunner {
 const TAIL_BYTES: usize = 4_096;
 
 impl SupervisedCheckRunner {
-    pub fn new(approved: Vec<ApprovedCommand>, work_root: PathBuf) -> Result<Self, AppError> {
+    pub fn new(
+        plan_hash: PlanHash,
+        approved: Vec<ApprovedCommand>,
+        work_root: PathBuf,
+    ) -> Result<Self, AppError> {
         let work_root = work_root
             .canonicalize()
             .map_err(|error| AppError::Storage(format!("check work root is unusable: {error}")))?;
         Ok(Self {
+            plan_hash,
             approved,
             work_root,
         })
@@ -111,6 +121,12 @@ fn normalize_join(base: &Path, raw: &str) -> PathBuf {
 #[async_trait]
 impl CheckRunner for SupervisedCheckRunner {
     async fn run(&self, request: CheckRequest) -> Result<CheckEvidence, AppError> {
+        if request.approved_plan_hash != self.plan_hash {
+            return Err(AppError::Forbidden(format!(
+                "check plan {} is not the approved plan {}",
+                request.approved_plan_hash, self.plan_hash,
+            )));
+        }
         if !self
             .approved
             .iter()

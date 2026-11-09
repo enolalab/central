@@ -46,30 +46,35 @@ Gate: `pwsh -File scripts/test-codex-single-task.ps1` → **GATE PASS**.
   expected hash aborts with no blob left, tampered blob fails re-hash on read.
 - `orphan_is_not_committed_artifact`: crashed blob is not readable as
   committed; sweep removes exactly it; referenced blobs are never deleted.
-- `unapproved_program_is_forbidden` / `approved_check_captures_evidence`:
-  only the exact approved program+argv runs; cwd escapes refused; stdout
-  hash equals `sha256("hi\r\n")`.
+- `unapproved_program_is_forbidden` / `approved_check_captures_evidence` /
+  `mismatched_plan_hash_is_rejected`: only the exact approved program+argv
+  runs, and only for the plan the runner was bound to (a request naming
+  another plan is refused even with identical argv); cwd escapes refused;
+  stdout hash equals `sha256("hi\r\n")`.
 
 Full `cargo test --workspace -j 2`: every suite `ok`, 0 failures.
 `cargo clippy --workspace --all-targets`: no warnings.
 `cargo fmt --check`: clean.
 
-## Real-model smoke (opt-in, `-RealModel`)
+## Live smoke: manual host steps (the gate script never does this)
 
-`pwsh -File scripts/test-codex-single-task.ps1 -RealModel` →
-deterministic part **PASS**, live smoke **SKIP (unverified)**:
+`scripts/test-codex-single-task.ps1` is fake-only: it drives no live model
+turn, enforces no turn cap, and performs no quota/auth stop. Passing
+`-RealModel` is rejected with guidance pointing here — it never falls back
+to a silent fake pass. The live proof below is a manual host procedure, to
+be run where a `codex` CLI resolves with auth:
 
-- No `codex` CLI on `PATH` in this environment (`Get-Command codex`
-  unresolvable; `--version` probe impossible without it), so no live turn
-  was attempted. Recorded in evidence as
-  `usage.note: SKIP: no codex CLI in this environment; live smoke unverified`,
-  `model: fake/none`, `tokens: unknown`, `turns: 0`.
-- Stopping rule honored: max 3 agent turns, stop on quota/auth; nothing was
-  sent, so no quota was consumed and no personal auth/config was touched.
+1. Turn budget: at most 3 agent turns total — one worker edit turn on the
+   materialized `tests/fixtures/tiny-repo` scratch copy (one function, one
+   test) plus the independent verifier pass.
+2. Stop rule: stop immediately on quota/auth errors; never retry with
+   different credentials, and never send the real repo — fixture-owned temp
+   scratch only.
+3. Usage capture: record model/effort/turns/tokens, or `unknown` with the
+   hold reason (e.g. no CLI, no auth, quota stop), and append the observed
+   values here.
 
-To complete the live proof on a host run with Codex CLI + auth: run the same
-script with `-RealModel` where `codex` resolves, allow up to 3 turns for the
-worker edit plus the independent verifier pass, and append the observed
-usage (model/effort/turns/tokens or `unknown` with the hold reason) here.
-Until then the live smoke stays unverified — the deterministic evidence
-above does not stand in for it.
+Status: live smoke **unverified** — no `codex` CLI on `PATH` in this
+environment, so no live turn was attempted, no quota was consumed, and no
+personal auth/config was touched. The deterministic evidence above does not
+stand in for it.

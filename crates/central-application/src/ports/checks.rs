@@ -4,9 +4,11 @@ use central_domain::{ContentHash, PlanHash};
 use crate::contracts::AppError;
 
 /// One approved check invocation. Only the exact `program`+`args` pair the
-/// runner was constructed with (from the approved plan) may run; anything
-/// else is refused without spawning. `cwd` and every `allowed_write_roots`
-/// entry must stay inside the runner's work root.
+/// runner was constructed with (from the approved plan) may run, and only
+/// for the plan the runner was bound to: `approved_plan_hash` must equal
+/// the runner's construction-plan hash. Anything else is refused without
+/// spawning. `cwd` and every `allowed_write_roots` entry must stay inside
+/// the runner's work root.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckRequest {
     pub approved_plan_hash: PlanHash,
