@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use central_domain::{
-    admission, dependencies_of, eligible_tasks, eligible_tasks_ignoring_gate, live_attempt_count,
-    verified_output, Actor, Admission, Command, CommandEnvelope, ResolvedProfile, RetryPolicy,
-    RunId, RunState, Task, TaskId, WorkRequest, WorkRole,
+    admission, eligible_tasks, eligible_tasks_ignoring_gate, live_attempt_count, render_input,
+    Actor, Admission, Command, CommandEnvelope, ResolvedProfile, RetryPolicy, RunId, RunState,
+    Task, TaskId, WorkRequest, WorkRole,
 };
 
 use crate::contracts::{AppError, DispatchSummary};
@@ -194,36 +194,10 @@ impl Scheduler {
 
     /// The exact input one attempt starts with: the task objective plus
     /// the verified outputs of its data prerequisites, pinned by hash.
-    /// Deterministic for a given snapshot.
+    /// Deterministic for a given snapshot. Delegates to the domain so the
+    /// reuse quarantine re-renders the identical string at re-verdict.
     pub fn render_input(state: &RunState, task: &Task) -> String {
-        let mut input = format!("implement task {}: {}", task.id, task.objective);
-        for edge in dependencies_of(task) {
-            match edge.kind {
-                central_domain::DependencyKind::Order => {
-                    input.push_str(&format!(
-                        "\norder prerequisite: task {} succeeded",
-                        edge.predecessor
-                    ));
-                }
-                central_domain::DependencyKind::Data => {
-                    match verified_output(state, edge.predecessor) {
-                        Some(hash) => {
-                            input.push_str(&format!(
-                                "\nverified input: task {} output {}",
-                                edge.predecessor, hash
-                            ));
-                        }
-                        None => {
-                            input.push_str(&format!(
-                                "\nverified input: task {} (pending verification)",
-                                edge.predecessor
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        input
+        render_input(state, task)
     }
 
     /// Scan one run and dispatch what is ready. Queueing and dispatch

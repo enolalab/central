@@ -4,12 +4,12 @@ use crate::revision::content_hash_of;
 use crate::{
     admission, apply_usage, assess_impact, blocking_dependencies, check_report, covering_attempt,
     criteria_changed, decide_quality, describe_criteria_impact, inbox, is_confirmed_terminal,
-    live_attempt_count, release_settled_claims, retry_used, sync_budget_holds, validate_plan,
-    Actor, ActorKind, Admission, AnswerPayload, Attempt, AttemptStatus, Command, CommandEnvelope,
-    ContentHash, DomainError, Effect, Event, HoldReason, InboxEntry, InboxKey, InboxKind,
-    InboxOutcome, InboxStatus, PlanDocumentV1, PlanHash, PlanRevision, PlanStatus, QualityDecision,
-    ReuseBindings, ReuseDecision, RunControl, RunState, StaleCandidate, Task, TaskId, TaskStatus,
-    Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
+    live_attempt_count, release_settled_claims, render_input, retry_used, sync_budget_holds,
+    validate_plan, Actor, ActorKind, Admission, AnswerPayload, Attempt, AttemptStatus, Command,
+    CommandEnvelope, ContentHash, DomainError, Effect, Event, HoldReason, InboxEntry, InboxKey,
+    InboxKind, InboxOutcome, InboxStatus, PlanDocumentV1, PlanHash, PlanRevision, PlanStatus,
+    QualityDecision, ReuseBindings, ReuseDecision, RunControl, RunState, StaleCandidate, Task,
+    TaskId, TaskStatus, Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1555,9 +1555,14 @@ fn record_stale_result(
         && Some(&task_state.plan_hash) == next.active_plan.as_ref()
     {
         if let Some(current) = assessed.verified_against.clone() {
+            // All four bindings must still hold: the input is re-rendered
+            // from the current snapshot, so a shift between assessment
+            // and re-verdict stays quarantined instead of concluding.
+            let fresh_input = content_hash_of(render_input(state, task_state).as_bytes());
             if report.subject_hash == assessed.candidate_hash
                 && report.criteria_hash == current.criteria_hash
                 && report.environment == current.environment
+                && fresh_input == current.input_hash
             {
                 check_report(task_state, report)?;
                 check_verifier_independence(state, actor, attempt, report)?;

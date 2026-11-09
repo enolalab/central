@@ -11,8 +11,46 @@
 //!
 //! Pure: no IO, no mutation, deterministic for a given [`RunState`].
 
-use crate::dependency::blocking_dependencies;
-use crate::{AttemptId, AttemptStatus, RunControl, RunState, TaskId, Timestamp};
+use crate::dependency::{blocking_dependencies, dependencies_of, verified_output};
+use crate::{
+    AttemptId, AttemptStatus, DependencyKind, RunControl, RunState, Task, TaskId, Timestamp,
+};
+
+/// The exact input one attempt starts with: the task objective plus the
+/// verified outputs of its data prerequisites, pinned by hash.
+/// Deterministic for a given snapshot. The scheduler renders this when
+/// queueing, and the reuse quarantine re-renders it at re-verdict time so
+/// an input shift between assessment and re-verdict cannot conclude as
+/// success: both sides share this one function, so they agree by
+/// construction.
+pub fn render_input(state: &RunState, task: &Task) -> String {
+    let mut input = format!("implement task {}: {}", task.id, task.objective);
+    for edge in dependencies_of(task) {
+        match edge.kind {
+            DependencyKind::Order => {
+                input.push_str(&format!(
+                    "\norder prerequisite: task {} succeeded",
+                    edge.predecessor
+                ));
+            }
+            DependencyKind::Data => match verified_output(state, edge.predecessor) {
+                Some(hash) => {
+                    input.push_str(&format!(
+                        "\nverified input: task {} output {}",
+                        edge.predecessor, hash
+                    ));
+                }
+                None => {
+                    input.push_str(&format!(
+                        "\nverified input: task {} (pending verification)",
+                        edge.predecessor
+                    ));
+                }
+            },
+        }
+    }
+    input
+}
 
 /// Attempts that occupy a concurrency slot: started but not terminally
 /// resolved. `UnknownOutcome` is deliberately excluded: an unknown branch

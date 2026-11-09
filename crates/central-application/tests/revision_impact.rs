@@ -1281,3 +1281,150 @@ async fn plan_change_schema_covers_revision_proposals() {
         );
     }
 }
+
+#[tokio::test]
+async fn verify_again_reverdict_rejects_shifted_input() {
+    let mut h = Harness::new();
+    let (a, b, c, _h1) = h.approved_run().await;
+
+    // c data-depends on a, so c's rendered input pins a's verified
+    // output: a succeeds under h1 first, then the old c attempt starts
+    // bound to h1.
+    let attempt_a = h.start_attempt(a).await;
+    let subject_a = hash_of("candidate-a");
+    h.worker_done(attempt_a, &subject_a).await;
+    h.execute(
+        verifier(),
+        Command::SubmitVerification {
+            task: a,
+            attempt: attempt_a,
+            report: h.report(
+                &subject_a,
+                &criteria_hash_for(&verify_spec()),
+                VerificationOutcome::Pass,
+            ),
+        },
+    )
+    .await;
+    let old_c = h.start_attempt(c).await;
+
+    // h2 changes a (objective + criteria): the old c result quarantines
+    // and assesses to VerifyAgain under the h2 bindings.
+    h.execute(
+        leader(),
+        Command::ProposeRevision {
+            plan: h.revised_plan(a, b, c),
+            reason: "the output contract changed".to_string(),
+            criteria_explanation: Some("criteria gain a no-warnings rule".to_string()),
+            semantic_affected: Vec::new(),
+        },
+    )
+    .await;
+    let h2 = h
+        .load()
+        .pending_revision
+        .clone()
+        .expect("pending")
+        .plan_hash;
+    h.execute(
+        user(),
+        Command::ApproveRevision {
+            plan_hash: h2.clone(),
+        },
+    )
+    .await;
+
+    let subject_c = hash_of("candidate-c");
+    let old_criteria = criteria_hash_for(&verify_spec());
+    h.execute(
+        verifier(),
+        Command::SubmitVerification {
+            task: c,
+            attempt: old_c,
+            report: h.report(&subject_c, &old_criteria, VerificationOutcome::Pass),
+        },
+    )
+    .await;
+    assert_eq!(h.stale(old_c).reuse, ReuseDecision::NeedsAssessment);
+
+    let current = h.current_for(old_c, "env-1");
+    assert_eq!(
+        recommend_reuse(&h.load(), &h.stale(old_c), &current),
+        ReuseDecision::VerifyAgain
+    );
+    h.execute(
+        user(),
+        Command::AssessReuse {
+            attempt: old_c,
+            decision: ReuseDecision::VerifyAgain,
+            current: current.clone(),
+        },
+    )
+    .await;
+
+    // The input shifts after the assessment: h3 changes only c's
+    // objective, so c's freshly rendered input no longer matches the
+    // assessed bindings (criteria stay put, so the report itself is
+    // still fresh).
+    let h2_doc = h.load().plans.get(&h2).expect("h2").document.clone();
+    let mut h3_tasks = h2_doc.tasks.clone();
+    for task in &mut h3_tasks {
+        if task.id == c {
+            task.objective = format!("implement task {c} with a shifted input contract");
+        }
+    }
+    let h3_doc = PlanDocumentV1 {
+        version: 1,
+        goal: h2_doc.goal.clone(),
+        tasks: h3_tasks,
+    };
+    h.execute(
+        leader(),
+        Command::ProposeRevision {
+            plan: h3_doc,
+            reason: "c needs a wider input contract".to_string(),
+            criteria_explanation: None,
+            semantic_affected: Vec::new(),
+        },
+    )
+    .await;
+    let h3 = h
+        .load()
+        .pending_revision
+        .clone()
+        .expect("pending")
+        .plan_hash;
+    h.execute(
+        user(),
+        Command::ApproveRevision {
+            plan_hash: h3.clone(),
+        },
+    )
+    .await;
+
+    // The re-verdict names the assessed bytes under the current criteria
+    // and environment — but the input moved, so it must stay quarantined
+    // instead of concluding success.
+    let fresh_criteria = h.load().tasks.get(&c).expect("task c").verify.clone();
+    let fresh_criteria_hash = criteria_hash_for(&fresh_criteria);
+    h.execute(
+        verifier(),
+        Command::SubmitVerification {
+            task: c,
+            attempt: old_c,
+            report: h.report(&subject_c, &fresh_criteria_hash, VerificationOutcome::Pass),
+        },
+    )
+    .await;
+    let run = h.load();
+    assert_eq!(
+        run.tasks.get(&c).expect("task c").status,
+        TaskStatus::AwaitingVerification,
+        "a re-verdict after an input shift must stay quarantined"
+    );
+    assert!(
+        !run.verified_outputs.contains_key(&c),
+        "a re-verdict after an input shift must not publish a verified output"
+    );
+    assert_eq!(h.stale(old_c).reuse, ReuseDecision::VerifyAgain);
+}

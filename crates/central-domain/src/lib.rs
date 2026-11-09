@@ -58,5 +58,5 @@ pub use run::{
 };
 pub use scheduling::{
     covering_attempt, eligible_tasks, eligible_tasks_ignoring_gate, is_confirmed_terminal,
-    is_live_status, live_attempt_count, release_settled_claims,
+    is_live_status, live_attempt_count, release_settled_claims, render_input,
 };
