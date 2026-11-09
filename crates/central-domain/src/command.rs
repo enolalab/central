@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActorId, AnswerPayload, CommandId, ContentHash, InboxKey, InboxRequest, Observation,
-    PlanDocumentV1, PlanHash, Revision,
+    ActorId, AnswerPayload, AttemptId, AttemptSession, CommandId, ContentHash, InboxKey,
+    InboxRequest, Observation, PlanDocumentV1, PlanHash, Revision, TaskId,
 };
 
 /// Internal identity kind. The actor is derived from auth/session mapping,
@@ -82,6 +82,44 @@ pub enum Command {
         key: InboxKey,
         preview_hash: ContentHash,
         reason: String,
+    },
+    /// Queue one implementation attempt for a ready task. The scheduler
+    /// (never the harness) issues this after the DAG, control, holds,
+    /// resource and concurrency gates pass. `max_parallel` travels with
+    /// the command so the decision can enforce the bound on fresh state
+    /// under the commit CAS, closing the race between concurrent ticks.
+    QueueAttempt {
+        attempt: AttemptId,
+        task: TaskId,
+        input: String,
+        resources: Vec<String>,
+        max_parallel: usize,
+    },
+    /// Mark a queued attempt as dispatching before any agent call, so a
+    /// crash between the call and its receipt reconciles to unknown
+    /// instead of silently duplicating the send.
+    StartDispatch {
+        attempt: AttemptId,
+    },
+    /// The harness accepted the turn: the attempt is running and bound
+    /// to the reported session for later reconciliation.
+    AttemptRunning {
+        attempt: AttemptId,
+        session: AttemptSession,
+    },
+    /// The send outcome is ambiguous: hold descendants and resources,
+    /// never resend blindly.
+    AttemptUnknown {
+        attempt: AttemptId,
+    },
+    /// The send definitely never happened: back to queued for retry.
+    RequeueAttempt {
+        attempt: AttemptId,
+    },
+    /// The harness definitively refused the turn: terminal, releases
+    /// the attempt's resource claims.
+    AttemptFailed {
+        attempt: AttemptId,
     },
 }
 

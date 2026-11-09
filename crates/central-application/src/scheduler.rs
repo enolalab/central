@@ -1,0 +1,274 @@
+//! DAG scheduler: topo-ready selection with bounded concurrency (P3 Task 1).
+//!
+//! [`Scheduler::tick`] is the daemon's scan step: it loads one run,
+//! selects [`eligible_tasks`](central_domain::scheduling::eligible_tasks)
+//! in stable [`TaskId`](central_domain::TaskId) order, queues up to the
+//! free concurrency slots through [`Runtime::execute`] (one CAS commit per
+//! attempt, so two racing ticks cannot duplicate or overfill), then hands
+//! every queued attempt to the [`Dispatcher`](crate::dispatcher::Dispatcher).
+//!
+//! Queueing decisions recheck control, holds, plan binding, typed
+//! dependencies and the named resource config on fresh state for every
+//! attempt; dispatch rechecks them again plus harness capabilities. The
+//! daemon calls `tick` periodically ([`Scheduler::should_tick`] with the
+//! configured cadence) and after new events; scheduling never follows UI
+//! animation state.
+
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use central_domain::{
+    dependencies_of, eligible_tasks, live_attempt_count, verified_output, Actor, Command,
+    CommandEnvelope, ResolvedProfile, RunId, RunState, Task, TaskId,
+};
+
+use crate::contracts::{AppError, DispatchSummary};
+use crate::dispatcher::Dispatcher;
+use crate::ports::{AgentGateway, Clock, IdSource, Store};
+use crate::Runtime;
+
+/// Resolves the frozen profile an attempt dispatches with. The scheduler
+/// never invents profiles: tests hand one in, production wires the
+/// profile layers (P2/T2) here.
+pub type ProfileResolver = dyn Fn(&Task) -> Option<ResolvedProfile> + Send + Sync;
+
+/// MVP default: two implementation attempts run side by side.
+pub const DEFAULT_MAX_PARALLEL: usize = 2;
+
+/// How often the daemon rescans a run for newly eligible work.
+pub const DEFAULT_POLL_INTERVAL_MS: i64 = 5_000;
+
+/// Static scheduling policy: the concurrency bound plus the named
+/// exclusive resources (`port:5432`, `db:test`, ...) each task needs.
+/// A task with no entry needs no exclusive resource.
+#[derive(Clone, Debug)]
+pub struct SchedulerConfig {
+    pub max_parallel: usize,
+    pub resources: BTreeMap<TaskId, Vec<String>>,
+    pub poll_interval_ms: i64,
+}
+
+impl Default for SchedulerConfig {
+    fn default() -> Self {
+        Self {
+            max_parallel: DEFAULT_MAX_PARALLEL,
+            resources: BTreeMap::new(),
+            poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
+        }
+    }
+}
+
+impl SchedulerConfig {
+    /// Reject misconfiguration loudly at construction: an empty resource
+    /// key or a duplicated key for one task would otherwise fail every
+    /// queue attempt at dispatch time.
+    pub fn validate(&self) -> Result<(), AppError> {
+        for (task, keys) in &self.resources {
+            let mut seen = std::collections::BTreeSet::new();
+            for key in keys {
+                if key.trim().is_empty() {
+                    return Err(AppError::Validation(format!(
+                        "scheduler config: task {task} names an empty resource key"
+                    )));
+                }
+                if !seen.insert(key.trim().to_string()) {
+                    return Err(AppError::Validation(format!(
+                        "scheduler config: task {task} names resource {key} twice"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// What one scheduler tick did: which tasks were queued plus the
+/// dispatch outcome (`sent` / `unknown` / `deferred`, mirroring
+/// [`DispatchSummary`]).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScheduleReport {
+    pub queued: Vec<TaskId>,
+    pub sent: usize,
+    pub unknown: usize,
+    pub deferred: usize,
+}
+
+/// Scans one run for ready work and dispatches it through the harness.
+pub struct Scheduler {
+    store: Arc<dyn Store>,
+    clock: Arc<dyn Clock>,
+    ids: Arc<dyn IdSource>,
+    agent: Arc<dyn AgentGateway>,
+    config: SchedulerConfig,
+    resolver: Arc<ProfileResolver>,
+    actor: Actor,
+}
+
+impl Scheduler {
+    pub fn new(
+        store: Arc<dyn Store>,
+        clock: Arc<dyn Clock>,
+        ids: Arc<dyn IdSource>,
+        agent: Arc<dyn AgentGateway>,
+        config: SchedulerConfig,
+        resolver: Arc<ProfileResolver>,
+        actor: Actor,
+    ) -> Result<Self, AppError> {
+        config.validate()?;
+        Ok(Self {
+            store,
+            clock,
+            ids,
+            agent,
+            config,
+            resolver,
+            actor,
+        })
+    }
+
+    pub fn config(&self) -> &SchedulerConfig {
+        &self.config
+    }
+
+    fn runtime_for(&self, run_id: RunId) -> Runtime {
+        Runtime::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.ids),
+            Arc::clone(&self.agent),
+            run_id,
+        )
+    }
+
+    fn dispatcher(&self) -> Dispatcher {
+        Dispatcher::new(
+            Arc::clone(&self.store),
+            Arc::clone(&self.clock),
+            Arc::clone(&self.ids),
+            Arc::clone(&self.agent),
+            Arc::clone(&self.resolver),
+            self.actor.clone(),
+        )
+    }
+
+    /// Whether the daemon's periodic scan is due.
+    pub fn should_tick(
+        &self,
+        last_tick: central_domain::Timestamp,
+        now: central_domain::Timestamp,
+    ) -> bool {
+        now.0.saturating_sub(last_tick.0) >= self.config.poll_interval_ms
+    }
+
+    /// The exact input one attempt starts with: the task objective plus
+    /// the verified outputs of its data prerequisites, pinned by hash.
+    /// Deterministic for a given snapshot.
+    pub fn render_input(state: &RunState, task: &Task) -> String {
+        let mut input = format!("implement task {}: {}", task.id, task.objective);
+        for edge in dependencies_of(task) {
+            match edge.kind {
+                central_domain::DependencyKind::Order => {
+                    input.push_str(&format!(
+                        "\norder prerequisite: task {} succeeded",
+                        edge.predecessor
+                    ));
+                }
+                central_domain::DependencyKind::Data => {
+                    match verified_output(state, edge.predecessor) {
+                        Some(hash) => {
+                            input.push_str(&format!(
+                                "\nverified input: task {} output {}",
+                                edge.predecessor, hash
+                            ));
+                        }
+                        None => {
+                            input.push_str(&format!(
+                                "\nverified input: task {} (pending verification)",
+                                edge.predecessor
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        input
+    }
+
+    /// Scan one run and dispatch what is ready. Queueing and dispatch
+    /// share nothing but fresh store loads: every attempt is considered
+    /// against current state, one CAS commit at a time.
+    pub async fn tick(&self, run_id: RunId) -> Result<ScheduleReport, AppError> {
+        let mut report = ScheduleReport::default();
+        let runtime = self.runtime_for(run_id);
+        let now = runtime.clock().now();
+        let state = self
+            .store
+            .load(run_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
+        if state.control != central_domain::RunControl::Running || !state.holds.is_empty() {
+            // The gate is closed (pause/stop/hold/awaiting resume): running
+            // attempts continue untouched, nothing new queues.
+            report.deferred = eligible_tasks(&state, now).len();
+            return Ok(report);
+        }
+
+        let eligible = eligible_tasks(&state, now);
+        for task_id in eligible {
+            // Fresh state per attempt: a racing tick's commits are
+            // visible here, so slots and claims are never oversubscribed
+            // beyond one in-flight commit window.
+            let fresh = self
+                .store
+                .load(run_id)
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("run {run_id} not found")))?;
+            if fresh.control != central_domain::RunControl::Running || !fresh.holds.is_empty() {
+                report.deferred += 1;
+                continue;
+            }
+            if live_attempt_count(&fresh) >= self.config.max_parallel {
+                report.deferred += 1;
+                continue;
+            }
+            let task = fresh
+                .tasks
+                .get(&task_id)
+                .cloned()
+                .ok_or_else(|| AppError::NotFound(format!("task {task_id} not found")))?;
+            let input = Self::render_input(&fresh, &task);
+            let resources = self
+                .config
+                .resources
+                .get(&task_id)
+                .cloned()
+                .unwrap_or_default();
+            let command = Command::QueueAttempt {
+                attempt: self.ids.next_attempt_id(),
+                task: task_id,
+                input,
+                resources,
+                max_parallel: self.config.max_parallel,
+            };
+            let envelope = CommandEnvelope {
+                id: self.ids.next_command_id(),
+                expected_revision: None,
+                command,
+            };
+            match runtime.execute(self.actor.clone(), envelope).await {
+                Ok(_) => report.queued.push(task_id),
+                // A racing tick won the queue, the plan moved, a
+                // dependency closed, or a claim/bound blocked us: defer,
+                // never fail the whole scan.
+                Err(AppError::Conflict(_)) => report.deferred += 1,
+                Err(other) => return Err(other),
+            }
+        }
+
+        let summary: DispatchSummary = self.dispatcher().dispatch_queued(run_id).await?;
+        report.sent = summary.dispatched;
+        report.unknown = summary.unknown;
+        report.deferred += summary.still_pending;
+        Ok(report)
+    }
+}

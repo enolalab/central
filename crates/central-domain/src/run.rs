@@ -67,6 +67,25 @@ pub struct Observation {
     pub outcome: Option<VerificationOutcome>,
 }
 
+impl Observation {
+    /// Evidence that one turn was sent for an attempt: keyed by the
+    /// harness turn id so a later reconcile can correlate it. The
+    /// dispatcher records this through `RecordObservation` right after a
+    /// confirmed send; it never fabricates worker results.
+    pub fn dispatch_probe(
+        attempt_id: AttemptId,
+        provider_epoch: impl Into<String>,
+        turn_id: impl Into<String>,
+    ) -> Self {
+        Self {
+            attempt_id,
+            provider_epoch: provider_epoch.into(),
+            dedup_key: turn_id.into(),
+            outcome: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlanStatus {
     Proposed,
@@ -108,6 +127,16 @@ pub struct Attempt {
     pub status: AttemptStatus,
     pub profile_id: Option<ProfileId>,
     pub created_at: Timestamp,
+}
+
+/// Where one dispatched attempt is executing, as reported by the harness.
+/// Stored separately from [`Attempt`] so the attempt shape stays frozen:
+/// the binding is evidence about the outside world, not task progress.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttemptSession {
+    pub provider: String,
+    pub instance_epoch: String,
+    pub thread_id: String,
 }
 
 pub use crate::inbox::{InboxEntry, InboxStatus};
@@ -152,6 +181,24 @@ pub struct RunState {
     pub artifacts: BTreeMap<ArtifactId, Artifact>,
     pub usage: UsageLedger,
     pub holds: BTreeSet<HoldReason>,
+    /// Verified outputs by task: the content hash the verifier accepted
+    /// for that task's sealed candidate. Data dependents open only when
+    /// their predecessor has an entry here (P3/T1 reads, P3/T2 writes).
+    #[serde(default)]
+    pub verified_outputs: BTreeMap<TaskId, ContentHash>,
+    /// Exclusive named resources (`port:5432`, `db:test`) held by the
+    /// owning attempt. Released only on a confirmed terminal attempt;
+    /// unknown-outcome attempts keep their claims so no second attempt
+    /// can take the resource while the first is unresolved.
+    #[serde(default)]
+    pub resource_claims: BTreeMap<String, AttemptId>,
+    /// The exact input each attempt was queued with. Queueing never
+    /// rewrites an existing entry: new input waits for a new attempt.
+    #[serde(default)]
+    pub attempt_inputs: BTreeMap<AttemptId, String>,
+    /// Harness session bindings for dispatched attempts (reconcile input).
+    #[serde(default)]
+    pub attempt_sessions: BTreeMap<AttemptId, AttemptSession>,
 }
 
 impl RunState {
@@ -174,6 +221,10 @@ impl RunState {
             artifacts: BTreeMap::new(),
             usage: UsageLedger::default(),
             holds: BTreeSet::new(),
+            verified_outputs: BTreeMap::new(),
+            resource_claims: BTreeMap::new(),
+            attempt_inputs: BTreeMap::new(),
+            attempt_sessions: BTreeMap::new(),
         }
     }
 

@@ -1,5 +1,6 @@
 pub mod command;
 pub mod decision;
+pub mod dependency;
 pub mod error;
 pub mod event;
 pub mod ids;
@@ -7,9 +8,14 @@ pub mod inbox;
 pub mod plan;
 pub mod profile;
 pub mod run;
+pub mod scheduling;
 
 pub use command::{Actor, ActorKind, Command, CommandEnvelope};
 pub use decision::{decide, decide_envelope, Decision};
+pub use dependency::{
+    blocking_dependencies, dependencies_of, dependency_ready, verified_output, DependencyKind,
+    TaskDependency,
+};
 pub use error::DomainError;
 pub use event::{Effect, Event};
 pub use ids::{
@@ -27,6 +33,10 @@ pub use profile::{
     ProfileLayers, ProfilePatch, ResolvedProfile,
 };
 pub use run::{
-    Artifact, Attempt, AttemptStatus, HoldReason, Observation, PlanRevision, PlanStatus,
-    RunControl, RunState, Task, TaskStatus, UsageLedger, VerificationOutcome,
+    Artifact, Attempt, AttemptSession, AttemptStatus, HoldReason, Observation, PlanRevision,
+    PlanStatus, RunControl, RunState, Task, TaskStatus, UsageLedger, VerificationOutcome,
+};
+pub use scheduling::{
+    covering_attempt, eligible_tasks, is_confirmed_terminal, is_live_status, live_attempt_count,
+    release_settled_claims,
 };

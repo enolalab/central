@@ -55,6 +55,10 @@ impl Runtime {
         &self.store
     }
 
+    pub(crate) fn clock(&self) -> &Arc<dyn Clock> {
+        &self.clock
+    }
+
     pub(crate) fn agent(&self) -> &Arc<dyn AgentGateway> {
         &self.agent
     }
@@ -409,6 +413,12 @@ impl Runtime {
                                 attempt.status = AttemptStatus::Cancelled;
                                 state_changed = true;
                             }
+                            // A cancelled attempt is a confirmed
+                            // terminal: its resource claims release so a
+                            // later tick can schedule the next attempt.
+                            // Unknown outcomes keep theirs.
+                            state_changed |=
+                                central_domain::release_settled_claims(&mut next_state);
                         }
                         Ok(_) | Err(_) => {
                             // No usable evidence: the cancel may or

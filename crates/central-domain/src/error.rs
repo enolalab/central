@@ -31,6 +31,14 @@ pub enum DomainError {
     /// The same request id was reused inside one epoch with different
     /// content. Not a replay; refuse instead of overwriting.
     RequestConflict(String),
+    /// The scheduler asked to queue work that is not ready to start:
+    /// a closed gate, an unsatisfied dependency, a live attempt already
+    /// covering the task, a held resource, or a full concurrency bound.
+    /// Deferrable: a later tick may succeed. Loud misconfiguration (an
+    /// empty input or resource key) never maps here.
+    QueueConflict(String),
+    /// The named task is not part of this run.
+    UnknownTask(TaskId),
 }
 
 impl fmt::Display for DomainError {
@@ -70,6 +78,8 @@ impl fmt::Display for DomainError {
                 f,
                 "request id reused in one epoch with different content: {key}"
             ),
+            Self::QueueConflict(reason) => write!(f, "task is not queueable now: {reason}"),
+            Self::UnknownTask(id) => write!(f, "unknown task: {id}"),
         }
     }
 }

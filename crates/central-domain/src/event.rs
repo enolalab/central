@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::{ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, RunId, Timestamp};
+use crate::{ActorId, AttemptId, InboxKind, InboxOutcome, PlanHash, RunId, TaskId, Timestamp};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
@@ -69,6 +69,50 @@ pub enum Event {
         run_id: RunId,
         attempt_id: AttemptId,
         dedup_key: String,
+        at: Timestamp,
+    },
+    /// One attempt queued for a task; carries no input (inputs live in
+    /// the snapshot, never in the journal).
+    AttemptQueued {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        task: TaskId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A queued attempt started dispatching, before any agent call.
+    AttemptDispatching {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A dispatching attempt is confirmed running in a harness session.
+    AttemptRunning {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A dispatch outcome is ambiguous; the attempt holds its claims.
+    AttemptUnknown {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A definitely-unsent attempt returned to queued.
+    AttemptRequeued {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A refused attempt reached its terminal state; claims released.
+    AttemptFailed {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        by: ActorId,
         at: Timestamp,
     },
 }

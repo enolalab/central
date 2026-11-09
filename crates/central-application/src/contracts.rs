@@ -44,10 +44,11 @@ impl From<DomainError> for AppError {
             DomainError::StaleRevision
             | DomainError::PlanHashMismatch
             | DomainError::StaleRequest
-            | DomainError::RequestConflict(_) => Self::Conflict(error.to_string()),
-            DomainError::UnknownPlan(_) | DomainError::UnknownRequest(_) => {
-                Self::NotFound(error.to_string())
-            }
+            | DomainError::RequestConflict(_)
+            | DomainError::QueueConflict(_) => Self::Conflict(error.to_string()),
+            DomainError::UnknownPlan(_)
+            | DomainError::UnknownRequest(_)
+            | DomainError::UnknownTask(_) => Self::NotFound(error.to_string()),
             other => Self::Validation(other.to_string()),
         }
     }

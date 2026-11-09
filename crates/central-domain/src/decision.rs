@@ -1,7 +1,10 @@
+use std::collections::BTreeSet;
+
 use crate::{
-    inbox, validate_plan, Actor, ActorKind, AnswerPayload, AttemptStatus, Command, CommandEnvelope,
-    DomainError, Effect, Event, InboxEntry, InboxKey, InboxKind, InboxOutcome, InboxStatus,
-    PlanRevision, PlanStatus, RunControl, RunState, Task, TaskStatus, Timestamp,
+    blocking_dependencies, covering_attempt, inbox, live_attempt_count, release_settled_claims,
+    validate_plan, Actor, ActorKind, AnswerPayload, Attempt, AttemptStatus, Command,
+    CommandEnvelope, DomainError, Effect, Event, InboxEntry, InboxKey, InboxKind, InboxOutcome,
+    InboxStatus, PlanRevision, PlanStatus, RunControl, RunState, Task, TaskStatus, Timestamp,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -493,7 +496,325 @@ pub fn decide(
                 now,
             )
         }
+
+        Command::QueueAttempt {
+            attempt,
+            task,
+            input,
+            resources,
+            max_parallel,
+        } => queue_attempt(
+            state,
+            actor,
+            *attempt,
+            *task,
+            input,
+            resources,
+            *max_parallel,
+            now,
+        ),
+
+        Command::StartDispatch { attempt } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            let attempt_state = state
+                .attempts
+                .get(attempt)
+                .map(|record| record.status)
+                .ok_or(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is unknown to this run"
+                )))?;
+            if attempt_state != AttemptStatus::Queued {
+                return Err(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is not queued (it is {attempt_state:?})"
+                )));
+            }
+            let mut next = state.clone();
+            if let Some(record) = next.attempts.get_mut(attempt) {
+                record.status = AttemptStatus::Dispatching;
+            }
+            Ok(finish(
+                next.clone(),
+                vec![Event::AttemptDispatching {
+                    run_id: next.id,
+                    attempt_id: *attempt,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::AttemptRunning { attempt, session } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            let attempt_state = state
+                .attempts
+                .get(attempt)
+                .map(|record| record.status)
+                .ok_or(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is unknown to this run"
+                )))?;
+            if attempt_state != AttemptStatus::Dispatching {
+                return Err(DomainError::QueueConflict(format!(
+                    "attempt {attempt} never started dispatching (it is {attempt_state:?})"
+                )));
+            }
+            let mut next = state.clone();
+            if let Some(record) = next.attempts.get_mut(attempt) {
+                record.status = AttemptStatus::Running;
+            }
+            next.attempt_sessions.insert(*attempt, session.clone());
+            Ok(finish(
+                next.clone(),
+                vec![Event::AttemptRunning {
+                    run_id: next.id,
+                    attempt_id: *attempt,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::AttemptUnknown { attempt } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            let attempt_state = state
+                .attempts
+                .get(attempt)
+                .map(|record| record.status)
+                .ok_or(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is unknown to this run"
+                )))?;
+            if !matches!(
+                attempt_state,
+                AttemptStatus::Dispatching | AttemptStatus::Running
+            ) {
+                return Err(DomainError::QueueConflict(format!(
+                    "attempt {attempt} has no ambiguous dispatch (it is {attempt_state:?})"
+                )));
+            }
+            // Claims stay held: nothing is released for unknown outcomes.
+            let mut next = state.clone();
+            if let Some(record) = next.attempts.get_mut(attempt) {
+                record.status = AttemptStatus::UnknownOutcome;
+            }
+            Ok(finish(
+                next.clone(),
+                vec![Event::AttemptUnknown {
+                    run_id: next.id,
+                    attempt_id: *attempt,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::RequeueAttempt { attempt } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            let attempt_state = state
+                .attempts
+                .get(attempt)
+                .map(|record| record.status)
+                .ok_or(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is unknown to this run"
+                )))?;
+            if attempt_state != AttemptStatus::Dispatching {
+                return Err(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is not waiting on a dispatch (it is {attempt_state:?})"
+                )));
+            }
+            let mut next = state.clone();
+            if let Some(record) = next.attempts.get_mut(attempt) {
+                record.status = AttemptStatus::Queued;
+            }
+            Ok(finish(
+                next.clone(),
+                vec![Event::AttemptRequeued {
+                    run_id: next.id,
+                    attempt_id: *attempt,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
+
+        Command::AttemptFailed { attempt } => {
+            require_user_or_system(actor)?;
+            require_created(state)?;
+            let attempt_state = state
+                .attempts
+                .get(attempt)
+                .map(|record| record.status)
+                .ok_or(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is unknown to this run"
+                )))?;
+            if attempt_state != AttemptStatus::Dispatching {
+                return Err(DomainError::QueueConflict(format!(
+                    "attempt {attempt} is not waiting on a dispatch (it is {attempt_state:?})"
+                )));
+            }
+            let mut next = state.clone();
+            let task_id = next.attempts.get(attempt).expect("checked above").task_id;
+            if let Some(record) = next.attempts.get_mut(attempt) {
+                record.status = AttemptStatus::Failed;
+            }
+            if let Some(task) = next.tasks.get_mut(&task_id) {
+                task.status = TaskStatus::Failed;
+            }
+            // A refused send is confirmed finished: release its claims.
+            release_settled_claims(&mut next);
+            Ok(finish(
+                next.clone(),
+                vec![Event::AttemptFailed {
+                    run_id: next.id,
+                    attempt_id: *attempt,
+                    by: actor.id,
+                    at: now,
+                }],
+                Vec::new(),
+            ))
+        }
     }
+}
+
+/// Queue one attempt: the full scheduler gate as a pure decision. Every
+/// refusal that a later tick could retry maps to [`DomainError::QueueConflict`];
+/// only loud misconfiguration (empty input, empty or duplicated resource
+/// keys, unknown task) surfaces as a different error.
+#[allow(clippy::too_many_arguments)]
+fn queue_attempt(
+    state: &RunState,
+    actor: &Actor,
+    attempt: crate::AttemptId,
+    task: crate::TaskId,
+    input: &str,
+    resources: &[String],
+    max_parallel: usize,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user_or_system(actor)?;
+    require_created(state)?;
+    if state.control != RunControl::Running {
+        return Err(DomainError::QueueConflict(format!(
+            "the queue gate is closed while the run is {:?}",
+            state.control
+        )));
+    }
+    if !state.holds.is_empty() {
+        return Err(DomainError::QueueConflict(
+            "the queue gate is closed while the run is held".to_string(),
+        ));
+    }
+    if input.trim().is_empty() {
+        return Err(DomainError::InvalidCommand(
+            "a queued attempt needs a non-empty input".to_string(),
+        ));
+    }
+    let task_state = state
+        .tasks
+        .get(&task)
+        .ok_or(DomainError::UnknownTask(task))?;
+    let Some(active) = state.active_plan.as_ref() else {
+        return Err(DomainError::QueueConflict(
+            "the run has no active plan".to_string(),
+        ));
+    };
+    if task_state.plan_hash != *active {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is bound to a superseded plan"
+        )));
+    }
+    if !matches!(task_state.status, TaskStatus::Pending | TaskStatus::Ready) {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is not ready to queue (it is {:?})",
+            task_state.status
+        )));
+    }
+    if state.attempts.contains_key(&attempt) {
+        return Err(DomainError::QueueConflict(format!(
+            "attempt {attempt} is already queued"
+        )));
+    }
+    let blocked = blocking_dependencies(task_state, state);
+    if !blocked.is_empty() {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} still waits on {} dependencies",
+            blocked.len()
+        )));
+    }
+    if let Some(covering) = covering_attempt(state, task) {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is already covered by attempt {covering}"
+        )));
+    }
+    let plan_hash = task_state.plan_hash.clone();
+    let profile_id = task_state.profile_id;
+
+    // Sweep claims of confirmed-terminal attempts first so a stale entry
+    // can never block a fresh queue; unknown owners keep their claims.
+    let mut next = state.clone();
+    release_settled_claims(&mut next);
+    let mut seen = BTreeSet::new();
+    for key in resources {
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(DomainError::InvalidCommand(
+                "a resource claim needs a non-empty key".to_string(),
+            ));
+        }
+        if !seen.insert(key) {
+            return Err(DomainError::InvalidCommand(format!(
+                "resource {key} is listed twice for task {task}"
+            )));
+        }
+        if let Some(owner) = next.resource_claims.get(key) {
+            return Err(DomainError::QueueConflict(format!(
+                "resource {key} is held by attempt {owner}"
+            )));
+        }
+    }
+    if live_attempt_count(&next) >= max_parallel {
+        return Err(DomainError::QueueConflict(format!(
+            "the concurrency bound ({max_parallel}) is reached"
+        )));
+    }
+
+    let task_record = next.tasks.get_mut(&task).expect("task checked above");
+    task_record.status = TaskStatus::Running;
+    next.attempts.insert(
+        attempt,
+        Attempt {
+            id: attempt,
+            task_id: task,
+            plan_hash,
+            status: AttemptStatus::Queued,
+            profile_id,
+            created_at: now,
+        },
+    );
+    // A second queue for the same task can only happen after the first
+    // attempt resolves (the gate above rejects live coverage), and this
+    // map is insert-only: existing inputs are never rewritten.
+    next.attempt_inputs.insert(attempt, input.to_string());
+    for key in resources {
+        next.resource_claims.insert(key.trim().to_string(), attempt);
+    }
+    Ok(finish(
+        next.clone(),
+        vec![Event::AttemptQueued {
+            run_id: next.id,
+            attempt_id: attempt,
+            task,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
 }
 
 /// Bound on stored harness observations; oldest drops first.
