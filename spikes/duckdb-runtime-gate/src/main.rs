@@ -102,14 +102,15 @@ fn run_crash_cycles(exe: &Path, dir: &Path) -> Result<(bool, bool), Box<dyn std:
         let committed_receipts = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM receipts WHERE command_id='cmd-committed-{}'", cycle))?;
         let uncommitted_events = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM events WHERE event_id='uncommitted-{}'", cycle))?;
         let uncommitted_outbox = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM outbox WHERE intent_id='uncommitted-{}'", cycle))?;
+        let uncommitted_receipts = scalar_i64(&conn, &format!("SELECT COUNT(*) FROM receipts WHERE command_id='cmd-uncommitted-{}'", cycle))?;
         let state = scalar_string(&conn, "SELECT state FROM snapshots WHERE run_id='crash-run'")?;
         let expected = format!("committed-{}", cycle);
         if !(committed_events == 1 && committed_outbox == 1 && committed_receipts == 1 && state == expected) {
             eprintln!("cycle {} committed set incomplete: ev={} ob={} rc={} state={}", cycle, committed_events, committed_outbox, committed_receipts, state);
             atomicity_ok = false;
         }
-        if !(uncommitted_events == 0 && uncommitted_outbox == 0 && state != format!("uncommitted-{}", cycle)) {
-            eprintln!("cycle {} uncommitted leaked: ev={} ob={} state={}", cycle, uncommitted_events, uncommitted_outbox, state);
+        if !(uncommitted_events == 0 && uncommitted_outbox == 0 && uncommitted_receipts == 0 && state != format!("uncommitted-{}", cycle)) {
+            eprintln!("cycle {} uncommitted leaked: ev={} ob={} rc={} state={}", cycle, uncommitted_events, uncommitted_outbox, uncommitted_receipts, state);
             atomicity_ok = false;
             recovery_ok = false;
         }
@@ -467,7 +468,7 @@ fn main() {
         };
         let gate_pass = atomicity_ok && recovery_ok && duplicate_ok && lock_ok && io_failure_ok
             && perf.zero_lost_ack && perf.starvation_ok && perf.reads_ok
-            && perf.p95_ms <= 100.0 && perf.p99_ms <= 500.0 && perf.sustained_writes_per_s >= 24.5;
+            && perf.p95_ms <= 100.0 && perf.p99_ms <= 500.0 && perf.sustained_writes_per_s >= 25.0;
         Ok(GateReport {
             atomicity_ok,
             recovery_ok,

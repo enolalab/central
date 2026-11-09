@@ -62,6 +62,10 @@ pub fn run_child(db_path: &Path, cycle: i64, marker_path: &Path) -> Result<(), B
             "INSERT INTO outbox VALUES (?, 'crash-run', ?)",
             params![format!("uncommitted-{}", cycle), format!("uncommitted-payload-{}", cycle)],
         )?;
+        tx.execute(
+            "INSERT INTO receipts VALUES ('crash-actor', ?, 'hash-uncommitted', ?)",
+            params![format!("cmd-uncommitted-{}", cycle), cycle + 100000],
+        )?;
         append_marker(marker_path, &format!("BEFORE_COMMIT {}", cycle));
         // Hold the transaction open until the parent kills us.
         loop {

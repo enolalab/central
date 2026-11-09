@@ -72,7 +72,7 @@ appends one event, one outbox row and one receipt (four writes, atomic).
 | reads_ok (305 reads, 0 failed; target >= 250) | true |
 | p95_ms | 3.94 (gate <= 100) |
 | p99_ms | 4.16 (gate <= 500) |
-| sustained_writes_per_s | 25.22 (gate >= 24.5; target 25/s) |
+| sustained_writes_per_s | 25.22 (gate >= 25.0; target 25/s) |
 | perf writes completed / sent | 1544 / 1544 |
 
 A first measured run at exactly 25.0/s offered load reported 24.42 writes/s
