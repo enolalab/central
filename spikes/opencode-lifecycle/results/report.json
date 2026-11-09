@@ -1,0 +1,93 @@
+{
+  "version": "1.19.5",
+  "started": "2026-11-08T17:26:55.608Z",
+  "modelCalls": false,
+  "checks": [
+    {
+      "name": "server-start",
+      "passed": true,
+      "evidence": {
+        "healthy": true,
+        "version": "1.19.5"
+      }
+    },
+    {
+      "name": "session-create",
+      "passed": true,
+      "evidence": {
+        "id": "ses_e43cd0fbfffeG6XGjo6FmqlRGE"
+      }
+    },
+    {
+      "name": "sse-session-event",
+      "passed": true,
+      "evidence": {
+        "types": [
+          "server.connected",
+          "session.created",
+          "session.updated",
+          "message.updated",
+          "message.part.updated"
+        ],
+        "ids": [
+          null,
+          null,
+          null,
+          null,
+          null,
+          null
+        ]
+      }
+    },
+    {
+      "name": "sse-replays-gap-within-1s",
+      "passed": false,
+      "evidence": {
+        "types": [
+          "server.connected"
+        ],
+        "gapID": "ses_e43cd0d9cffeOTlbw1H2qVK2WG",
+        "caveat": "Bounded observation with synthetic Last-Event-ID; not proof of all replay behavior."
+      }
+    },
+    {
+      "name": "gap-recoverable-by-query",
+      "passed": true,
+      "evidence": {}
+    },
+    {
+      "name": "session-and-message-survive-forced-restart",
+      "passed": true,
+      "evidence": {
+        "messageCount": 1,
+        "status": {},
+        "caveat": "Persisted idle session; does not establish interrupted model/tool continuation."
+      }
+    },
+    {
+      "name": "abort-stops-controlled-shell-child",
+      "passed": true,
+      "evidence": {
+        "abortResponse": true,
+        "finishedMarker": false,
+        "childAlive": false,
+        "shellResponseOK": true
+      }
+    },
+    {
+      "name": "inflight-crash-reconciliation-observed",
+      "passed": true,
+      "evidence": {
+        "recoveredToolStates": [
+          "running"
+        ],
+        "reportedStatus": "absent",
+        "sideEffectCompletedAfterServerDeath": true,
+        "helperAlive": false,
+        "transportOutcome": "fetch failed",
+        "caveat": "Observation only; success means evidence collected, not automatic continuation or correctness."
+      }
+    }
+  ],
+  "finished": "2026-11-08T17:27:25.296Z"
+}

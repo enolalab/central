@@ -1,0 +1,87 @@
+{
+  "started": "2026-11-09T02:32:18.463Z",
+  "modelCalls": [
+    {
+      "status": "failed",
+      "selectedModel": {
+        "providerID": "opencode",
+        "modelID": "deepseek-v4.1-flash-free",
+        "name": "DeepSeek V4.1 Flash Free"
+      },
+      "submitted": "2026-11-09T02:32:19.789Z",
+      "transportError": "Provider quota exhausted; stopped without waiting for retries"
+    }
+  ],
+  "isolatedState": true,
+  "toolsDenied": true,
+  "health": {
+    "healthy": true,
+    "version": "1.19.5"
+  },
+  "availableFreeModels": [
+    {
+      "providerID": "opencode",
+      "modelID": "beam-free",
+      "name": "Beam Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "mimo-v2.6-flash-free",
+      "name": "MiMo-V2.6-Flash Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "big-pickle",
+      "name": "Big Pickle"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "iceman-free",
+      "name": "Iceman Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "glm-5.3-flash-free",
+      "name": "GLM-5.3-Flash Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "inkling-2-small-free",
+      "name": "Inkling 2 Small Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "deepseek-v4.1-flash-free",
+      "name": "DeepSeek V4.1 Flash Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "flint-40b-free",
+      "name": "Flint 40B Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "nemotron-3.5-lightning-free",
+      "name": "Nemotron 3.5 Lightning Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "crouton-alpha-free",
+      "name": "Crouton Alpha Free"
+    },
+    {
+      "providerID": "opencode",
+      "modelID": "nemotron-3.5-super-vl-free",
+      "name": "Nemotron 3.5 Super VL Free"
+    }
+  ],
+  "selectedModel": {
+    "providerID": "opencode",
+    "modelID": "deepseek-v4.1-flash-free",
+    "name": "DeepSeek V4.1 Flash Free"
+  },
+  "sessionID": "ses_e41d9c1b5ffeC2VWBGLk0fKOM7",
+  "providerError": "Free usage limit reached",
+  "error": "Provider quota exhausted; stopped without waiting for retries",
+  "finished": "2026-11-09T02:32:21.417Z"
+}

@@ -1,0 +1,130 @@
+{
+  "started": "2026-11-09T02:51:04.907Z",
+  "runID": "2026-11-09T02-51-04-875Z",
+  "model": "gpt-6-luna",
+  "effort": "low",
+  "transport": "loopback WebSocket, capability-token auth",
+  "checks": [],
+  "cases": [
+    {
+      "kind": "command-approval",
+      "turnID": "01a1be37-6a85-7ab3-97e2-eb14f9b848a0",
+      "initialMethod": "item/commandExecution/requestApproval",
+      "noSideEffectBeforeApproval": true,
+      "beforeDisconnect": {
+        "type": "active",
+        "activeFlags": [
+          "waitingOnApproval"
+        ]
+      },
+      "afterReconnect": {
+        "type": "active",
+        "activeFlags": [
+          "waitingOnApproval"
+        ]
+      },
+      "sameThreadID": true,
+      "requestReplayed": true,
+      "originalRequestID": 0,
+      "replayedRequestID": 0,
+      "finalTurnStatus": "completed",
+      "markerMatches": true,
+      "resolutionObserved": true,
+      "passed": true,
+      "usage": {
+        "total": {
+          "totalTokens": 31035,
+          "inputTokens": 30878,
+          "cachedInputTokens": 28160,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 157,
+          "reasoningOutputTokens": 0
+        },
+        "last": {
+          "totalTokens": 15535,
+          "inputTokens": 15530,
+          "cachedInputTokens": 15232,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 5,
+          "reasoningOutputTokens": 0
+        },
+        "modelContextWindow": 258400
+      }
+    },
+    {
+      "kind": "user-question",
+      "turnID": "01a1be37-9161-7bb1-96c0-89242d007140",
+      "initialMethod": "item/tool/requestUserInput",
+      "questions": [
+        {
+          "id": "test_label",
+          "header": "Test label",
+          "question": "Which test label should I use?",
+          "isOther": true,
+          "isSecret": false,
+          "options": [
+            {
+              "label": "Alpha",
+              "description": "Use the Alpha label."
+            },
+            {
+              "label": "Beta",
+              "description": "Use the Beta label."
+            }
+          ]
+        }
+      ],
+      "beforeDisconnect": {
+        "type": "active",
+        "activeFlags": [
+          "waitingOnUserInput"
+        ]
+      },
+      "afterReconnect": {
+        "type": "active",
+        "activeFlags": [
+          "waitingOnUserInput"
+        ]
+      },
+      "sameThreadID": true,
+      "requestReplayed": true,
+      "originalRequestID": 1,
+      "replayedRequestID": 1,
+      "finalTurnStatus": "completed",
+      "resolutionObserved": true,
+      "finalMessages": [
+        "Alpha"
+      ],
+      "passed": true,
+      "usage": {
+        "total": {
+          "totalTokens": 31837,
+          "inputTokens": 31765,
+          "cachedInputTokens": 25856,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 72,
+          "reasoningOutputTokens": 0
+        },
+        "last": {
+          "totalTokens": 15933,
+          "inputTokens": 15928,
+          "cachedInputTokens": 12928,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 5,
+          "reasoningOutputTokens": 0
+        },
+        "modelContextWindow": 258400
+      }
+    }
+  ],
+  "serverInfo": {
+    "userAgent": "central_protocol_spike/0.167.0-alpha.3.2 (Windows 10.0.26300; x86_64) dumb (central_protocol_spike; 0.0.1)",
+    "codexHome": "C:\\Users\\hieun\\.codex",
+    "platformFamily": "windows",
+    "platformOs": "windows"
+  },
+  "approvalThreadID": "01a1be37-6a60-7521-add1-40b64adeefd3",
+  "questionThreadID": "01a1be37-9144-7820-8a0d-c623ef720c72",
+  "passed": true,
+  "finished": "2026-11-09T02:51:22.113Z"
+}

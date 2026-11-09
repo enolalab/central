@@ -1,0 +1,11 @@
+codex app-server (WebSockets)
+  listening on: ws://127.0.0.1:62356
+  readyz: http://127.0.0.1:62356/readyz
+  healthz: http://127.0.0.1:62356/healthz
+  note: binds localhost only (use SSH port-forwarding for remote access)
+{"timestamp":"2026-11-09T02:51:05.195307Z","level":"WARN","fields":{"message":"ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/"},"target":"codex_skills::interface"}
+{"timestamp":"2026-11-09T02:51:05.195347Z","level":"WARN","fields":{"message":"ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/"},"target":"codex_skills::interface"}
+{"timestamp":"2026-11-09T02:51:05.197291Z","level":"WARN","fields":{"message":"Failed to create shell snapshot for powershell: Shell snapshot not supported yet for PowerShell"},"target":"codex_core::shell_snapshot"}
+{"timestamp":"2026-11-09T02:51:05.516598Z","level":"WARN","fields":{"message":"ignoring interface.icon_small: icon path with '..' must resolve under plugin assets/"},"target":"codex_skills::interface"}
+{"timestamp":"2026-11-09T02:51:05.516626Z","level":"WARN","fields":{"message":"ignoring interface.icon_large: icon path with '..' must resolve under plugin assets/"},"target":"codex_skills::interface"}
+{"timestamp":"2026-11-09T02:51:15.144708Z","level":"WARN","fields":{"message":"Failed to create shell snapshot for powershell: Shell snapshot not supported yet for PowerShell"},"target":"codex_core::shell_snapshot"}

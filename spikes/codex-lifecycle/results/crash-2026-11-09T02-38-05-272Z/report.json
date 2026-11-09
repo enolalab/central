@@ -1,0 +1,33 @@
+{
+  "started": "2026-11-09T02:38:05.278Z",
+  "model": "gpt-6-luna",
+  "effort": "low",
+  "runID": "2026-11-09T02-38-05-272Z",
+  "calls": [
+    {
+      "label": "interrupted",
+      "code": 0,
+      "signal": null,
+      "threadID": "01a1be2b-842b-7622-a6dd-e8828f8ce999",
+      "eventTypes": [
+        "thread.started",
+        "turn.started",
+        "item.completed",
+        "turn.completed"
+      ],
+      "usage": {
+        "input_tokens": 30436,
+        "cached_input_tokens": 26624,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 213,
+        "reasoning_output_tokens": 0
+      },
+      "commandEvents": [],
+      "errors": [],
+      "answer": "The command was blocked by policy and did not run."
+    }
+  ],
+  "passed": false,
+  "error": "No in-flight checkpoint observed; not a successful crash test. Inspect events/stderr.",
+  "finished": "2026-11-09T02:38:17.561Z"
+}

@@ -1,0 +1,68 @@
+{
+  "started": "2026-11-09T02:34:11.692Z",
+  "model": "gpt-6.1-sol",
+  "effort": "medium",
+  "authentication": "existing ChatGPT login; no credential copied",
+  "calls": [
+    {
+      "label": "initial",
+      "code": 0,
+      "signal": null,
+      "timedOut": false,
+      "elapsedMs": 13916,
+      "threadID": "01a1be27-f3e7-70b2-aa67-785de8806bdc",
+      "eventTypes": [
+        "thread.started",
+        "turn.started",
+        "item.completed",
+        "turn.completed"
+      ],
+      "usage": {
+        "input_tokens": 18886,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 82,
+        "reasoning_output_tokens": 49
+      },
+      "answer": {
+        "probe": "central-live",
+        "nonce": "cd266035c45e1ebb",
+        "sum": 42
+      },
+      "toolItems": 0,
+      "errors": [],
+      "passed": true
+    },
+    {
+      "label": "resume",
+      "code": 0,
+      "signal": null,
+      "timedOut": false,
+      "elapsedMs": 6532,
+      "threadID": "01a1be27-f3e7-70b2-aa67-785de8806bdc",
+      "eventTypes": [
+        "thread.started",
+        "turn.started",
+        "item.completed",
+        "turn.completed"
+      ],
+      "usage": {
+        "input_tokens": 39085,
+        "cached_input_tokens": 18816,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 113,
+        "reasoning_output_tokens": 49
+      },
+      "answer": {
+        "probe": "central-live",
+        "nonce": "cd266035c45e1ebb",
+        "sum": 42
+      },
+      "toolItems": 0,
+      "errors": [],
+      "passed": true
+    }
+  ],
+  "passed": true,
+  "finished": "2026-11-09T02:34:32.141Z"
+}

@@ -1,0 +1,140 @@
+{
+  "started": "2026-11-09T02:39:01.422Z",
+  "model": "gpt-6-luna",
+  "effort": "low",
+  "runID": "2026-11-09T02-39-01-410Z",
+  "calls": [
+    {
+      "label": "interrupted",
+      "code": null,
+      "signal": "SIGKILL",
+      "threadID": "01a1be2c-5f7d-7c81-9a8b-88d147a90418",
+      "eventTypes": [
+        "thread.started",
+        "turn.started",
+        "item.completed",
+        "item.started"
+      ],
+      "usage": null,
+      "commandEvents": [
+        {
+          "type": "item.started",
+          "item": {
+            "id": "item_1",
+            "type": "command_execution",
+            "command": "\"C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\native\\\\powershell\\\\pwsh.exe\" -NoProfile -Command \"& 'C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\node\\\\bin\\\\node.exe' 'D:\\\\Code\\\\enolalab\\\\central\\\\spikes\\\\codex-lifecycle\\\\workspace\\\\crash-2026-11-09T02-39-01-410Z\\\\worker.cjs' run\"",
+            "aggregated_output": "",
+            "exit_code": null,
+            "status": "in_progress"
+          }
+        }
+      ],
+      "errors": [],
+      "answer": null
+    },
+    {
+      "label": "resumed",
+      "code": 0,
+      "signal": null,
+      "threadID": "01a1be2c-5f7d-7c81-9a8b-88d147a90418",
+      "eventTypes": [
+        "thread.started",
+        "turn.started",
+        "item.completed",
+        "item.started",
+        "turn.completed"
+      ],
+      "usage": {
+        "input_tokens": 44695,
+        "cached_input_tokens": 40192,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 391,
+        "reasoning_output_tokens": 0
+      },
+      "commandEvents": [
+        {
+          "type": "item.started",
+          "item": {
+            "id": "item_1",
+            "type": "command_execution",
+            "command": "\"C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\native\\\\powershell\\\\pwsh.exe\" -NoProfile -Command \"& 'C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\node\\\\bin\\\\node.exe' 'D:\\\\Code\\\\enolalab\\\\central\\\\spikes\\\\codex-lifecycle\\\\workspace\\\\crash-2026-11-09T02-39-01-410Z\\\\worker.cjs' inspect\"",
+            "aggregated_output": "",
+            "exit_code": null,
+            "status": "in_progress"
+          }
+        },
+        {
+          "type": "item.completed",
+          "item": {
+            "id": "item_1",
+            "type": "command_execution",
+            "command": "\"C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\native\\\\powershell\\\\pwsh.exe\" -NoProfile -Command \"& 'C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\node\\\\bin\\\\node.exe' 'D:\\\\Code\\\\enolalab\\\\central\\\\spikes\\\\codex-lifecycle\\\\workspace\\\\crash-2026-11-09T02-39-01-410Z\\\\worker.cjs' inspect\"",
+            "aggregated_output": "{\"checkpoint\":{\"nonce\":\"89b61081c8215b42\",\"phase\":\"started\",\"pid\":18904},\"alive\":false,\"actions\":\"START\\n\"}\n",
+            "exit_code": 0,
+            "status": "completed"
+          }
+        },
+        {
+          "type": "item.started",
+          "item": {
+            "id": "item_3",
+            "type": "command_execution",
+            "command": "\"C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\native\\\\powershell\\\\pwsh.exe\" -NoProfile -Command \"& 'C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\node\\\\bin\\\\node.exe' 'D:\\\\Code\\\\enolalab\\\\central\\\\spikes\\\\codex-lifecycle\\\\workspace\\\\crash-2026-11-09T02-39-01-410Z\\\\worker.cjs' finish\"",
+            "aggregated_output": "",
+            "exit_code": null,
+            "status": "in_progress"
+          }
+        },
+        {
+          "type": "item.completed",
+          "item": {
+            "id": "item_3",
+            "type": "command_execution",
+            "command": "\"C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\native\\\\powershell\\\\pwsh.exe\" -NoProfile -Command \"& 'C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\node\\\\bin\\\\node.exe' 'D:\\\\Code\\\\enolalab\\\\central\\\\spikes\\\\codex-lifecycle\\\\workspace\\\\crash-2026-11-09T02-39-01-410Z\\\\worker.cjs' finish\"",
+            "aggregated_output": "{\"nonce\":\"89b61081c8215b42\",\"phase\":\"done\",\"pid\":24028}\n",
+            "exit_code": 0,
+            "status": "completed"
+          }
+        }
+      ],
+      "errors": [],
+      "answer": "{\"nonce\":\"89b61081c8215b42\",\"phase\":\"done\",\"recovered\":true}"
+    }
+  ],
+  "beforeCrash": {
+    "nonce": "89b61081c8215b42",
+    "phase": "started",
+    "pid": 18904
+  },
+  "immediatelyAfterCrash": {
+    "workerAlive": false,
+    "checkpoint": {
+      "nonce": "89b61081c8215b42",
+      "phase": "started",
+      "pid": 18904
+    }
+  },
+  "beforeResume": {
+    "workerAlive": false,
+    "checkpoint": {
+      "nonce": "89b61081c8215b42",
+      "phase": "started",
+      "pid": 18904
+    },
+    "actions": "START\n"
+  },
+  "final": {
+    "checkpoint": {
+      "nonce": "89b61081c8215b42",
+      "phase": "done",
+      "pid": 24028
+    },
+    "actions": [
+      "START",
+      "RECOVER",
+      "FINISH"
+    ]
+  },
+  "passed": true,
+  "finished": "2026-11-09T02:39:50.710Z"
+}

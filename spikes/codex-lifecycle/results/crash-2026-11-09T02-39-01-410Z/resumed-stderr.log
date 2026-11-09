@@ -1,0 +1,4 @@
+2026-11-09T02:39:33.161894Z  WARN codex_core::shell_snapshot: Failed to create shell snapshot for powershell: Shell snapshot not supported yet for PowerShell
+2026-11-09T02:39:36.308930Z ERROR codex_core::util: Custom tool call output is missing for call id: call_8d7abea64a5a4b30b4fe06ac7d744774
+2026-11-09T02:39:42.711051Z ERROR codex_core::util: Custom tool call output is missing for call id: call_8d7abea64a5a4b30b4fe06ac7d744774
+2026-11-09T02:39:47.621888Z ERROR codex_core::util: Custom tool call output is missing for call id: call_8d7abea64a5a4b30b4fe06ac7d744774

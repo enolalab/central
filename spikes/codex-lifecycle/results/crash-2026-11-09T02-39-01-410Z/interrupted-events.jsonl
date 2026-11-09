@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"01a1be2c-5f7d-7c81-9a8b-88d147a90418"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll run the exact PowerShell command once and wait for it to finish."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"\"C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\native\\\\powershell\\\\pwsh.exe\" -NoProfile -Command \"& 'C:\\\\Program Files\\\\WindowsApps\\\\OpenAI.CodexPrimaryRuntime.v26-1105-1297-0_26.1105.1297.0_x64__3k8sg7r9htsxt\\\\dependencies\\\\node\\\\bin\\\\node.exe' 'D:\\\\Code\\\\enolalab\\\\central\\\\spikes\\\\codex-lifecycle\\\\workspace\\\\crash-2026-11-09T02-39-01-410Z\\\\worker.cjs' run\"","aggregated_output":"","exit_code":null,"status":"in_progress"}}
