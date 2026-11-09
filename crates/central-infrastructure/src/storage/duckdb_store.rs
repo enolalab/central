@@ -338,6 +338,11 @@ impl Store for DuckDbStore {
             .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
     }
 
+    async fn events(&self, id: RunId) -> Result<Vec<Event>, AppError> {
+        // Delegate to the inherent method (inherent resolution wins).
+        DuckDbStore::events(self, id).await
+    }
+
     async fn replace_state(
         &self,
         state: &RunState,

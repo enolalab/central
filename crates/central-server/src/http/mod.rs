@@ -8,9 +8,8 @@ use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::Router;
-use central_application::ports::{AgentGateway, Clock, IdSource};
+use central_application::ports::{AgentGateway, Clock, IdSource, Store};
 use central_domain::Actor;
-use central_infrastructure::storage::DuckDbStore;
 use tokio::sync::oneshot;
 
 /// Maximum accepted command body: 1 MiB.
@@ -21,7 +20,7 @@ pub type FakeCounts = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub store: Arc<DuckDbStore>,
+    pub store: Arc<dyn Store>,
     pub actor: Actor,
     pub token: String,
     pub clock: Arc<dyn Clock>,

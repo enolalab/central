@@ -10,7 +10,7 @@ use std::sync::Arc;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use central_application::ports::{Clock, IdSource, Store};
+use central_application::ports::{Clock, IdSource};
 use central_application::Runtime;
 use central_domain::{Command, CommandEnvelope, RunId};
 
@@ -19,7 +19,7 @@ use super::AppState;
 
 fn runtime_for(state: &AppState, run_id: RunId) -> Runtime {
     Runtime::new(
-        Arc::clone(&state.store) as Arc<dyn Store>,
+        Arc::clone(&state.store),
         Arc::clone(&state.clock) as Arc<dyn Clock>,
         Arc::clone(&state.ids) as Arc<dyn IdSource>,
         Arc::clone(&state.agent),

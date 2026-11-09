@@ -522,6 +522,203 @@ fn resume_response_reports_dispatch_outcome() {
     );
 }
 
+// ---------- in-process HTTP dispatch-failure seam ----------
+
+/// Delegates every `Store` call to the real DuckDB store, except
+/// `pending` fails while armed. `Runtime::execute` never calls
+/// `pending`, so arming it after setup makes the post-commit
+/// `dispatch_once` fail for real while the command commit succeeds.
+struct DispatchFailStore {
+    inner: std::sync::Arc<central_infrastructure::storage::DuckDbStore>,
+    fail_pending: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl central_application::ports::Store for DispatchFailStore {
+    async fn load(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<Option<central_domain::RunState>, central_application::contracts::AppError> {
+        central_application::ports::Store::load(&*self.inner, id).await
+    }
+    async fn receipt(
+        &self,
+        actor: central_domain::ActorId,
+        id: central_domain::CommandId,
+    ) -> Result<
+        Option<central_application::contracts::Receipt>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::receipt(&*self.inner, actor, id).await
+    }
+    async fn commit(
+        &self,
+        batch: central_application::contracts::CommitBatch,
+    ) -> Result<central_application::contracts::Receipt, central_application::contracts::AppError>
+    {
+        central_application::ports::Store::commit(&*self.inner, batch).await
+    }
+    async fn pending(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<
+        Vec<central_application::contracts::OutboxIntent>,
+        central_application::contracts::AppError,
+    > {
+        if self.fail_pending.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(central_application::contracts::AppError::Storage(
+                "injected dispatch store failure".to_string(),
+            ));
+        }
+        central_application::ports::Store::pending(&*self.inner, id).await
+    }
+    async fn list_run_ids(
+        &self,
+    ) -> Result<Vec<central_domain::RunId>, central_application::contracts::AppError> {
+        central_application::ports::Store::list_run_ids(&*self.inner).await
+    }
+    async fn outbox(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<
+        Vec<central_application::contracts::OutboxIntent>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::outbox(&*self.inner, id).await
+    }
+    async fn transition_outbox(
+        &self,
+        id: central_domain::IntentId,
+        expected: central_application::contracts::OutboxStatus,
+        next: central_application::contracts::OutboxStatus,
+    ) -> Result<bool, central_application::contracts::AppError> {
+        central_application::ports::Store::transition_outbox(&*self.inner, id, expected, next).await
+    }
+    async fn replace_state(
+        &self,
+        state: &central_domain::RunState,
+        expected_revision: central_domain::Revision,
+    ) -> Result<(), central_application::contracts::AppError> {
+        central_application::ports::Store::replace_state(&*self.inner, state, expected_revision)
+            .await
+    }
+    async fn events(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<Vec<central_domain::Event>, central_application::contracts::AppError> {
+        self.inner.events(id).await
+    }
+}
+
+fn post_command_addr(
+    addr: &str,
+    token: &str,
+    run: Option<&str>,
+    id: u128,
+    command: serde_json::Value,
+) -> (u16, serde_json::Value) {
+    let path = match run {
+        Some(run) => format!("/v1/commands?run={run}"),
+        None => "/v1/commands".to_string(),
+    };
+    let (status, body) = http(
+        "POST",
+        addr,
+        &path,
+        Some(token),
+        Some(&envelope(id, command)),
+    );
+    let value: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::Value::Null);
+    (status, value)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resume_dispatch_failure_is_caller_visible_over_http() {
+    use std::sync::atomic::AtomicBool;
+
+    let dir = state_dir("dispatch-error-http");
+    let inner = std::sync::Arc::new(
+        central_infrastructure::storage::DuckDbStore::open(&dir.join("central.duckdb"))
+            .expect("open store"),
+    );
+    let fail_pending = std::sync::Arc::new(AtomicBool::new(false));
+    let store: std::sync::Arc<dyn central_application::ports::Store> =
+        std::sync::Arc::new(DispatchFailStore {
+            inner,
+            fail_pending: fail_pending.clone(),
+        });
+    let token = "dispatch-error-token".to_string();
+    let state = central_server::http::AppState {
+        store,
+        actor: central_domain::Actor::user(central_domain::ActorId::from_u128(0xaa)),
+        token: token.clone(),
+        clock: std::sync::Arc::new(central_server::bootstrap::SystemClock),
+        ids: std::sync::Arc::new(central_server::bootstrap::UuidIds),
+        agent: std::sync::Arc::new(central_server::bootstrap::UnavailableGateway),
+        fake_agent_enabled: false,
+        fake_counts: None,
+        shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, central_server::http::router(state)).await;
+    });
+
+    let (status, receipt) = post_command_addr(
+        &addr,
+        &token,
+        None,
+        900,
+        serde_json::json!({"CreateRun": {"goal": "g", "repository": "r"}}),
+    );
+    assert_eq!(status, 200, "create: {receipt}");
+    let run = receipt["run_id"].as_str().expect("run id").to_string();
+
+    let (status, receipt) =
+        post_command_addr(&addr, &token, Some(&run), 901, serde_json::json!("Pause"));
+    assert_eq!(status, 200, "pause: {receipt}");
+    let paused_revision = receipt["revision"].as_u64().expect("paused revision");
+
+    // Arm the real store failure only now: the Resume commit below
+    // does not touch `pending`, the post-commit dispatch does.
+    fail_pending.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (status, receipt) =
+        post_command_addr(&addr, &token, Some(&run), 902, serde_json::json!("Resume"));
+
+    // Receipt remains committed and truthful (still 2xx, fields intact).
+    assert_eq!(status, 200, "resume with failing dispatch: {receipt}");
+    assert_eq!(receipt["run_id"].as_str().expect("receipt run"), run);
+    assert_eq!(receipt["result"], "applied", "receipt: {receipt}");
+    assert!(
+        receipt["revision"].as_u64().expect("receipt revision") > paused_revision,
+        "resume must have committed a new revision: {receipt}"
+    );
+    // The dispatch failure is caller-visible, not swallowed.
+    assert_eq!(
+        receipt["dispatch"]["status"], "error",
+        "dispatch failure must be visible over HTTP: {receipt}"
+    );
+    assert!(
+        receipt["dispatch"]["error"]
+            .as_str()
+            .expect("dispatch error text")
+            .contains("injected dispatch store failure"),
+        "dispatch error text: {receipt}"
+    );
+
+    // The committed Resume is durable truth despite the dispatch error.
+    fail_pending.store(false, std::sync::atomic::Ordering::SeqCst);
+    let (status, body) = http("GET", &addr, &format!("/v1/runs/{run}"), Some(&token), None);
+    assert_eq!(status, 200, "get run: {body}");
+    let view: serde_json::Value = serde_json::from_str(&body).expect("run json");
+    assert_eq!(view["state"]["control"], "Running", "run view: {view}");
+
+    server.abort();
+}
+
 #[test]
 fn ui_not_built_returns_clear_503() {
     let dir = state_dir("ui");

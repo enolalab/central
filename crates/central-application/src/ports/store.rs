@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use central_domain::{ActorId, CommandId, IntentId, Revision, RunId, RunState};
+use central_domain::{ActorId, CommandId, Event, IntentId, Revision, RunId, RunState};
 
 use crate::contracts::{AppError, CommitBatch, OutboxIntent, OutboxStatus, Receipt};
 
@@ -47,6 +47,16 @@ pub trait Store: Send + Sync {
         let _ = (id, expected, next);
         Err(AppError::Storage(
             "transition_outbox is not supported by this store".to_string(),
+        ))
+    }
+
+    /// Every persisted event for a run, in sequence order. The default
+    /// reports the operation as unsupported rather than silently
+    /// returning no history.
+    async fn events(&self, id: RunId) -> Result<Vec<Event>, AppError> {
+        let _ = id;
+        Err(AppError::Storage(
+            "events is not supported by this store".to_string(),
         ))
     }
 
