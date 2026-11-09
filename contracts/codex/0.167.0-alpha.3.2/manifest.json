@@ -1,0 +1,23 @@
+{
+  "name": "central-codex-adapter",
+  "cliVersion": "0.167.0-alpha.3.2",
+  "cliVersionAllowlist": ["0.167.0-alpha.3.2"],
+  "transport": "stdio JSONL (JSON-RPC 2.0, one frame per line)",
+  "frameCapBytes": 8388608,
+  "notificationBufferCapacity": 256,
+  "allowProviderModelFallback": false,
+  "schemaProvenance": {
+    "generatedFromLiveCli": false,
+    "reason": "Codex CLI binary not reachable from the build sandbox (not on PATH; bundled WindowsApps shims are not executable Store stubs and probing them would risk touching personal auth/config). Spike-captured schemas used instead.",
+    "schemaSource": "spikes/codex-app-server/schema (captured 2026-11-09 via `codex app-server generate-json-schema --experimental --out schema`)",
+    "transcriptSource": "spikes/codex-app-server/results/2026-11-09T02-51-04-875Z/rpc.jsonl (filtered: host paths, codexHome, installationId, serverName, OS build, disposable command text replaced with fixture placeholders)",
+    "fullV2SchemasSha256": "B1E5D17224B9D9732B5976012438BA78E2CF7E418B67F8F8A5F5CFFE301B875D",
+    "clientRequestSha256": "2D629AAACEEA335D7E58AB19CE5908D8DD75CA3F3A6161A5F015BF59AADD3295"
+  },
+  "policies": {
+    "timeoutAfterWrite": "OutcomeUnknown, never resend turn/start",
+    "oversizeFrame": "close transport, require reconciliation, never parse partial event",
+    "secretHandling": "logs and request errors redact token/secret/authorization material; no tokens or env in durable outbox",
+    "modelMismatch": "requested/observed model mismatch is a capability error, never silent fallback"
+  }
+}

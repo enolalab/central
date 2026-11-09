@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Central Codex app-server protocol subset (typed v2)",
+  "description": "Distilled wire surface used by Central P2/T1. Field shapes verified against the spike-captured v2 schemas and the captured rpc.jsonl transcript (tests/fixtures/codex). NOT generated from a live CLI: the Codex CLI binary is not reachable from the build sandbox without touching personal auth/config.",
+  "provenance": {
+    "cliVersion": "0.167.0-alpha.3.2",
+    "schemaSource": "spikes/codex-app-server/schema (spike-captured, 2026-11-09)",
+    "fullV2SchemasSha256": "B1E5D17224B9D9732B5976012438BA78E2CF7E418B67F8F8A5F5CFFE301B875D",
+    "clientRequestSha256": "2D629AAACEEA335D7E58AB19CE5908D8DD75CA3F3A6161A5F015BF59AADD3295",
+    "generatedFromLiveCli": false
+  },
+  "envelope": {
+    "transport": "JSONL over stdio (one JSON-RPC 2.0 frame per line, UTF-8, LF terminated)",
+    "frameCapBytes": 8388608,
+    "id": "client request ids are numbers; server request ids observed as numbers (0, 1)",
+    "request": { "id": "number|string", "method": "string", "params": "object" },
+    "response": { "id": "number|string", "result": "any, error absent": null },
+    "errorResponse": { "id": "number|string|null", "error": { "code": "integer", "message": "string" } },
+    "serverRequest": { "id": "number", "method": "string", "params": "object" },
+    "notification": { "method": "string", "params": "object", "id": "absent" }
+  },
+  "clientMethods": {
+    "initialize": {
+      "params": {
+        "clientInfo": { "name": "string", "title": "string", "version": "string" },
+        "capabilities": { "experimentalApi": true }
+      },
+      "result": {
+        "userAgent": "string (contains CLI version)",
+        "codexHome": "string (REDACTED in fixtures)",
+        "platformFamily": "windows",
+        "platformOs": "windows"
+      },
+      "source": "capture rpc.jsonl lines 1-2"
+    },
+    "initialized": {
+      "params": {},
+      "source": "capture rpc.jsonl line 3"
+    },
+    "thread/start": {
+      "params": {
+        "model": "string (requested model, e.g. gpt-6-luna)",
+        "cwd": "string",
+        "sandbox": ["read-only", "workspace-write", "danger-full-access"],
+        "approvalPolicy": ["untrusted", "on-request", "never"],
+        "approvalsReviewer": ["user", "auto_review", "guardian_subagent"],
+        "ephemeral": "boolean",
+        "experimentalRawEvents": "boolean",
+        "allowProviderModelFallback": false,
+        "config": { "model_reasoning_effort": "string" }
+      },
+      "result": {
+        "thread": { "id": "string (UUID)", "model": "string (OBSERVED model)", "modelProvider": "string" },
+        "model": "string (OBSERVE: requested/observed mismatch is a capability error)"
+      },
+      "source": "spikes/codex-app-server/schema/v2/ThreadStartParams.json + ThreadStartResponse.json; allowProviderModelFallback description: Allow a provider with an authoritative static model catalog to replace an unavailable requested model with its default. Central always sends false."
+    },
+    "thread/resume": {
+      "params": { "threadId": "string (UUID)", "excludeTurns": "boolean" },
+      "result": { "thread": { "id": "string (UUID)" }, "model": "string" },
+      "source": "spikes/codex-app-server/schema/v2/ThreadResumeParams.json + capture reconnect sequence"
+    },
+    "thread/read": {
+      "params": { "threadId": "string (UUID)", "includeTurns": "boolean" },
+      "result": { "thread": { "id": "string (UUID)" }, "readState": "object" },
+      "source": "spikes/codex-app-server/schema/v2/ThreadReadParams.json + capture"
+    },
+    "turn/start": {
+      "params": {
+        "threadId": "string (UUID)",
+        "effort": "string",
+        "input": [{ "type": "text", "text": "string", "text_elements": "array" }]
+      },
+      "result": { "turn": { "id": "string (UUID)", "status": "inProgress|completed" } },
+      "source": "spikes/codex-app-server/schema/v2/TurnStartParams.json + capture"
+    }
+  },
+  "serverRequests": {
+    "item/commandExecution/requestApproval": {
+      "params": {
+        "kind": "command",
+        "threadId": "string (UUID)",
+        "turnId": "string (UUID)",
+        "itemId": "string",
+        "command": "string (REDACTED preview in fixtures)",
+        "cwd": "string (REDACTED in fixtures)",
+        "availableDecisions": ["accept", "cancel"]
+      },
+      "answer": { "decision": ["accept", "cancel"] },
+      "source": "capture + spikes/codex-app-server/schema/CommandExecutionRequestApprovalParams.json"
+    },
+    "item/tool/requestUserInput": {
+      "params": {
+        "threadId": "string (UUID)",
+        "turnId": "string (UUID)",
+        "itemId": "string",
+        "questions": [{ "id": "string", "header": "string", "question": "string", "isSecret": "boolean", "options": [{ "label": "string" }] }],
+        "isBlocking": "boolean"
+      },
+      "answer": { "answers": "object" },
+      "source": "capture + spikes/codex-app-server/schema/ToolRequestUserInputParams.json"
+    }
+  },
+  "serverNotifications": {
+    "thread/started": { "params": { "thread": { "id": "string (UUID)" } } },
+    "thread/status/changed": { "params": { "threadId": "string", "status": { "type": "idle|active" } } },
+    "turn/started": { "params": { "threadId": "string", "turn": { "id": "string" } } },
+    "turn/completed": { "params": { "threadId": "string", "turn": { "id": "string", "status": "completed" } } },
+    "item/started": { "params": { "threadId": "string", "turnId": "string" } },
+    "item/completed": { "params": { "threadId": "string", "turnId": "string" } },
+    "serverRequest/resolved": { "params": { "threadId": "string", "requestId": "number" } }
+  }
+}

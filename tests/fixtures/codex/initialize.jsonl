@@ -1,0 +1,4 @@
+{"dir":"sent","message":{"id":100,"method":"initialize","params":{"clientInfo":{"name":"central-fixture","title":"Central protocol spike","version":"0.0.1"},"capabilities":{"experimentalApi":true}}}}
+{"dir":"received","message":{"id":100,"result":{"userAgent":"central-fixture/0.167.0-alpha.3.2 (Windows 10.0; x86_64) dumb (central-fixture; 0.0.1)","codexHome":"C:\\fixture\\codex-home","platformFamily":"windows","platformOs":"windows"}}}
+{"dir":"sent","message":{"method":"initialized","params":{}}}
+{"dir":"received","message":{"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"FIXTURE-SERVER","installationId":"00000000-0000-4000-8000-000000000000","environmentId":null},"emittedAtMs":1794192665181}}
