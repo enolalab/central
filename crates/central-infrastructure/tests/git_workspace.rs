@@ -224,3 +224,44 @@ async fn sync_does_not_stash_user_work() {
     assert_eq!(stash_after, stash_before, "sync must never stash user work");
     assert!(stash_after.is_empty(), "no stash entry may appear");
 }
+
+#[tokio::test]
+async fn seal_binds_attempt_identity() {
+    let root = scratch_root("seal-attempt-bind");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let head = repo_with_commit(&repo, &[("calc.py", "def add(a, b):\n    return a + b\n")], "base");
+
+    let manager = GitWorkspaceManager::open(&root.join("state")).expect("open manager");
+    let snapshot = manager
+        .snapshot(snapshot_request(&repo, &head))
+        .await
+        .expect("snapshot");
+    let workspace = manager
+        .create(WorkspaceRequest {
+            attempt_id: AttemptId::from_u128(5_003),
+            input: snapshot,
+        })
+        .await
+        .expect("create");
+    let candidate = manager.seal(&workspace).await.expect("seal");
+    manager
+        .verify_seal(&candidate)
+        .await
+        .expect("fresh seal verifies");
+
+    // A CandidateRef with a swapped attempt_id must not verify: the seal is
+    // bound to the attempt that produced it.
+    let mut swapped = candidate.clone();
+    swapped.attempt_id = AttemptId::from_u128(9_999);
+    let verdict = manager.verify_seal(&swapped).await;
+    assert!(
+        matches!(verdict, Err(AppError::Conflict(_))),
+        "swapped attempt_id must fail verify: {verdict:?}"
+    );
+
+    manager
+        .remove_workspace(&workspace)
+        .await
+        .expect("explicit ownership-checked cleanup");
+}

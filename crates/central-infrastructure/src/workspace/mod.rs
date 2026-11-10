@@ -315,7 +315,10 @@ impl WorkspaceManager for GitWorkspaceManager {
                     candidate.commit,
                 ))
             })?;
-        if entry.tree != candidate.tree || entry.parent != candidate.parent {
+        if entry.attempt_id != candidate.attempt_id
+            || entry.tree != candidate.tree
+            || entry.parent != candidate.parent
+        {
             return Err(AppError::Conflict(format!(
                 "candidate {} does not match its seal; reverify against the current seal",
                 candidate.commit,
