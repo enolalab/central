@@ -199,6 +199,7 @@ pub fn observation_for(
         provider_epoch: epoch.to_string(),
         dedup_key: format!("{}:{thread}:{item}:{id}", event.method),
         outcome: None,
+        detail: String::new(),
     }
 }
 

@@ -279,12 +279,14 @@ fn evidence_for_returns_attempt_scoped_evidence() {
         provider_epoch: "epoch-1".to_string(),
         dedup_key: "obs-for-attempt".to_string(),
         outcome: None,
+        detail: String::new(),
     });
     state.observations.push(Observation {
         attempt_id: other_attempt,
         provider_epoch: "epoch-1".to_string(),
         dedup_key: "obs-for-other".to_string(),
         outcome: None,
+        detail: String::new(),
     });
     let own_hash = hash("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     let other_hash_value = hash("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");

@@ -24,15 +24,19 @@ use central_application::contracts::{
 use central_application::integration::recover_receipt;
 use central_application::ports::workspace::PromotionIntent;
 use central_application::ports::{AgentGateway, Clock, IdSource, Store};
-use central_application::recovery::{blocked_by_unknown, can_resume_session, inspect_run};
+use central_application::recovery::{
+    blocked_by_unknown, can_resume_session, inspect_run, reconciled_outcome,
+};
 use central_application::scheduler::{Scheduler, SchedulerConfig};
 use central_application::Runtime;
 use central_domain::{
     Actor, ActorId, ActorKind, Attempt, AttemptId, AttemptSession, AttemptStatus, Command,
     CommandEnvelope, CommandId, ContentHash, Effect, InboxEntry, InboxKind, InboxStatus, IntentId,
     MissingUsage, Observation, PlanDocumentV1, PlanHash, PlanTaskV1, ResolvedProfile, Revision,
-    RunControl, RunId, RunState, Task, TaskId, TaskKind, TaskStatus, Timestamp, VerifySpec,
+    RunControl, RunId, RunState, Task, TaskId, TaskKind, TaskStatus, Timestamp,
+    VerificationOutcome, VerifySpec,
 };
+use central_server::scan::{tick_all, ScanConfig};
 
 // ---------- deterministic fakes ----------
 
@@ -71,6 +75,8 @@ struct FakeGateway {
     reconciles: AtomicUsize,
     sent_inputs: Mutex<Vec<String>>,
     cancel_result: Mutex<bool>,
+    reconcile_status: Mutex<AttemptStatus>,
+    reconcile_detail: Mutex<String>,
 }
 
 impl FakeGateway {
@@ -82,7 +88,14 @@ impl FakeGateway {
             reconciles: AtomicUsize::new(0),
             sent_inputs: Mutex::new(Vec::new()),
             cancel_result: Mutex::new(true),
+            reconcile_status: Mutex::new(AttemptStatus::UnknownOutcome),
+            reconcile_detail: Mutex::new("fake has no evidence".to_string()),
         }
+    }
+
+    fn set_reconcile(&self, status: AttemptStatus, detail: &str) {
+        *self.reconcile_status.lock().expect("lock") = status;
+        *self.reconcile_detail.lock().expect("lock") = detail.to_string();
     }
 
     fn inference_calls(&self) -> usize {
@@ -165,8 +178,8 @@ impl AgentGateway for FakeGateway {
         self.reconciles.fetch_add(1, Ordering::SeqCst);
         Ok(ReconcileEvidence {
             attempt_id: target.attempt_id,
-            status: AttemptStatus::UnknownOutcome,
-            detail: "fake has no evidence".to_string(),
+            status: *self.reconcile_status.lock().expect("lock"),
+            detail: self.reconcile_detail.lock().expect("lock").clone(),
         })
     }
 }
@@ -390,12 +403,27 @@ impl Harness {
     }
 
     fn seed(&self, state: RunState) {
+        self.seed_as(self.run_id, state);
+    }
+
+    fn seed_as(&self, run_id: RunId, state: RunState) {
         self.store
             .inner
             .lock()
             .expect("lock")
             .states
-            .insert(self.run_id, state);
+            .insert(run_id, state);
+    }
+
+    fn load_as(&self, run_id: RunId) -> RunState {
+        self.store
+            .inner
+            .lock()
+            .expect("lock")
+            .states
+            .get(&run_id)
+            .cloned()
+            .expect("run seeded")
     }
 
     fn push_intent(&self, intent: OutboxIntent) {
@@ -828,6 +856,7 @@ async fn boot_requires_resume_even_when_evidence_complete() {
         provider_epoch: "epoch-1".to_string(),
         dedup_key: "turn-1".to_string(),
         outcome: None,
+        detail: String::new(),
     });
     // Unknown usage with a missing final: the hold predates the crash.
     state.usage.missing_final.insert(
@@ -894,4 +923,168 @@ async fn boot_requires_resume_even_when_evidence_complete() {
         goal: String::new(),
         tasks: Vec::<PlanTaskV1>::new(),
     };
+}
+
+/// A reconciled terminal harness verdict must make the old outcome
+/// known: the reported status/detail persist durably in the observation
+/// (the handover precondition of brief item 3), while the attempt status
+/// itself is never rewritten by reconcile. An `UnknownOutcome` verdict
+/// stays unforced: stored, but with no outcome.
+#[tokio::test]
+async fn reconcile_terminal_verdict_persists_old_outcome() {
+    let h = Harness::new();
+    let a1 = AttemptId::from_u128(101);
+    let a2 = AttemptId::from_u128(102);
+    let mut state = base_state(h.run_id);
+    state.tasks.insert(
+        TaskId::from_u128(1),
+        task(1, vec![], vec![], TaskStatus::Running),
+    );
+    state
+        .attempts
+        .insert(a1, attempt(101, 1, AttemptStatus::UnknownOutcome));
+    state
+        .attempts
+        .insert(a2, attempt(102, 1, AttemptStatus::UnknownOutcome));
+    state.attempt_sessions.insert(a1, session("epoch-1"));
+    state.attempt_sessions.insert(a2, session("epoch-1"));
+    state.attempt_inputs.insert(a1, "input-a".to_string());
+    state.attempt_inputs.insert(a2, "input-b".to_string());
+    h.seed(state);
+    assert_eq!(reconciled_outcome(&h.load(), a1), None);
+
+    // Terminal verdict: the old outcome becomes known and persisted.
+    h.gateway
+        .set_reconcile(AttemptStatus::Completed, "harness reports worker done");
+    let evidence = h
+        .runtime()
+        .reconcile_attempt(user(), a1)
+        .await
+        .expect("reconcile stores terminal evidence");
+    assert_eq!(evidence.status, AttemptStatus::Completed);
+    assert_eq!(
+        h.load().attempts.get(&a1).expect("attempt").status,
+        AttemptStatus::UnknownOutcome,
+        "reconcile never rewrites the attempt status"
+    );
+    assert_eq!(
+        reconciled_outcome(&h.load(), a1),
+        Some(VerificationOutcome::Pass),
+        "a reconciled Completed verdict makes the old outcome known"
+    );
+    let stored = h
+        .load()
+        .observations
+        .iter()
+        .find(|observation| {
+            observation.attempt_id == a1 && observation.dedup_key.starts_with("reconcile:")
+        })
+        .expect("reconcile observation stored")
+        .clone();
+    assert_eq!(stored.outcome, Some(VerificationOutcome::Pass));
+    assert_eq!(stored.detail, "harness reports worker done");
+
+    // Unknown verdict: stored, but the outcome stays unforced.
+    h.gateway
+        .set_reconcile(AttemptStatus::UnknownOutcome, "fake has no evidence");
+    let evidence = h
+        .runtime()
+        .reconcile_attempt(user(), a2)
+        .await
+        .expect("reconcile stores unknown evidence");
+    assert_eq!(evidence.status, AttemptStatus::UnknownOutcome);
+    assert_eq!(reconciled_outcome(&h.load(), a2), None);
+    assert_eq!(
+        h.load().attempts.get(&a2).expect("attempt").status,
+        AttemptStatus::UnknownOutcome,
+        "unknown is never forced into a terminal claim"
+    );
+}
+
+/// `tick_all` scans every known run yet leaves a parked run intact: the
+/// unrelated run keeps its control, attempts, holds, observations and
+/// revision while the resumed run dispatches through the same pass.
+#[tokio::test]
+async fn scan_tick_all_leaves_parked_run_untouched() {
+    let h = Harness::new();
+    let other = RunId::from_u128(11);
+
+    // The resumed run: one ready task, gate open, so the scan sends.
+    let mut live = base_state(h.run_id);
+    live.tasks.insert(
+        TaskId::from_u128(1),
+        task(1, vec![], vec![], TaskStatus::Ready),
+    );
+    h.seed(live);
+
+    // The unrelated parked run: awaiting resume behind a hold, with an
+    // unknown attempt and one stored reconcile observation.
+    let parked_attempt = AttemptId::from_u128(701);
+    let mut parked = base_state(other);
+    parked.control = RunControl::AwaitingResume;
+    parked.tasks.insert(
+        TaskId::from_u128(7),
+        task(7, vec![], vec![], TaskStatus::Running),
+    );
+    parked.attempts.insert(
+        parked_attempt,
+        attempt(701, 7, AttemptStatus::UnknownOutcome),
+    );
+    parked
+        .attempt_sessions
+        .insert(parked_attempt, session("epoch-9"));
+    parked
+        .holds
+        .insert(central_domain::HoldReason::UsageUnknown);
+    parked.observations.push(Observation {
+        attempt_id: parked_attempt,
+        provider_epoch: "epoch-9".to_string(),
+        dedup_key: "reconcile:thread-1:unknown:UnknownOutcome".to_string(),
+        outcome: None,
+        detail: "fake has no evidence".to_string(),
+    });
+    h.seed_as(other, parked);
+    let before = h.load_as(other);
+
+    // One real scan pass over all runs (cadence disabled: always due).
+    let store: Arc<dyn Store> = h.store.clone();
+    let clock: Arc<dyn Clock> = h.clock.clone();
+    let ids: Arc<dyn IdSource> = h.ids.clone();
+    let agent: Arc<dyn AgentGateway> = h.gateway.clone();
+    let mut last_tick = HashMap::new();
+    let (ticked, sent, _) = tick_all(
+        &store,
+        &clock,
+        &ids,
+        &agent,
+        &system(),
+        &ScanConfig::disabled(true),
+        &mut last_tick,
+    )
+    .await;
+    assert_eq!(ticked, 1, "only the running run ticks");
+    assert_eq!(sent, 1, "only the running run sends");
+    assert!(last_tick.contains_key(&h.run_id));
+    assert!(
+        !last_tick.contains_key(&other),
+        "the parked run is skipped, never ticked"
+    );
+
+    // The live run dispatched its task; the parked run is byte-identical.
+    let live_after = h.load();
+    assert!(
+        live_after
+            .attempts
+            .values()
+            .any(|a| a.task_id == TaskId::from_u128(1)),
+        "the resumed run dispatches through the shared scan"
+    );
+    let after = h.load_as(other);
+    assert_eq!(after.control, before.control);
+    assert_eq!(after.control, RunControl::AwaitingResume);
+    assert_eq!(after.attempts, before.attempts);
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.holds, before.holds);
+    assert_eq!(after.observations, before.observations);
+    assert_eq!(after.revision, before.revision);
 }

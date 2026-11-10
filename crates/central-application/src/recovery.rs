@@ -14,7 +14,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use central_domain::{Actor, AttemptId, AttemptStatus, Command, InboxStatus, RunState, TaskId};
+use central_domain::{
+    Actor, AttemptId, AttemptStatus, Command, InboxStatus, RunState, TaskId, VerificationOutcome,
+};
 
 use crate::contracts::{AppError, ExecutionRef, ReconcileEvidence, RunRecovery, SessionRef};
 use crate::Runtime;
@@ -212,12 +214,46 @@ pub fn can_resume_session(state: &RunState, attempt_id: AttemptId) -> bool {
     })
 }
 
+/// The old outcome of one attempt as the stored reconcile evidence
+/// knows it: the outcome of the latest reconcile observation for the
+/// attempt, or `None` when no reconcile ever reported a terminal
+/// verdict. This is the durable answer to brief item 3's handover
+/// precondition — a new attempt continues with a handover only after
+/// this returns `Some` for the predecessor.
+pub fn reconciled_outcome(state: &RunState, attempt_id: AttemptId) -> Option<VerificationOutcome> {
+    state
+        .observations
+        .iter()
+        .rfind(|observation| {
+            observation.attempt_id == attempt_id && observation.dedup_key.starts_with("reconcile:")
+        })
+        .and_then(|observation| observation.outcome)
+}
+
+/// Map a reported harness status onto a persisted verification
+/// outcome. Terminal verdicts converge the evidence (`Completed` is
+/// work done, `Failed` is work failed, `Cancelled` unblocks nothing so
+/// it reads as `Blocked`); every other status — including
+/// `UnknownOutcome` — stays unforced (`None`), never a claim.
+fn reconcile_outcome(status: AttemptStatus) -> Option<VerificationOutcome> {
+    match status {
+        AttemptStatus::Completed => Some(VerificationOutcome::Pass),
+        AttemptStatus::Failed => Some(VerificationOutcome::Fail),
+        AttemptStatus::Cancelled => Some(VerificationOutcome::Blocked),
+        _ => None,
+    }
+}
+
 impl Runtime {
     /// Passively reconcile one attempt: ask the gateway what it knows,
-    /// store that evidence as a durable observation, and report it. Never
-    /// starts inference — no `open`, `send` or `answer` happens here — and
-    /// never rewrites the attempt status: an unknown outcome stays unknown
-    /// until the user queues a new attempt with a handover.
+    /// store that evidence as a durable observation, and report it. The
+    /// reported status/detail persist in the observation (terminal
+    /// verdicts map onto an outcome via [`reconciled_outcome`]; unknown
+    /// stays unforced), so a later handover can prove the old outcome
+    /// is known. Never starts inference — no `open`, `send` or `answer`
+    /// happens here — and never rewrites the attempt status: an unknown
+    /// outcome stays unknown until the user queues a new attempt with a
+    /// handover.
     pub async fn reconcile_attempt(
         &self,
         actor: Actor,
@@ -255,11 +291,18 @@ impl Runtime {
         };
         // Passive read only: the gateway reports, Central never instructs.
         let evidence = self.agent().reconcile(&target).await?;
+        // The key carries the reported verdict, so a changed verdict
+        // stores a new observation while repeating the same verdict
+        // stays idempotent; the outcome mapping keeps unknown unforced.
         let observation = central_domain::Observation {
             attempt_id,
             provider_epoch: session.instance_epoch.clone(),
-            dedup_key: format!("reconcile:{}:{attempt_id}", session.thread_id),
-            outcome: None,
+            dedup_key: format!(
+                "reconcile:{}:{attempt_id}:{:?}",
+                session.thread_id, evidence.status
+            ),
+            outcome: reconcile_outcome(evidence.status),
+            detail: evidence.detail.clone(),
         };
         let envelope = central_domain::CommandEnvelope {
             id: self.ids().next_command_id(),

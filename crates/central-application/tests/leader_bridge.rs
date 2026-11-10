@@ -436,6 +436,7 @@ async fn handover_separates_claims() {
             provider_epoch: "epoch-1".to_string(),
             dedup_key: "ev-1".to_string(),
             outcome: Some(VerificationOutcome::Pass),
+            detail: String::new(),
         }],
         artifact_hashes: &[],
     };

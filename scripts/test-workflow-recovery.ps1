@@ -4,8 +4,19 @@
 # in-process, virtual clock) -> real daemon kill-restart at the after_send
 # barrier (kill own child only) with the scan loop disabled for setup and
 # enabled for the resume phase -> explicit resume -> scan queues and
-# dispatches two independent implementation tasks -> reconcile endpoint
-# stores evidence without resending. Fake gateway only, no live models.
+# dispatches two independent implementation tasks while the downstream
+# verifier and integration tasks stay held (dependencies unmet) -> second
+# kill-restart with those stages pending -> resume -> no duplicate sends,
+# downstream still held -> reconcile endpoint stores evidence without
+# resending. A second parked run proves the shared scan leaves unrelated
+# runs untouched. Fake gateway only, no live models.
+#
+# Honest scope: the fake harness never completes attempts (no worker
+# results or verdicts flow through the daemon), so verifier/integration
+# *progression* — verdicts driving their dispatch — cannot run here. The
+# gate proves the daemon dispatches what is ready and holds the rest
+# across two crashes; full stage progression stays covered in-process by
+# the quality_loop / git_integration suites (see docs/validation/p3-workflow.md).
 #
 # Reboot/manual Windows acceptance is NOT inferred from the process kill
 # here; it is recorded separately in docs/validation/p3-workflow.md.
@@ -54,7 +65,9 @@ try {
   "goal": "Ship the reliable workflow",
   "tasks": [
     {"id":"00000000-0000-0000-0000-000000000001","kind":"implementation","objective":"Task A","inputs":[],"scope":[],"outOfScope":[],"dependsOn":[],"dataDependsOn":[],"outputs":[],"verify":{"method":"check","criteria":["a done"]},"evidence":[],"profileId":null,"permissions":[],"maxRepairRounds":2,"requiresApproval":[],"handover":""},
-    {"id":"00000000-0000-0000-0000-000000000002","kind":"implementation","objective":"Task B","inputs":[],"scope":[],"outOfScope":[],"dependsOn":[],"dataDependsOn":[],"outputs":[],"verify":{"method":"check","criteria":["b done"]},"evidence":[],"profileId":null,"permissions":[],"maxRepairRounds":2,"requiresApproval":[],"handover":""}
+    {"id":"00000000-0000-0000-0000-000000000002","kind":"implementation","objective":"Task B","inputs":[],"scope":[],"outOfScope":[],"dependsOn":[],"dataDependsOn":[],"outputs":[],"verify":{"method":"check","criteria":["b done"]},"evidence":[],"profileId":null,"permissions":[],"maxRepairRounds":2,"requiresApproval":[],"handover":""},
+    {"id":"00000000-0000-0000-0000-000000000003","kind":"verification","objective":"Verify A and B","inputs":[],"scope":[],"outOfScope":[],"dependsOn":["00000000-0000-0000-0000-000000000001","00000000-0000-0000-0000-000000000002"],"dataDependsOn":[],"outputs":[],"verify":{"method":"check","criteria":["a and b verified"]},"evidence":[],"profileId":null,"permissions":[],"maxRepairRounds":2,"requiresApproval":[],"handover":""},
+    {"id":"00000000-0000-0000-0000-000000000004","kind":"integration","objective":"Integrate verified work","inputs":[],"scope":[],"outOfScope":[],"dependsOn":["00000000-0000-0000-0000-000000000003"],"dataDependsOn":[],"outputs":[],"verify":{"method":"check","criteria":["integrated"]},"evidence":[],"profileId":null,"permissions":[],"maxRepairRounds":2,"requiresApproval":[],"handover":""}
   ]
 }
 '@ | Set-Content -Encoding UTF8 $planFile
@@ -90,9 +103,66 @@ try {
     function Fake-Sends($addr, $token) {
         return (Invoke-RestMethod -Uri "http://$addr/v1/test/fake-sends" -Headers @{ Authorization = "Bearer $token" }).sends
     }
+    function Attempt-Count($view, $taskId) {
+        if ($null -eq $view.state.attempts) { return 0 }
+        return @($view.state.attempts.PSObject.Properties | Where-Object { $_.Value.task_id -eq $taskId }).Count
+    }
+    # Pre-flight for every daemon start: if a previous run left a daemon
+    # recorded in server.json that is alive but answers nothing on
+    # healthz (a zombie holding the owner lock), stop ONLY that recorded
+    # pid — our own test child — so the start below cannot fail with a
+    # misleading already-running. A healthy daemon is never touched.
+    function Stop-RecordedDaemon {
+        $infoPath = Join-Path $stateDir "server.json"
+        if (-not (Test-Path $infoPath)) { return }
+        try { $info = Get-Content $infoPath -Raw | ConvertFrom-Json } catch { return }
+        if ($null -eq $info.pid) { return }
+        $live = Get-Process -Id $info.pid -ErrorAction SilentlyContinue
+        if ($null -eq $live) { return }
+        $healthy = $false
+        try {
+            $probe = Invoke-WebRequest -Uri "http://$($info.addr)/healthz" -TimeoutSec 2 -UseBasicParsing
+            $healthy = $probe.StatusCode -eq 200
+        } catch { $healthy = $false }
+        if ($healthy) { return }
+        Write-Output "pre-flight: recorded daemon pid $($info.pid) is alive but not listening; stopping our own test child"
+        # Best-effort: the pid may exit between the check and the kill. A
+        # genuinely unkillable holder surfaces honestly below, when
+        # `daemon start` reports already-running.
+        Stop-Process -Id $info.pid -Force -ErrorAction SilentlyContinue
+        Wait-Process -Id $info.pid -Timeout 30 -ErrorAction SilentlyContinue
+    }
+    # Readiness for dispatched work: the sends counter increments before
+    # the attempt's Running commit lands, and Run-View can predate both,
+    # so a view read next to sends>=2 may still show Dispatching. Refresh
+    # until the attempts converge (or the deadline expires and the gate
+    # fails honestly instead of asserting on a stale view).
+    function Wait-AttemptsRunning($run, $minRunning, $timeoutSec) {
+        $deadline = (Get-Date).AddSeconds($timeoutSec)
+        $running = @()
+        do {
+            Start-Sleep -Milliseconds 500
+            $view = Run-View $run
+            if ($null -ne $view.state.attempts) {
+                $running = @($view.state.attempts.PSObject.Properties | Where-Object { $_.Value.status -eq "Running" })
+            }
+            if ($running.Count -ge $minRunning) { return $view }
+            if ((Get-Date) -gt $deadline) { break }
+        } while ($true)
+        throw "ASSERT FAILED: only $($running.Count) attempts Running after ${timeoutSec}s (wanted $minRunning); dispatch never converged"
+    }
+    function Total-Attempts($view) {
+        if ($null -eq $view.state.attempts) { return 0 }
+        return @($view.state.attempts.PSObject.Properties).Count
+    }
+    $taskA = "00000000-0000-0000-0000-000000000001"
+    $taskB = "00000000-0000-0000-0000-000000000002"
+    $taskV = "00000000-0000-0000-0000-000000000003"
+    $taskI = "00000000-0000-0000-0000-000000000004"
 
     Write-Output "== phase 1: setup with the scan loop disabled (deterministic) =="
     $env:CENTRAL_SCAN_MS = "0"
+    Stop-RecordedDaemon
     $started = Central daemon start --fake-agent
     Assert-Equal $started.status "started" "daemon started (scan disabled)"
     $run = (Central init --goal "Ship the reliable workflow" --repository "D:/Code/enolalab/central").run_id
@@ -101,6 +171,12 @@ try {
     $null = Central pause --run $run
     $paused = Run-View $run
     Assert-Equal $paused.state.control "Paused" "run paused before crash; nothing queued or sent"
+    # Second, unrelated run: parked from the start, never resumed. The
+    # shared scan must leave it untouched through both crashes.
+    $run2 = (Central init --goal "Unrelated parked run" --repository "D:/Code/enolalab/central").run_id
+    $null = Central pause --run $run2
+    $paused2 = Run-View $run2
+    Assert-Equal $paused2.state.control "Paused" "unrelated run parked before crash"
     $info = Get-Content (Join-Path $stateDir "server.json") | ConvertFrom-Json
     $token = (Get-Content (Join-Path $stateDir "daemon.token")).Trim()
     Assert-Equal (Fake-Sends $info.addr $token) 0 "zero sends while paused"
@@ -112,10 +188,13 @@ try {
 
     Write-Output "== phase 2: restart with the scan loop enabled; boot parks =="
     $env:CENTRAL_SCAN_MS = "5000"
+    Stop-RecordedDaemon
     $restarted = Central daemon start --fake-agent
     Assert-Equal $restarted.status "started" "daemon restarted after crash"
     $restored = Run-View $run
     Assert-Equal $restored.state.control "AwaitingResume" "run awaits explicit resume after boot"
+    $restored2 = Run-View $run2
+    Assert-Equal $restored2.state.control "AwaitingResume" "unrelated run parked by boot too"
     $info = Get-Content (Join-Path $stateDir "server.json") | ConvertFrom-Json
     $token = (Get-Content (Join-Path $stateDir "daemon.token")).Trim()
     Assert-Equal (Fake-Sends $info.addr $token) 0 "scan loop sends nothing for a parked run"
@@ -131,8 +210,43 @@ try {
         if ((Get-Date) -gt $deadline) { break }
     } while ($sends -lt 2)
     Assert-True ($sends -ge 2) "scan dispatched both independent tasks (sends=$sends)"
+    # Refresh: the loop's last view can predate the Running commits.
+    $view = Wait-AttemptsRunning $run 2 45
     $running = @($view.state.attempts.PSObject.Properties | Where-Object { $_.Value.status -eq "Running" })
     Assert-True ($running.Count -ge 2) "both attempts Running after scan dispatch"
+    Assert-Equal (Attempt-Count $view $taskA) 1 "task A has exactly one attempt (no duplicates)"
+    Assert-Equal (Attempt-Count $view $taskB) 1 "task B has exactly one attempt (no duplicates)"
+    Assert-Equal (Attempt-Count $view $taskV) 0 "verifier held: predecessors still running, nothing dispatched"
+    Assert-Equal (Attempt-Count $view $taskI) 0 "integration held: verifier not reached, nothing dispatched"
+
+    Write-Output "== barrier at verifier/integration pending: second hard-kill, restart, resume =="
+    $info = Get-Content (Join-Path $stateDir "server.json") | ConvertFrom-Json
+    $crashedPid2 = $info.pid
+    Stop-Process -Id $crashedPid2 -Force
+    Wait-Process -Id $crashedPid2 -Timeout 30 -ErrorAction SilentlyContinue
+    Stop-RecordedDaemon
+    $restarted2 = Central daemon start --fake-agent
+    Assert-Equal $restarted2.status "started" "daemon restarted with downstream stages pending"
+    $reparked = Run-View $run
+    Assert-Equal $reparked.state.control "AwaitingResume" "run parks again after the second crash"
+    $info = Get-Content (Join-Path $stateDir "server.json") | ConvertFrom-Json
+    $token = (Get-Content (Join-Path $stateDir "daemon.token")).Trim()
+    # Fresh process, fresh counter: nothing may dispatch while parked.
+    Assert-Equal (Fake-Sends $info.addr $token) 0 "restart resends nothing while parked"
+    $null = Central resume --run $run
+    # Let the scan loop tick at least twice (5s cadence), then prove
+    # stability: no duplicate sends, downstream still held. Refresh the
+    # view first: a pre-sleep view can predate the Running commits.
+    Start-Sleep -Seconds 12
+    $steady = Wait-AttemptsRunning $run 2 45
+    Assert-Equal $steady.state.control "Running" "run stays resumed after the second crash"
+    Assert-Equal (Fake-Sends $info.addr $token) 0 "second resume dispatches nothing new"
+    $stillRunning = @($steady.state.attempts.PSObject.Properties | Where-Object { $_.Value.status -eq "Running" })
+    Assert-True ($stillRunning.Count -ge 2) "both implementation attempts still Running"
+    Assert-Equal (Attempt-Count $steady $taskA) 1 "task A still exactly one attempt after two crashes"
+    Assert-Equal (Attempt-Count $steady $taskB) 1 "task B still exactly one attempt after two crashes"
+    Assert-Equal (Attempt-Count $steady $taskV) 0 "verifier still held after the second crash"
+    Assert-Equal (Attempt-Count $steady $taskI) 0 "integration still held after the second crash"
 
     Write-Output "== passive reconcile: evidence stored, nothing resent =="
     $attemptId = $running[0].Name
@@ -141,7 +255,7 @@ try {
         -Headers @{ Authorization = "Bearer $token" } `
         -ContentType "application/json" -Body "{}"
     Assert-Equal $reconciled.evidence.attempt_id $attemptId "reconcile returns evidence for the attempt"
-    Assert-Equal (Fake-Sends $info.addr $token) $sends "reconcile resends nothing"
+    Assert-Equal (Fake-Sends $info.addr $token) 0 "reconcile resends nothing"
     $afterReconcile = Run-View $run
     Assert-Equal $afterReconcile.state.attempts.$attemptId.status "Running" "reconcile never rewrites the attempt status"
 
@@ -150,6 +264,11 @@ try {
         throw "CENTRAL_LIVE_SMOKE=1 needs a configured live gateway; no live harness exists in this repo, so the smoke stays opt-in and unconfigured. Stopping instead of calling any model."
     }
     Write-Output "skip: live-model smoke is opt-in only (CENTRAL_LIVE_SMOKE unset); reboot/manual Windows acceptance is recorded separately in docs/validation/p3-workflow.md, never inferred from this process kill."
+
+    Write-Output "== unrelated run intact after resume + shared scans =="
+    $untouched = Run-View $run2
+    Assert-Equal $untouched.state.control "AwaitingResume" "unrelated run never resumed by the shared scan"
+    Assert-Equal (Total-Attempts $untouched) 0 "unrelated run gained no attempts"
 
     Write-Output "== shutdown =="
     $null = Central daemon shutdown

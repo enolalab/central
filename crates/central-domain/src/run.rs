@@ -66,6 +66,11 @@ pub struct Observation {
     pub provider_epoch: String,
     pub dedup_key: String,
     pub outcome: Option<VerificationOutcome>,
+    /// Human-readable harness note stored with the evidence (for
+    /// example the `detail` of a reconcile verdict). Never machine
+    /// parsed; `#[serde(default)]` keeps older snapshots decodable.
+    #[serde(default)]
+    pub detail: String,
 }
 
 impl Observation {
@@ -83,6 +88,7 @@ impl Observation {
             provider_epoch: provider_epoch.into(),
             dedup_key: turn_id.into(),
             outcome: None,
+            detail: String::new(),
         }
     }
 }

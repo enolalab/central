@@ -621,6 +621,7 @@ async fn resolved_cannot_accept() {
             provider_epoch: approval.epoch.clone(),
             dedup_key: format!("requestApproval:{}", approval.item_id),
             outcome: None,
+            detail: String::new(),
         });
     let summary = runtime
         .reconcile_inbox(&system(), &session_for(approval))
@@ -971,6 +972,7 @@ async fn unrelated_observation_does_not_resolve_answered_approval() {
             provider_epoch: approval.epoch.clone(),
             dedup_key: "thread/status/changed:progress-ping".to_string(),
             outcome: None,
+            detail: String::new(),
         });
     let summary = runtime
         .reconcile_inbox(&system(), &session_for(approval))
@@ -995,6 +997,7 @@ async fn unrelated_observation_does_not_resolve_answered_approval() {
             provider_epoch: approval.epoch.clone(),
             dedup_key: format!("requestApproval:{}", approval.item_id),
             outcome: None,
+            detail: String::new(),
         });
     let summary = runtime
         .reconcile_inbox(&system(), &session_for(approval))

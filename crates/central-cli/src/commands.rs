@@ -606,6 +606,18 @@ fn daemon(state_dir: &Path, command: &DaemonCommands) -> i32 {
                     }
                 }
                 if Instant::now() > deadline {
+                    // Never abandon a half-started daemon: a process left
+                    // behind here holds the owner lock with no listener —
+                    // a zombie that blocks every later start with a
+                    // misleading already-running. Re-check once (it may
+                    // have become healthy since the last poll), then stop
+                    // our own child before reporting the failure.
+                    let healthy = read_server_info(state_dir)
+                        .is_some_and(|info| info.pid == child_pid && health_ok(&info.addr));
+                    if !healthy {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                     return fail("daemon did not become healthy in time; see daemon.log");
                 }
                 std::thread::sleep(Duration::from_millis(100));
