@@ -84,6 +84,11 @@ pub fn execute(cli: Cli) -> i32 {
         Commands::Result { command } => result(&state_dir, command),
         Commands::Handover { command } => handover_cmd(&state_dir, command),
         Commands::Budget { run } => budget(&state_dir, run),
+        Commands::Sync {
+            run,
+            commit,
+            repository,
+        } => sync(&state_dir, run, commit, repository.as_deref()),
         Commands::SetLimits {
             run,
             max_tokens,
@@ -191,6 +196,42 @@ fn budget(state_dir: &Path, run: &RunId) -> i32 {
             0
         }
         Err(message) => fail(&message),
+    }
+}
+
+/// Queue the user's commit for a run. The repository defaults to the
+/// run's own repository from the daemon; the commit is verified read-only
+/// and the worktree is never touched — no checkout, stash or pull. The
+/// intent lands in the state-dir sync queue for the daemon to pick up.
+fn sync(state_dir: &Path, run: &RunId, commit: &str, repository: Option<&Path>) -> i32 {
+    let repo: PathBuf = match repository {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            let client = match client(state_dir) {
+                Ok(client) => client,
+                Err(code) => return code,
+            };
+            match client.get(&format!("/v1/runs/{run}")) {
+                Ok(view) => match view["state"]["repository"].as_str() {
+                    Some(dir) => PathBuf::from(dir),
+                    None => return fail("run response has no repository"),
+                },
+                Err(message) => return fail(&message),
+            }
+        }
+    };
+    match central_infrastructure::workspace::queue_user_commit(state_dir, *run, &repo, commit) {
+        Ok(intent) => {
+            print_json(&serde_json::json!({
+                "status": "queued",
+                "run_id": run.to_string(),
+                "commit": intent.commit,
+                "repository": intent.repository,
+                "dirty_fingerprint": intent.dirty_fingerprint,
+            }));
+            0
+        }
+        Err(message) => fail(&message.to_string()),
     }
 }
 

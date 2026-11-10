@@ -4,6 +4,7 @@ pub mod dispatcher;
 pub mod fallback;
 pub mod handover;
 pub mod inbox;
+pub mod integration;
 pub mod leader;
 pub mod ports;
 pub mod profiles;

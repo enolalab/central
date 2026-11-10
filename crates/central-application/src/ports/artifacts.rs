@@ -3,6 +3,18 @@ use central_domain::{ArtifactId, AttemptId, ContentHash, TaskId};
 
 use crate::contracts::AppError;
 
+/// Where a committed artifact came from in the Git workspace flow: the
+/// user commit it was snapshotted from, the sealed candidate commit it was
+/// built from, and the attempt worktree that produced it. All optional —
+/// pre-workspace artifacts carry no provenance — and never affect the
+/// content hash: the hash still binds the bytes alone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ArtifactProvenance {
+    pub source_commit: Option<String>,
+    pub candidate_commit: Option<String>,
+    pub workspace: Option<String>,
+}
+
 /// One immutable artifact to commit. `path` is run-relative and must stay
 /// inside the run root; `bytes` are staged to a temp file, hashed, flushed
 /// and renamed before any metadata commits. `expected_hash`, when present,
@@ -15,6 +27,7 @@ pub struct PublishArtifact {
     pub kind: String,
     pub bytes: Vec<u8>,
     pub expected_hash: Option<ContentHash>,
+    pub provenance: Option<ArtifactProvenance>,
 }
 
 /// Committed reference to an immutable blob.
@@ -30,6 +43,7 @@ pub struct ArtifactBytes {
     pub id: ArtifactId,
     pub hash: ContentHash,
     pub bytes: Vec<u8>,
+    pub provenance: Option<ArtifactProvenance>,
 }
 
 /// Content-addressed artifact store. Blobs are immutable after commit: there

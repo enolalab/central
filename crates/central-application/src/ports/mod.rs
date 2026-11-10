@@ -5,6 +5,7 @@ pub mod clock;
 pub mod ids;
 pub mod process;
 pub mod store;
+pub mod workspace;
 
 pub use agent::AgentGateway;
 pub use artifacts::{ArtifactBytes, ArtifactRef, ArtifactStore, PublishArtifact};

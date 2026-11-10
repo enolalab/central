@@ -106,6 +106,18 @@ pub enum Commands {
         #[arg(long)]
         run: RunId,
     },
+    /// Queue the user's commit for a run without touching the user
+    /// worktree: the commit is verified read-only and a sync intent is
+    /// appended under the state dir for the daemon to pick up. Never
+    /// checks out, stashes or pulls.
+    Sync {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        commit: String,
+        #[arg(long)]
+        repository: Option<PathBuf>,
+    },
     /// Set the run's shared count/token/time limits (plus the optional
     /// user-configured monetary estimate cap). User only.
     SetLimits {

@@ -45,6 +45,12 @@ struct ArtifactMeta {
     task_id: Option<central_domain::TaskId>,
     attempt_id: Option<central_domain::AttemptId>,
     size: u64,
+    #[serde(default)]
+    source_commit: Option<String>,
+    #[serde(default)]
+    candidate_commit: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
 }
 
 /// Filesystem [`ArtifactStore`]. All operations stay under `root`; only
@@ -170,6 +176,14 @@ impl ArtifactStore for FilesystemArtifactStore {
             })?;
         }
         let id = ArtifactId::new();
+        let (source_commit, candidate_commit, workspace) = match &request.provenance {
+            Some(provenance) => (
+                provenance.source_commit.clone(),
+                provenance.candidate_commit.clone(),
+                provenance.workspace.clone(),
+            ),
+            None => (None, None, None),
+        };
         let meta = ArtifactMeta {
             id,
             hash: hash.clone(),
@@ -178,6 +192,9 @@ impl ArtifactStore for FilesystemArtifactStore {
             task_id: request.task_id,
             attempt_id: Some(request.attempt_id),
             size: request.bytes.len() as u64,
+            source_commit,
+            candidate_commit,
+            workspace,
         };
         // The blob without metadata is an orphan by construction: it is
         // never readable as committed (no id points at it) and a later
@@ -200,10 +217,24 @@ impl ArtifactStore for FilesystemArtifactStore {
                 "committed artifact {id} fails its hash check; not a valid artifact"
             ))
         })?;
+        let provenance =
+            match (meta.source_commit, meta.candidate_commit, meta.workspace) {
+                (None, None, None) => None,
+                (source_commit, candidate_commit, workspace) => {
+                    Some(
+                        central_application::ports::artifacts::ArtifactProvenance {
+                            source_commit,
+                            candidate_commit,
+                            workspace,
+                        },
+                    )
+                }
+            };
         Ok(ArtifactBytes {
             id,
             hash: meta.hash,
             bytes,
+            provenance,
         })
     }
 

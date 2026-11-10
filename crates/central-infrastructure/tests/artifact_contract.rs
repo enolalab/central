@@ -48,6 +48,7 @@ fn publish_request(path: &str, bytes: &[u8], expected: Option<ContentHash>) -> P
         kind: "candidate".to_string(),
         bytes: bytes.to_vec(),
         expected_hash: expected,
+        provenance: None,
     }
 }
 
