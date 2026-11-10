@@ -99,7 +99,9 @@ impl Git {
     /// Resolve `rev` to a commit SHA (`rev^{commit}`), refusing non-commits.
     pub async fn rev_parse_commit(&self, repo: &Path, rev: &str) -> Result<String, AppError> {
         let candidate = format!("{rev}^{{commit}}");
-        let sha = self.run(repo, &["rev-parse", "--verify", &candidate]).await?;
+        let sha = self
+            .run(repo, &["rev-parse", "--verify", &candidate])
+            .await?;
         if sha.len() != 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(AppError::Storage(format!(
                 "git resolved {rev} to a non-commit id: {sha}"
@@ -244,9 +246,7 @@ impl Git {
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|error| {
-                AppError::Transport(format!("cannot spawn git cat-file: {error}"))
-            })?;
+            .map_err(|error| AppError::Transport(format!("cannot spawn git cat-file: {error}")))?;
         let status = tokio::time::timeout(GIT_TIMEOUT, output.wait_with_output())
             .await
             .map_err(|_| {
@@ -266,9 +266,10 @@ async fn drain(pipe: &mut Option<impl tokio::io::AsyncRead + Unpin>) -> Result<V
     use tokio::io::AsyncReadExt as _;
     let mut bytes = Vec::new();
     if let Some(handle) = pipe.as_mut() {
-        handle.read_to_end(&mut bytes).await.map_err(|error| {
-            AppError::Transport(format!("git output is unreadable: {error}"))
-        })?;
+        handle
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|error| AppError::Transport(format!("git output is unreadable: {error}")))?;
     }
     Ok(bytes)
 }

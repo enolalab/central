@@ -16,7 +16,10 @@ use central_application::contracts::AppError;
 /// directory. Returned roots are canonical so later comparisons are stable.
 pub fn canonical_root(raw: &Path) -> Result<PathBuf, AppError> {
     let canonical = raw.canonicalize().map_err(|error| {
-        AppError::Validation(format!("workspace root is unusable: {}: {error}", raw.display()))
+        AppError::Validation(format!(
+            "workspace root is unusable: {}: {error}",
+            raw.display()
+        ))
     })?;
     if !canonical.is_dir() {
         return Err(AppError::Validation(format!(

@@ -223,7 +223,10 @@ impl WorkspaceManager for GitWorkspaceManager {
         for file in &request.input.selected {
             let source = contained_path(&repo, &file.path)?;
             let bytes = std::fs::read(&source).map_err(|error| {
-                AppError::Storage(format!("cannot re-read selected path {}: {error}", file.path))
+                AppError::Storage(format!(
+                    "cannot re-read selected path {}: {error}",
+                    file.path
+                ))
             })?;
             if content_hash(&bytes) != file.hash {
                 let _ = self.git.remove_worktree(&repo, &worktree).await;
@@ -268,7 +271,10 @@ impl WorkspaceManager for GitWorkspaceManager {
         self.git.run(&worktree, &["add", "-A"]).await?;
         // Always a fresh commit (even when empty) so the sealed candidate is
         // a distinct immutable object bound to this attempt.
-        let message = format!("central: seal candidate for attempt {}", workspace.attempt_id);
+        let message = format!(
+            "central: seal candidate for attempt {}",
+            workspace.attempt_id
+        );
         self.git
             .run(
                 &worktree,
@@ -324,7 +330,10 @@ impl WorkspaceManager for GitWorkspaceManager {
                 candidate.commit,
             )));
         }
-        let head = self.git.run(&entry.worktree, &["rev-parse", "HEAD"]).await?;
+        let head = self
+            .git
+            .run(&entry.worktree, &["rev-parse", "HEAD"])
+            .await?;
         // `write-tree` only serializes the index, so an uncommitted
         // working-tree edit would slip past a tree comparison: any
         // porcelain output means the tracked source moved under
@@ -385,13 +394,17 @@ impl WorkspaceManager for GitWorkspaceManager {
             request.run,
             self.counter.fetch_add(1, Ordering::SeqCst)
         );
-        let worktree = self
-            .worktrees_dir
-            .join(format!("integration-{}-{}", request.run, self.counter.load(Ordering::SeqCst)));
-        if let Err(error) = self.git.create_branch(&repo, &branch, &base).await {
-            return Err(error);
-        }
-        if let Err(error) = self.git.add_worktree_branch(&repo, &worktree, &branch).await {
+        let worktree = self.worktrees_dir.join(format!(
+            "integration-{}-{}",
+            request.run,
+            self.counter.load(Ordering::SeqCst)
+        ));
+        self.git.create_branch(&repo, &branch, &base).await?;
+        if let Err(error) = self
+            .git
+            .add_worktree_branch(&repo, &worktree, &branch)
+            .await
+        {
             let _ = self.git.delete_branch(&repo, &branch).await;
             return Err(error);
         }
@@ -468,7 +481,8 @@ impl WorkspaceManager for GitWorkspaceManager {
             // The round is over: release the slot and drop the temporary
             // branch/worktree so a new candidate and new checks can start.
             // Nothing was mutated — the good ref never moved.
-            self.finish_integration(request.candidate.run, &active).await;
+            self.finish_integration(request.candidate.run, &active)
+                .await;
             return Err(error);
         }
         // Intent before mutation: flush the durable record, then CAS.
@@ -505,7 +519,8 @@ impl WorkspaceManager for GitWorkspaceManager {
                     .git
                     .read_ref(&active.repo, &request.candidate.ref_name)
                     .await?;
-                self.finish_integration(request.candidate.run, &active).await;
+                self.finish_integration(request.candidate.run, &active)
+                    .await;
                 return Err(AppError::Conflict(format!(
                     "good ref {} refused the CAS ({error}); it points at {actual} — \
                      a new candidate and new checks are required",
@@ -513,7 +528,8 @@ impl WorkspaceManager for GitWorkspaceManager {
                 )));
             }
         };
-        self.finish_integration(request.candidate.run, &active).await;
+        self.finish_integration(request.candidate.run, &active)
+            .await;
         Ok(PromotionReceipt {
             ref_name: request.candidate.ref_name.clone(),
             previous_head: request.expected_parent.clone(),
@@ -557,16 +573,16 @@ impl GitWorkspaceManager {
     fn persist_intent(&self, intent: &PromotionIntent) -> Result<(), AppError> {
         let path = self.intent_path(intent.run, &intent.ref_name);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|error| {
-                AppError::Storage(format!("cannot create intent dir: {error}"))
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|error| AppError::Storage(format!("cannot create intent dir: {error}")))?;
         }
         let text = serde_json::to_string(intent).map_err(|error| {
             AppError::Storage(format!("cannot encode promotion intent: {error}"))
         })?;
         let tmp = path.with_extension("json-part");
-        std::fs::write(&tmp, text)
-            .map_err(|error| AppError::Storage(format!("cannot stage promotion intent: {error}")))?;
+        std::fs::write(&tmp, text).map_err(|error| {
+            AppError::Storage(format!("cannot stage promotion intent: {error}"))
+        })?;
         std::fs::rename(&tmp, &path).map_err(|error| {
             let _ = std::fs::remove_file(&tmp);
             AppError::Storage(format!("cannot commit promotion intent: {error}"))
@@ -581,9 +597,8 @@ impl GitWorkspaceManager {
                 "no promotion intent for run {run} ref {ref_name}; nothing to recover"
             ))
         })?;
-        serde_json::from_str(&text).map_err(|error| {
-            AppError::Storage(format!("promotion intent is corrupt: {error}"))
-        })
+        serde_json::from_str(&text)
+            .map_err(|error| AppError::Storage(format!("promotion intent is corrupt: {error}")))
     }
 
     /// Release the run's slot and delete the temporary branch and worktree.

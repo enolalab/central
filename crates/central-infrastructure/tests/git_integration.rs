@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use central_application::contracts::AppError;
 use central_application::integration::{IntegrationPlan, PlannedCheck};
 use central_application::ports::workspace::{
-    CandidateRef, IntegrationRequest, PromoteRequest, VerificationSummary, WorkspaceManager,
-    WorkspaceRequest, SnapshotRequest,
+    CandidateRef, IntegrationRequest, PromoteRequest, SnapshotRequest, VerificationSummary,
+    WorkspaceManager, WorkspaceRequest,
 };
 use central_domain::{AttemptId, PlanHash, RunId};
 use central_infrastructure::checks::{ApprovedCommand, SupervisedCheckRunner};
@@ -85,7 +85,10 @@ async fn sealed_candidate(
     commit: &str,
     attempt: u128,
     edit: Option<(&str, &str)>,
-) -> (central_application::ports::workspace::WorkspaceRef, CandidateRef) {
+) -> (
+    central_application::ports::workspace::WorkspaceRef,
+    CandidateRef,
+) {
     let snapshot = manager
         .snapshot(snapshot_request(repo, commit))
         .await
@@ -398,7 +401,11 @@ async fn integration_checks_run_baseline_affected_acceptance() {
         run_integration_checks(&runner, &approved_plan, &prepared.worktree, &plan)
             .await
             .expect("run checks");
-    assert_eq!(evidence.len(), 3, "baseline + affected + acceptance, in order");
+    assert_eq!(
+        evidence.len(),
+        3,
+        "baseline + affected + acceptance, in order"
+    );
     assert!(summary.passed && summary.baseline_ok && summary.affected_ok && summary.acceptance_ok);
 
     // The harness (not this helper) judges: unapproved programs never run.
@@ -410,8 +417,7 @@ async fn integration_checks_run_baseline_affected_acceptance() {
         affected: Vec::new(),
         acceptance: Vec::new(),
     };
-    let refused =
-        run_integration_checks(&runner, &approved_plan, &prepared.worktree, &bad).await;
+    let refused = run_integration_checks(&runner, &approved_plan, &prepared.worktree, &bad).await;
     assert!(
         matches!(refused, Err(AppError::Forbidden(_))),
         "unapproved checks must refuse without spawning: {refused:?}"

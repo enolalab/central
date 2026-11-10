@@ -253,11 +253,7 @@ mod tests {
     #[test]
     fn checks_run_in_plan_order_and_all_must_pass() {
         let plan = plan();
-        let names: Vec<&str> = plan
-            .required()
-            .iter()
-            .map(|c| c.program.as_str())
-            .collect();
+        let names: Vec<&str> = plan.required().iter().map(|c| c.program.as_str()).collect();
         assert_eq!(names, vec!["base", "aff", "acc"]);
         assert_eq!(
             judge_integration(&plan, &[ok(), ok(), ok()]),

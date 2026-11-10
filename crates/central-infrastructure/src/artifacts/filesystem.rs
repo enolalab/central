@@ -217,19 +217,16 @@ impl ArtifactStore for FilesystemArtifactStore {
                 "committed artifact {id} fails its hash check; not a valid artifact"
             ))
         })?;
-        let provenance =
-            match (meta.source_commit, meta.candidate_commit, meta.workspace) {
-                (None, None, None) => None,
-                (source_commit, candidate_commit, workspace) => {
-                    Some(
-                        central_application::ports::artifacts::ArtifactProvenance {
-                            source_commit,
-                            candidate_commit,
-                            workspace,
-                        },
-                    )
-                }
-            };
+        let provenance = match (meta.source_commit, meta.candidate_commit, meta.workspace) {
+            (None, None, None) => None,
+            (source_commit, candidate_commit, workspace) => {
+                Some(central_application::ports::artifacts::ArtifactProvenance {
+                    source_commit,
+                    candidate_commit,
+                    workspace,
+                })
+            }
+        };
         Ok(ArtifactBytes {
             id,
             hash: meta.hash,

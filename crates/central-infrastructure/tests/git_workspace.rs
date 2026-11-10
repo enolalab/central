@@ -9,9 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use central_application::contracts::AppError;
-use central_application::ports::workspace::{
-    SnapshotRequest, WorkspaceManager, WorkspaceRequest,
-};
+use central_application::ports::workspace::{SnapshotRequest, WorkspaceManager, WorkspaceRequest};
 use central_domain::{AttemptId, RunId};
 use central_infrastructure::workspace::{queue_user_commit, GitWorkspaceManager};
 
@@ -90,7 +88,11 @@ async fn space_unicode_and_junction_paths() {
     let root = scratch_root("central ws caf\u{00e9} \u{5b50}");
     let repo = root.join("repo dir \u{00e9}");
     std::fs::create_dir_all(&repo).expect("unicode repo dir");
-    let head = repo_with_commit(&repo, &[("calc.py", "def add(a, b):\n    return a + b\n")], "base");
+    let head = repo_with_commit(
+        &repo,
+        &[("calc.py", "def add(a, b):\n    return a + b\n")],
+        "base",
+    );
 
     let state = root.join("state");
     let manager = GitWorkspaceManager::open(&state).expect("open manager");
@@ -107,7 +109,10 @@ async fn space_unicode_and_junction_paths() {
         })
         .await
         .expect("worktree under spaced unicode path");
-    let candidate = manager.seal(&workspace).await.expect("seal unicode worktree");
+    let candidate = manager
+        .seal(&workspace)
+        .await
+        .expect("seal unicode worktree");
     assert_eq!(candidate.parent, head);
     manager
         .verify_seal(&candidate)
@@ -152,7 +157,11 @@ async fn candidate_seal_detects_mutation() {
     let root = scratch_root("seal-mutation");
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).expect("repo dir");
-    let head = repo_with_commit(&repo, &[("calc.py", "def add(a, b):\n    return a + b\n")], "base");
+    let head = repo_with_commit(
+        &repo,
+        &[("calc.py", "def add(a, b):\n    return a + b\n")],
+        "base",
+    );
 
     let manager = GitWorkspaceManager::open(&root.join("state")).expect("open manager");
     let snapshot = manager
@@ -182,8 +191,11 @@ async fn candidate_seal_detects_mutation() {
     // A tracked-source write inside the worktree mutates the candidate under
     // verification: the evidence is invalid, never a pass.
     let worktree = PathBuf::from(&workspace.worktree);
-    std::fs::write(worktree.join("calc.py"), "def add(a, b):\n    return 'mutated'\n")
-        .expect("mutate tracked source");
+    std::fs::write(
+        worktree.join("calc.py"),
+        "def add(a, b):\n    return 'mutated'\n",
+    )
+    .expect("mutate tracked source");
     let verdict = manager.verify_seal(&candidate).await;
     assert!(
         matches!(verdict, Err(AppError::Conflict(_))),
@@ -201,10 +213,17 @@ async fn sync_does_not_stash_user_work() {
     let root = scratch_root("sync-no-stash");
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).expect("repo dir");
-    let head = repo_with_commit(&repo, &[("calc.py", "def add(a, b):\n    return a + b\n")], "base");
+    let head = repo_with_commit(
+        &repo,
+        &[("calc.py", "def add(a, b):\n    return a + b\n")],
+        "base",
+    );
     // Uncommitted user work: sync must queue the commit without touching it.
-    std::fs::write(repo.join("calc.py"), "def add(a, b):\n    return a + b  # user edit\n")
-        .expect("dirty user file");
+    std::fs::write(
+        repo.join("calc.py"),
+        "def add(a, b):\n    return a + b  # user edit\n",
+    )
+    .expect("dirty user file");
 
     let user_dirty_before = porcelain(&repo);
     assert!(!user_dirty_before.is_empty(), "fixture must start dirty");
@@ -230,7 +249,11 @@ async fn seal_binds_attempt_identity() {
     let root = scratch_root("seal-attempt-bind");
     let repo = root.join("repo");
     std::fs::create_dir_all(&repo).expect("repo dir");
-    let head = repo_with_commit(&repo, &[("calc.py", "def add(a, b):\n    return a + b\n")], "base");
+    let head = repo_with_commit(
+        &repo,
+        &[("calc.py", "def add(a, b):\n    return a + b\n")],
+        "base",
+    );
 
     let manager = GitWorkspaceManager::open(&root.join("state")).expect("open manager");
     let snapshot = manager
