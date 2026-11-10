@@ -78,6 +78,9 @@ pub async fn post_command(
             format!("cannot encode receipt: {error}"),
         )
     })?;
+    // Wake the daemon scan loop: new state may have made work eligible.
+    // The loop still enforces its per-run cadence via should_tick.
+    state.scan_notify.notify_one();
     Ok(Json(attach_dispatch(receipt, dispatch)))
 }
 
@@ -128,6 +131,7 @@ pub async fn dispatch(
         .dispatch_once(run_id)
         .await
         .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
     Ok(Json(serde_json::json!({
         "run_id": run_id.to_string(),
         "dispatched": summary.dispatched,

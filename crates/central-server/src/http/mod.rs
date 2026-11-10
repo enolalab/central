@@ -1,3 +1,4 @@
+pub mod attempts;
 pub mod auth;
 pub mod commands;
 pub mod inbox;
@@ -33,6 +34,9 @@ pub struct AppState {
     pub fake_agent_enabled: bool,
     pub fake_counts: Option<FakeCounts>,
     pub shutdown: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+    /// Wakes the daemon scan loop after an API write (periodic ticks still
+    /// apply; see `crate::scan`). Never blocks request handling.
+    pub scan_notify: Arc<tokio::sync::Notify>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -50,6 +54,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/inbox/decline", post(inbox::post_decline))
         .route("/v1/runs/{id}/inbox/answer", post(inbox::post_answer))
         .route("/v1/runs/{id}/inbox/reconcile", post(inbox::post_reconcile))
+        .route(
+            "/v1/runs/{id}/attempts/{attempt_id}/reconcile",
+            post(attempts::post_reconcile_attempt),
+        )
         .route("/v1/shutdown", post(commands::shutdown))
         .route("/v1/test/fake-sends", get(fake_sends))
         .fallback(ui_not_built)

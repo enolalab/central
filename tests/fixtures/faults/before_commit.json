@@ -1,0 +1,16 @@
+{
+  "schema": "central/fault-barrier-v1",
+  "barrier": "before_commit",
+  "description": "Crash after the harness send is issued but before the AttemptRunning receipt commits. The intent and attempt stay Dispatching; boot must converge them to UnknownOutcome, never resend.",
+  "kill_scope": "own-child-only",
+  "live_models": false,
+  "constraints": [
+    "the fixture kills only the daemon child it spawned, by PID, at this named barrier",
+    "no live model is ever called; the fake gateway records the pre-crash send"
+  ],
+  "expected": {
+    "duplicate_external_actions": 0,
+    "inference_calls_during_boot": 0,
+    "attempt_status_after_boot": "UnknownOutcome"
+  }
+}

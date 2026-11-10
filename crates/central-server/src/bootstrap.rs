@@ -405,6 +405,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
     let _info_guard = ServerInfoGuard(info_path);
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let scan_notify = Arc::new(tokio::sync::Notify::new());
     let state = AppState {
         store,
         actor,
@@ -417,7 +418,25 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
         fake_agent_enabled: config.fake_agent && cfg!(feature = "test-support"),
         fake_counts,
         shutdown: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
+        scan_notify: Arc::clone(&scan_notify),
     };
+    // Daemon scan loop (P3/T6 carries T1's scheduler into production):
+    // periodic + on-event ticks via should_tick/tick. Parked runs stay
+    // parked — only an explicit Resume reopens their gate — and dispatch
+    // rechecks every gate, so the loop can never send before resume.
+    // `CENTRAL_SCAN_MS=0` disables it (deterministic tests).
+    let scan_config = crate::scan::ScanConfig::from_env(state.fake_agent_enabled);
+    if scan_config.enabled() {
+        crate::scan::spawn_scan_loop(
+            Arc::clone(&state.store) as Arc<dyn central_application::ports::Store>,
+            Arc::clone(&state.clock) as Arc<dyn central_application::ports::Clock>,
+            Arc::clone(&state.ids) as Arc<dyn central_application::ports::IdSource>,
+            Arc::clone(&state.agent) as Arc<dyn central_application::ports::AgentGateway>,
+            state.actor.clone(),
+            scan_config,
+            scan_notify,
+        );
+    }
     eprintln!("central-server: listening on {addr}");
 
     let router = http::router(state);

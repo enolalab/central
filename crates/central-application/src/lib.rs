@@ -9,6 +9,7 @@ pub mod leader;
 pub mod ports;
 pub mod profiles;
 pub mod quality_loop;
+pub mod recovery;
 pub mod retries;
 pub mod revisions;
 pub mod runtime;

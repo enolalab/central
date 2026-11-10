@@ -89,6 +89,11 @@ fn spawn_server_with_listen(dir: &std::path::Path, listen: &str) -> Command {
     ])
     .stdout(Stdio::null())
     .stderr(Stdio::piped());
+    // The daemon scan loop is disabled here so these command-path tests
+    // stay deterministic: no background tick may queue or dispatch between
+    // the explicit calls below. Scan timing is covered by
+    // `workflow_recovery` plus the script gate, not by exact event counts.
+    cmd.env("CENTRAL_SCAN_MS", "0");
     cmd
 }
 
@@ -659,6 +664,7 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
         fake_agent_enabled: false,
         fake_counts: None,
         shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        scan_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

@@ -223,6 +223,11 @@ impl Runtime {
             if changed {
                 self.store.replace_state(&next, state.revision).await?;
             }
+            // Passive per-run report: findings plus required user actions.
+            // Recovery itself never dispatches, answers, promotes or
+            // resumes; every entry names an explicit user step instead.
+            // Holds are deliberately preserved here, never cleared.
+            summary.details.push(crate::recovery::inspect_run(&next));
         }
         Ok(summary)
     }

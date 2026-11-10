@@ -242,11 +242,26 @@ pub struct DispatchSummary {
     pub still_pending: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecoverySummary {
     pub runs_seen: usize,
     pub awaiting_resume: usize,
     pub unknown_outcome: usize,
+    /// Per-run passive findings plus the required user actions. Empty for
+    /// runs with nothing to report; `#[serde(default)]` keeps older
+    /// snapshots decodable.
+    #[serde(default)]
+    pub details: Vec<RunRecovery>,
+}
+
+/// Passive recovery report for one run: what boot found and what the user
+/// must do next. Findings never trigger inference, sends or promotions;
+/// every entry names an explicit user action instead.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecovery {
+    pub run_id: RunId,
+    pub findings: Vec<String>,
+    pub required_actions: Vec<String>,
 }
 
 /// Identity of a supervised OS process. PID alone is not enough on Windows:

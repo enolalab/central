@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod http;
 pub mod recovery;
+pub mod scan;
 
 #[cfg(feature = "test-support")]
 pub mod fake_agent {

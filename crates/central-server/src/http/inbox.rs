@@ -162,6 +162,7 @@ pub async fn post_approve(
         .execute(actor, envelope)
         .await
         .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
     receipt_json(&receipt).map(Json)
 }
 
@@ -200,6 +201,7 @@ pub async fn post_decline(
         .execute(actor, envelope)
         .await
         .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
     receipt_json(&receipt).map(Json)
 }
 
@@ -259,6 +261,7 @@ pub async fn post_answer(
             .await
             .map_err(app_error_response)?
     };
+    state.scan_notify.notify_one();
     receipt_json(&receipt).map(Json)
 }
 
@@ -276,6 +279,7 @@ pub async fn post_reconcile(
         .reconcile_inbox(&actor, &body.session)
         .await
         .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
     let summary = serde_json::to_value(&summary).map_err(|error| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,

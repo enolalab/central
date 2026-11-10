@@ -1,0 +1,16 @@
+{
+  "schema": "central/fault-barrier-v1",
+  "barrier": "after_git_promote",
+  "description": "Crash after the git ref moved to the candidate but the promotion receipt is missing. Recovery must converge from the actual ref (committed stays committed) without a second ref mutation.",
+  "kill_scope": "own-child-only",
+  "live_models": false,
+  "constraints": [
+    "the fixture kills only the daemon child it spawned, by PID, at this named barrier",
+    "recovery reads the actual ref head; it never writes the ref"
+  ],
+  "expected": {
+    "git_commit_count": "unchanged",
+    "converges_from_actual_ref": true,
+    "duplicate_external_actions": 0
+  }
+}

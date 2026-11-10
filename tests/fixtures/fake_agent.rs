@@ -66,7 +66,11 @@ impl central_application::ports::AgentGateway for FakeAgent {
         Ok(Capabilities {
             provider: "fake".to_string(),
             supports_resume: true,
-            features: vec!["test-support".to_string()],
+            // The daemon scan loop dispatches a default low profile under
+            // `--fake-agent`; advertising its model keeps that path honest
+            // instead of silently deferring. Production (no fake agent)
+            // still has no servable profile and defers.
+            features: vec!["test-support".to_string(), "model:fake-model".to_string()],
         })
     }
 

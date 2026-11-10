@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use central_domain::{
-    plan_hash, Command, CommandEnvelope, CommandId, PlanDocumentV1, Revision, RunId,
+    plan_hash, AttemptId, Command, CommandEnvelope, CommandId, PlanDocumentV1, Revision, RunId,
 };
 use central_infrastructure::process::{spawn_detached, DetachPlacement, ALREADY_RUNNING_EXIT_CODE};
 
@@ -103,6 +103,7 @@ pub fn execute(cli: Cli) -> i32 {
             *max_attempts,
             *max_duration_ms,
         ),
+        Commands::Reconcile { run, attempt } => reconcile(&state_dir, run, attempt),
         Commands::Pause { run } => simple(&state_dir, run, Command::Pause),
         Commands::Stop { run } => simple(&state_dir, run, Command::Stop),
         Commands::Resume { run } => simple(&state_dir, run, Command::Resume),
@@ -158,6 +159,26 @@ fn send_command(
         None => "/v1/commands".to_string(),
     };
     client.post_json(&path, &body)
+}
+
+/// Passively reconcile one attempt through the daemon: the harness
+/// evidence is stored durably and returned. Nothing is resent, answered
+/// or promoted by this call.
+fn reconcile(state_dir: &Path, run: &RunId, attempt: &AttemptId) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.post_json(
+        &format!("/v1/runs/{run}/attempts/{attempt}/reconcile"),
+        &serde_json::json!({}),
+    ) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
 }
 
 fn simple(state_dir: &Path, run: &RunId, command: Command) -> i32 {

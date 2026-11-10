@@ -136,6 +136,15 @@ pub enum Commands {
         #[arg(long)]
         max_duration_ms: Option<i64>,
     },
+    /// Passively reconcile one attempt: store the harness evidence
+    /// durably without starting inference. An unknown outcome stays
+    /// unknown until a new attempt continues with a handover.
+    Reconcile {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        attempt: AttemptId,
+    },
     /// Pause a running run (in-flight attempts finish).
     Pause {
         #[arg(long)]
