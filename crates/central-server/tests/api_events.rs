@@ -171,7 +171,11 @@ fn invalid_cursor_is_400_not_500() {
     );
     if status == 400 {
         let value: serde_json::Value = serde_json::from_str(&body).expect("400 json");
-        assert!(value["error"]["code"].as_str().is_some(), "code: {value}");
+        assert_eq!(
+            value["error"]["code"].as_str(),
+            Some("validation_failed"),
+            "bad cursor uses the documented stable code: {value}"
+        );
     }
 }
 

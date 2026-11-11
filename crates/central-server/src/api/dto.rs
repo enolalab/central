@@ -36,14 +36,14 @@ pub fn decode_cursor(raw: &str, collection: &str, run: &str) -> Result<u64, ApiE
     let bytes = hex_decode(raw).ok_or_else(|| {
         error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            "invalid_cursor",
+            "validation_failed",
             format!("cursor for {collection} is not valid; refetch the collection head"),
         )
     })?;
     let text = String::from_utf8(bytes).map_err(|_| {
         error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            "invalid_cursor",
+            "validation_failed",
             format!("cursor for {collection} is not valid; refetch the collection head"),
         )
     })?;
@@ -61,14 +61,14 @@ pub fn decode_cursor(raw: &str, collection: &str, run: &str) -> Result<u64, ApiE
             pos.parse::<u64>().map_err(|_| {
                 error_response(
                     axum::http::StatusCode::BAD_REQUEST,
-                    "invalid_cursor",
+                    "validation_failed",
                     format!("cursor for {collection} is not valid; refetch the collection head"),
                 )
             })
         }
         _ => Err(error_response(
             axum::http::StatusCode::BAD_REQUEST,
-            "invalid_cursor",
+            "validation_failed",
             format!("cursor belongs to another collection or run; refetch the {collection} head"),
         )),
     }
