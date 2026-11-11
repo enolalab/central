@@ -80,3 +80,22 @@
 - [ ] **3. Implement:** temp-write/hash/flush/rename blob rồi commit metadata; orphan dọn tường minh, không xóa referenced blob. CheckRunner chỉ program+argv đã duyệt, capture stdout/stderr/exit/hash, cwd/root/timeout qua supervisor; không eval model prose. Verifier phiên/scratch riêng, không sửa candidate/criteria; không recursive verifier.
 - [ ] **4. Run green:** `pwsh -File scripts/test-codex-single-task.ps1 -RealModel`: fixture one function/test, worker sửa, verifier độc lập, evidence; restart Central -> zero inference trước resume. Initial smoke tối đa 3 agent turns; stop khi quota/auth; tests thường fake. Ghi usage/unknown, không gửi repo thật.
 - [ ] **5. Commit:** `feat: verify one Codex task with immutable provenance`; P2 evidence không chỉ lời agent nói xong.
+
+## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
+
+Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`).
+Các checkbox gốc giữ nguyên lịch sử.
+
+- [x] Suite xác định xanh: `verification` 5, `artifact_contract` 2 bài chạy
+  được trên Linux (3 bài còn lại `cfg(windows)`, không biên dịch ở đây),
+  `codex_transport` 9, `profile_isolation` 6, `process_ownership` 9 đạt +
+  1 ignored (smoke opt-in, chạy riêng đạt `initialize ok`).
+- [x] Live smoke đúng thủ tục manual của P2 (scratch fixture-owned, tối đa
+  3 turn, dừng khi quota/auth lỗi): 2 turn qua `codex exec` trực tiếp —
+  worker sửa `calc.py` (hash đổi `ba1a531f…` → `2ce8d715…`,
+  `add(1,2)==3` giữ, bool bị `TypeError`; usage in 62984/cached 53120/
+  out 187) + verifier độc lập PASS (usage in 41378/cached 31872/out 133).
+  Model yêu cầu `gpt-6-luna`/low; output `--json` không mang tên model quan
+  sát nên ghi nhận theo yêu cầu, không suy diễn fallback.
+- Smoke trên chạy ngoài daemon (đúng phạm vi manual của P2); workflow live
+  qua daemon thuộc P4 và đang bị chặn — xem P4.

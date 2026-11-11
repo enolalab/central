@@ -69,3 +69,16 @@
 - [ ] **3. Implement:** owner file lock trước mở DB; OS-owner-only token/server-info; loopback auth; command body max 1 MiB. CLI spawn daemon detached/hidden bằng Windows adapter, không shell string; đóng CLI không giết daemon. Startup nonterminal -> AwaitingResume; Dispatching thiếu receipt -> UnknownOutcome. Fake agent chỉ test-support feature, release không trả output giả.
 - [ ] **4. Run green:** `pwsh -File scripts/test-runtime-recovery.ps1`: create -> approve -> crash -> reopen -> zero dispatch -> explicit resume -> fake workflow tiếp tục; event không lặp, independent run không mất. UI chưa build -> clear 503, không crash server. No live-model calls.
 - [ ] **5. Commit:** `feat: expose durable local runtime through daemon and CLI`; lưu `docs/validation/p1-runtime.md`. Gate không được tuyên bố đã hoàn thành MVP hay tích hợp model thật.
+
+## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
+
+Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`,
+3 file sửa chưa commit). Các checkbox gốc giữ nguyên lịch sử; dưới đây là
+trạng thái mới, chỉ tick những gì phiên này chứng minh trực tiếp.
+
+- [x] Suite xác định xanh trên Linux: `plan_lifecycle` 11,
+  `command_runtime` 5, `recovery_dispatch` 5, `store_contract` 10,
+  `local_runtime` 10; `cargo fmt --check` và clippy `-D warnings` đạt.
+- [ ] DuckDB suitability gate không chạy lại trên host này (gate PowerShell
+  Windows); evidence lịch sử trong `docs/validation/duckdb-gate.md` giữ nguyên.
+- P1 không có nội dung live-model theo thiết kế; không tuyên bố gì thêm.

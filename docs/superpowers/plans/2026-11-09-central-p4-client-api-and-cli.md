@@ -123,3 +123,28 @@ contract cho UI bên ngoài, không hứa cung cấp UI hoặc SDK ở chặng s
 Nguồn: [OpenAPI](https://spec.openapis.org/oas/v3.1.2.html),
 [SSE](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events),
 [Fetch](https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch).
+
+## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
+
+Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`).
+Các checkbox gốc giữ nguyên lịch sử; dưới đây là trạng thái mới.
+
+- [x] Suite xác định xanh: `api_contract` 8, `api_auth` 8, `api_events` 7,
+  `api_workflow` 6, `artifact_retention` 3, `release_security` 3,
+  `api_parity` 3; `cargo fmt --check` và clippy `-D warnings` đạt.
+  GC giữ dry-run-only đúng contract (từ chối `dry_run:false`, loại
+  referenced/active/unknown) — không cần code thêm.
+- [x] Probe live qua daemon bằng binary release-like (không test-support)
+  và `codex.json` trung thực đã chạy: daemon tự ghi
+  `codex CLI version not allowlisted`, profile `gpt-6-luna`/low về
+  capability `unknown`, dispatch 0, daemon không sinh process agent nào,
+  shutdown sạch exit 0. Đây là bằng chứng đường từ chối an toàn, KHÔNG
+  phải bằng chứng workflow live.
+- [ ] Workflow live worker → verifier → integration qua daemon: **BỊ CHẶN +
+  UNVERIFIED** — CLI đã cài là `0.167.1`, ngoài allowlist đã pin
+  (`["0.167.0-alpha.3.2"]`). Cách gỡ: cài đúng bản CLI được pin, hoặc mở
+  rộng allowlist kèm capture + subset protocol mới (thay đổi sản phẩm cần
+  re-validation; không làm để ép xanh).
+- [ ] Client độc lập, e2e gate (`test-mvp-e2e.ps1`), đóng gói/zip Windows,
+  smoke zip không Rust/Node, reboot thủ công: chưa chạy lại (thiếu `pwsh`,
+  gateway live bị chặn). Không suy từ kết quả Linux.

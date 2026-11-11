@@ -18,9 +18,12 @@ use central_application::contracts::{
 use central_application::ports::{AgentGateway, ProcessSupervisor};
 use central_domain::{AttemptId, ContentHash, ProfileId, ResolvedProfile, Timestamp};
 use central_infrastructure::codex::{CodexConfig, CodexGateway};
+#[cfg(windows)]
 use central_infrastructure::process::{
-    current_process_in_job, process_creation_time_ms, process_in_job, spawn_detached,
-    DetachPlacement, JobError, JobObject, JobPlacement, OwnedProcessSupervisor,
+    current_process_in_job, process_creation_time_ms, process_in_job,
+};
+use central_infrastructure::process::{
+    spawn_detached, DetachPlacement, JobError, JobObject, JobPlacement, OwnedProcessSupervisor,
 };
 
 /// Helper sleeper: Windows and portable variants so supervision itself is
@@ -71,6 +74,7 @@ fn helper_command() -> (String, Vec<String>) {
 }
 
 /// Deterministic nested-job-style refusal for the assign hook.
+#[cfg(windows)]
 fn fail_assign(_job: &JobObject, _pid: u32) -> Result<(), JobError> {
     Err(JobError::Win32(5))
 }

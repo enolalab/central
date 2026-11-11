@@ -10,9 +10,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use central_application::ports::artifacts::{ArtifactStore, PublishArtifact};
+#[cfg(windows)]
 use central_application::ports::checks::{CheckRequest, CheckRunner};
 use central_domain::{AttemptId, ContentHash, TaskId};
 use central_infrastructure::artifacts::FilesystemArtifactStore;
+#[cfg(windows)]
 use central_infrastructure::checks::{ApprovedCommand, SupervisedCheckRunner};
 use sha2::{Digest, Sha256};
 

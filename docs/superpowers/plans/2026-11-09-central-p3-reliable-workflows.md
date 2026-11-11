@@ -94,3 +94,17 @@
 - [ ] **3. Implement:** passive inspect ownership/session/history/artifacts, store reconciliation evidence, resume same session only when profile/input match and safe. Else new attempt with handover after old outcome known. Unknown branch holds its descendants/resources; independent work can run after explicit run resume unless global budget hold. Cancel requests not terminal until evidence; zero blind replay approvals/outbox sends.
 - [ ] **4. Run green:** `pwsh -File scripts/test-workflow-recovery.ps1`: 2 independent implementation tasks -> verifier -> integration; inject each barrier and restart. `cargo test --workspace`; fake models default. One opt-in Luna/low workflow smoke only after deterministic gate, configurable max calls, stop on quota/auth/unknown accounting. Reboot/manual Windows acceptance recorded separately, not inferred from process kill.
 - [ ] **5. Commit:** `test: prove workflow recovery and side-effect reconciliation`; record remaining external-effect limits. P3 gate: trace input/plan/attempt/profile/verification for every fixture output.
+
+## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
+
+Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`).
+Các checkbox gốc giữ nguyên lịch sử.
+
+- [x] Suite xác định xanh: `scheduler` 12, `quality_loop` 16, `budget` 4,
+  `retry_fallback` 6, `revision_impact` 10, `git_workspace` 4,
+  `git_integration` 4 (gồm bài baseline/affected/acceptance từng lỗi,
+  đã sửa containment trong `checks/runner.rs` + 4 unit test regression),
+  `workflow_recovery` 7.
+- [ ] Reboot/manual Windows acceptance chưa thực hiện; không suy từ
+  process kill/restart. Gate PowerShell (`test-workflow-recovery.ps1`)
+  không chạy lại trên host này (thiếu `pwsh`).

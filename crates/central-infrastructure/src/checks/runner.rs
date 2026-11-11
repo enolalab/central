@@ -54,8 +54,11 @@ impl SupervisedCheckRunner {
     }
 
     fn contained(&self, raw: &str) -> Result<PathBuf, AppError> {
+        reject_raw_path(raw)?;
+        let unified = raw.replace('\\', "/");
+        let absolute = is_unix_absolute(&unified) || is_drive_absolute(&unified);
         let joined;
-        let candidate: &Path = if Path::new(raw).is_absolute() {
+        let candidate: &Path = if absolute {
             joined = normalize(raw);
             &joined
         } else {
@@ -85,22 +88,73 @@ fn normalize(raw: &str) -> PathBuf {
     normalize_join(&PathBuf::new(), raw)
 }
 
+/// Reject Windows-unsafe syntax before any resolution: NUL, device
+/// namespaces (`\\?\`, `\\.\`) and NTFS alternate streams (`:`) fail
+/// closed. A single leading drive prefix (`C:/...`) is allowed so an
+/// absolute worktree on Windows can still prove containment; any other
+/// colon is a stream and is refused.
+fn reject_raw_path(raw: &str) -> Result<(), AppError> {
+    if raw.contains('\0') {
+        return Err(AppError::Forbidden("check path contains NUL".to_string()));
+    }
+    let unified = raw.replace('\\', "/");
+    if unified.starts_with("//?/") || unified.starts_with("//./") {
+        return Err(AppError::Forbidden(format!(
+            "check path uses a device namespace: {raw}"
+        )));
+    }
+    if let Some(colon_pos) = unified.find(':') {
+        let drive_ok = colon_pos == 1
+            && unified.len() >= 2
+            && unified.as_bytes()[0].is_ascii_alphabetic()
+            && unified.as_bytes()[1] == b':'
+            && (unified.len() == 2 || unified.as_bytes()[2] == b'/');
+        if !drive_ok {
+            return Err(AppError::Forbidden(format!(
+                "check path escapes the work root: {raw}"
+            )));
+        }
+        if unified[2..].contains(':') {
+            return Err(AppError::Forbidden(format!(
+                "check path escapes the work root: {raw}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn is_unix_absolute(unified: &str) -> bool {
+    unified.starts_with('/')
+}
+
+fn is_drive_absolute(unified: &str) -> bool {
+    let Some(first) = unified.split('/').next() else {
+        return false;
+    };
+    first.len() == 2 && first.ends_with(':') && first.as_bytes()[0].is_ascii_alphabetic()
+}
+
 /// Lexically join `raw` under `base`, resolving `.`/`..` without touching
 /// the filesystem. A `..` that climbs past the base is kept as `..` so the
-/// containment check below rejects it.
+/// containment check below rejects it. Absolute inputs keep their root
+/// (`/` on Unix, `C:/` for a drive prefix) so an absolute worktree inside
+/// the work root still proves containment; anything outside still fails.
 fn normalize_join(base: &Path, raw: &str) -> PathBuf {
     let unified = raw.replace('\\', "/");
-    let absolute = unified.starts_with('/')
-        || unified
-            .split('/')
-            .next()
-            .is_some_and(|first| first.ends_with(':'));
-    let mut out = if absolute {
-        PathBuf::new()
+    let unix_abs = is_unix_absolute(&unified);
+    let drive_abs = is_drive_absolute(&unified);
+    let mut out = if unix_abs {
+        PathBuf::from("/")
+    } else if drive_abs {
+        let drive = unified.split('/').next().expect("drive prefix");
+        PathBuf::from(format!("{drive}/"))
     } else {
         base.to_path_buf()
     };
-    for part in unified.split('/') {
+    for (index, part) in unified.split('/').enumerate() {
+        if drive_abs && !unix_abs && index == 0 {
+            continue;
+        }
         match part {
             "" | "." => {}
             ".." => {
@@ -111,10 +165,6 @@ fn normalize_join(base: &Path, raw: &str) -> PathBuf {
             _ => out.push(part),
         }
     }
-    // An absolute `raw` normalizes from empty, never silently under `base`:
-    // only paths that lexically stay inside the work root pass the check in
-    // `contained`. Callers pass run-relative paths; absolute paths are
-    // rejected fail-closed even when they name the root itself.
     out
 }
 
@@ -204,4 +254,52 @@ async fn drain(pipe: &mut Option<impl tokio::io::AsyncRead + Unpin>) -> Result<V
 fn tail(bytes: &[u8]) -> String {
     let start = bytes.len().saturating_sub(TAIL_BYTES);
     String::from_utf8_lossy(&bytes[start..]).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn absolute_unix_path_keeps_leading_root() {
+        assert_eq!(
+            normalize("/tmp/state/worktrees/w1"),
+            PathBuf::from("/tmp/state/worktrees/w1")
+        );
+        assert_eq!(
+            normalize_join(&PathBuf::from("/tmp/state"), "/tmp/state/worktrees/w1"),
+            PathBuf::from("/tmp/state/worktrees/w1")
+        );
+    }
+
+    #[test]
+    fn lexical_dot_segments_resolve_without_escaping() {
+        assert_eq!(
+            normalize_join(&PathBuf::from("/tmp/state"), "a/./b/../c"),
+            PathBuf::from("/tmp/state/a/c")
+        );
+    }
+
+    #[test]
+    fn drive_prefix_is_preserved_lexically() {
+        assert_eq!(
+            normalize("C:/state/worktrees/w1"),
+            PathBuf::from("C:/state/worktrees/w1")
+        );
+        assert_eq!(
+            normalize_join(&PathBuf::from("C:/state"), "C:/state/worktrees/w1"),
+            PathBuf::from("C:/state/worktrees/w1")
+        );
+    }
+
+    #[test]
+    fn device_namespace_and_stream_syntax_fail_closed() {
+        assert!(reject_raw_path("//?/C:/state").is_err());
+        assert!(reject_raw_path("\\\\?\\C:\\state").is_err());
+        assert!(reject_raw_path("file:stream").is_err());
+        assert!(reject_raw_path("C:/state/file:stream").is_err());
+        assert!(reject_raw_path("has\0nul").is_err());
+        assert!(reject_raw_path("C:/state/worktrees/w1").is_ok());
+        assert!(reject_raw_path("/tmp/state/worktrees/w1").is_ok());
+    }
 }
