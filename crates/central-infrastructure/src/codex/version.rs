@@ -8,7 +8,11 @@
 pub const SUPPORTED_CLI_VERSION: &str = "0.167.0-alpha.3.2";
 
 /// CLI builds Central speaks. Extended only with a new capture + subset.
-pub const CLI_VERSION_ALLOWLIST: &[&str] = &[SUPPORTED_CLI_VERSION];
+/// `0.167.1` was verified live on 2026-11-11 (initialize/thread-start/
+/// turn-start result shapes match, approval surface unchanged; usage flows
+/// over `thread/tokenUsage/updated`): see
+/// `contracts/codex/0.167.1/protocol-subset.json`.
+pub const CLI_VERSION_ALLOWLIST: &[&str] = &[SUPPORTED_CLI_VERSION, "0.167.1"];
 
 /// A parsed `major.minor.patch[-pre][+build]` version. Suffixes compare
 /// lexically; only exact allowlist membership is accepted.

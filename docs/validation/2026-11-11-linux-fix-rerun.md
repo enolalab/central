@@ -1,7 +1,10 @@
 # Linux fix rerun — 2026-11-11 (containment + Clippy, live Codex smoke)
 
 Base revision: `a00a2b5fda46887fdd9dda8fbe2b9b32868d2cdf`.
-Working tree: 3 files modified, uncommitted (see git status below); no commits made.
+Working tree at writing time: 3 files modified, uncommitted.
+Update 2026-11-11 (late): all of it committed as `12e0217`
+(user-authorized; `skills/` left untracked). Only edits after `12e0217`
+remain uncommitted.
 Host: Linux `x86_64`; Rust `1.99.1 (58cf8f9c3 2026-10-13)`, Cargo `1.99.1`.
 Codex CLI: `0.167.1` (earlier rerun reported `0.166.0`; host has since moved).
 `CXXFLAGS=-g0` only trims C++ debug symbols for the bundled DuckDB build;
@@ -147,13 +150,121 @@ the version question is resolved properly.
   Rust/Node, manual reboot acceptance: no `pwsh` or `.toolchain/env.ps1`
   on this host — not rerun, not inferred from Linux results.
 - Live P4 daemon workflow with model (worker → verifier → integration
-  through the daemon): **BLOCKED + UNVERIFIED** — the probe above proves
-  the exact cause (installed `0.167.1` outside the pinned allowlist;
-  daemon reports unknown capability, dispatches nothing, spawns nothing).
-  Only the direct-CLI 2-turn smoke is proven. No live/MVP gate is claimed.
-- Plan files (`docs/superpowers/plans/*.md`) left untouched: their
-  `- [ ]` boxes predate this session and acceptance status lives in
-  `docs/validation/`; no box was ticked to force completion.
+  through the daemon): **BLOCKED + UNVERIFIED** — the earlier probe proved
+  the allowlist cause; the transport wiring below removes that cause but
+  the live worker leg still needs dispatcher→worktree cwd wiring (see
+  transport section). Only the direct-CLI 2-turn smoke is proven.
+  No live/MVP gate is claimed.
+- Protocol probe 2026-11-11 (late, installed CLI `0.167.1`): initialize
+  result keys match the pinned subset; `thread/start` returns observed
+  model `gpt-6-luna` + `reasoningEffort low`; `turn/start` response and
+  `turn/completed` shapes match; usage arrives via
+  `thread/tokenUsage/updated` (turn 1: in 21601/cached 11520/out 8).
+  New vs fixture: `remoteControl/status/changed`, `account/updated`,
+  `mcpServer/*`, `thread/tokenUsage/updated`, `account/rateLimits/updated`
+  notifications; approval surface
+  (`item/commandExecution/requestApproval`, `item/tool/requestUserInput`)
+  still present in 0.167.1 schemas. Approval request+cancel answer NOT
+  verified live (model answered in text, never requested approval);
+  gateway answer path (`respond` + Once table) has no live proof and no
+  dedicated unit test. Full wire details in the protocol-probe section
+  below (appended 2026-11-11 late).
+- Plan files: original `- [ ]` boxes preserved; a dated
+  `Trạng thái nghiệm thu 2026-11-11` section was appended to each P1–P4
+  plan (committed in `12e0217`) with new evidence-backed checkboxes only.
+
+## Protocol verification of installed CLI 0.167.1 (2026-11-11 late)
+
+Bounded probe: raw JSON-RPC over `codex app-server` stdio on
+fixture-owned scratch (`/tmp/central-proto-*`, removed after), ephemeral
+threads (nothing persisted), model `gpt-6-luna`, effort low,
+`allowProviderModelFallback:false`. No repo sent, no config modified.
+
+- `initialize` → result keys exactly
+  `[codexHome, platformFamily, platformOs, userAgent]`, matching the
+  pinned subset; `userAgent` reports `0.167.1`.
+- `initialized` notification accepted; interleaved server notifications
+  `remoteControl/status/changed` and `account/updated` observed (absent
+  from the 0.167.0-alpha.3.2 fixtures — the gateway must tolerate unknown
+  notification methods, which `parse_frame`/`ingest_wire_frame` do by
+  buffering them as opaque events).
+- `thread/start` → observed `model: gpt-6-luna`,
+  `reasoningEffort: low`, `approvalPolicy: on-request`,
+  `sandbox: workspaceWrite`, `ephemeral: true` honored; shape matches the
+  subset (`thread{id,model,modelProvider}` + top-level `model`).
+- `turn/start` → immediate response `{turn:{id,status:inProgress}}`,
+  then `turn/completed` with full result items (`PROBE-OK` text,
+  `status:completed`, `durationMs:6132`). Usage is NOT top-level in
+  `turn/completed`; it arrives via `thread/tokenUsage/updated`
+  (turn 1: `inputTokens 21601, cachedInputTokens 11520, outputTokens 8,
+  totalTokens 21609, modelContextWindow 258400`). Gateway usage harvesting
+  must read tokenUsage notifications.
+- `codex app-server generate-json-schema --experimental` works read-only
+  (47 top-level + 423 v2 files captured to `/tmp/schema-0.167.1`, kept
+  outside the repo): `ThreadStartParams` keeps
+  `model/cwd/sandbox/approvalPolicy/ephemeral/allowProviderModelFallback/config`;
+  both approval methods
+  (`item/commandExecution/requestApproval`, `item/tool/requestUserInput`)
+  still present in `ServerRequest.json`.
+- NOT verified: a live approval request + cancel answer (the model
+  answered in text both times and never emitted a server request), and
+  `thread/resume` (not exercised). Gateway `answer()` (`respond` + Once
+  table in `PendingRequestTable`) has no live proof and no dedicated unit
+  test in `requests.rs`.
+- Transport gap confirmed in code: `CodexGateway::send` returns
+  `DefinitelyNotSent` ("live stdio transport not attached"); `open()`
+  spawns the app-server with `Stdio::null()`, so no RPC can ride the
+  supervised process today. Wiring needs a supervised piped-spawn path
+  (open design question — asked to user separately).
+
+Windows gates: `pwsh` absent (exit 127), no `.toolchain/` — packaging,
+zip smoke and reboot acceptance cannot run here; recorded as blockers,
+never inferred.
+
+## Transport wiring 2026-11-11 (late): stdio/RPC attached to the gateway
+
+Scope decided with user: `spawn_piped` on the existing supervisor shape
+(as a separate infra trait, so no tokio leaks into application ports),
+allowlist extended to the verified `0.167.1`, wiring + acceptance now.
+
+- `PipedSpawner`/`PipedStdio` (`process/piped.rs`): piped spawn shares
+  the exact supervision core (kernel creation time, job assignment,
+  identity-checked kill); default trait body refuses honestly.
+  `OwnedProcessSupervisor` implements it; `spawn()` behavior unchanged.
+- `CodexGateway`: optional `with_piped` attach (legacy callers keep
+  supervision-only and `send` still refuses loudly). `open` supervises +
+  stores pipes/profile/workspace; `send` runs initialize → thread/start
+  (or resume) → turn/start with observed-model and CLI-build checks
+  (mismatch = capability error/Rejected, never fallback). `observe`
+  pumps the wire first; `drain_requests` correlates on the server thread
+  id; `answer` shapes the wire decision strictly from the domain verdict
+  (`approved`→accept, `declined:*`→cancel, questions need server ids) and
+  writes it through the owning session; `cancel` drops the transport and
+  kills by handle; `reconcile` reports transport state, outcome stays
+  UnknownOutcome without completed-turn evidence. Usage arrives via
+  `thread/tokenUsage/updated`, not `turn/completed` (feed the ledger via
+  the audited user resolve path; no automatic fill).
+- Maintained tests: `attached_transport_speaks_verified_protocol`
+  (duplex open→send→observe→drain→answer-cancel-on-wire→completion) and
+  `piped_spawn_echoes_and_kills_by_handle` (real `cat` echo + exactly-once
+  kill). Full gates after wiring: fmt ok, clippy `-D warnings` ok,
+  `cargo test --workspace`: **243 passed, 0 failed, 1 ignored**.
+- Contracts: `contracts/codex/0.167.1/{manifest,protocol-subset}.json`
+  (live-verified, generatedFromLiveCli:true); allowlist is now
+  `["0.167.0-alpha.3.2", "0.167.1"]`.
+- Wired daemon probe (release-like binary, truthful `codex.json`
+  0.167.1, fresh state dir, removed after): gateway line now reads
+  `codex gateway configured`; profile `gpt-6-luna`/low → capability
+  `supported` ("model advertised by codex"); empty dispatch → 0 sends,
+  zero daemon children, zero new codex PIDs, shutdown exit 0.
+- Still open (NOT claimed): a live worker leg through the daemon —
+  `dispatcher` passes only a workspace *label* (`workspace_label`, "no
+  directory is created here"), so a live `thread/start` has no real
+  fixture-owned cwd yet; wiring dispatch to P3 worktrees + the
+  approval-answer loop + result import is the next chunk. Deliberately
+  not attempted live (a wrong cwd could put workspace-write outside
+  fixture scratch). Approval request+cancel still unverified against the
+  real server (gateway path is e2e-tested on duplex).
 
 ## Assessment
 

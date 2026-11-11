@@ -707,6 +707,226 @@ async fn buffered_events_drain_to_bound_observations() {
     );
 }
 
+/// End-to-end RPC attach over in-memory duplex pipes: open, send
+/// (initialize + thread/start + turn/start), a server approval request,
+/// an answered decline that reaches the wire as a cancel decision, and
+/// cancel teardown. The fake server speaks the live-verified 0.167.1
+/// surface: observed model echo plus the allowlisted CLI build echo.
+#[tokio::test]
+async fn attached_transport_speaks_verified_protocol() {
+    use std::sync::Mutex;
+
+    use central_application::contracts::{ExternalAnswer, OpenSession, SendTurn};
+    use central_domain::{AnswerPayload, AnswerScope, AttemptId, CommandId, Timestamp};
+    use central_infrastructure::process::{PipedSpawner, PipedStdio};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    struct DuplexSpawner {
+        server: Mutex<Option<(tokio::io::DuplexStream, tokio::io::DuplexStream)>>,
+    }
+
+    #[async_trait]
+    impl PipedSpawner for DuplexSpawner {
+        async fn spawn_piped(
+            &self,
+            _spec: &ProcessSpec,
+        ) -> Result<(ProcessIdentity, PipedStdio), AppError> {
+            let (gw_write, srv_read) = tokio::io::duplex(64 * 1024);
+            let (srv_write, gw_read) = tokio::io::duplex(64 * 1024);
+            *self.server.lock().expect("server slot") = Some((srv_read, srv_write));
+            Ok((
+                ProcessIdentity {
+                    pid: 4242,
+                    created_at: Timestamp::from_millis(1_700_000_000_000),
+                    ownership_id: "duplex-e2e".to_string(),
+                },
+                PipedStdio {
+                    stdin: Box::new(gw_write),
+                    stdout: Box::new(gw_read),
+                },
+            ))
+        }
+    }
+
+    let spawner = Arc::new(DuplexSpawner {
+        server: Mutex::new(None),
+    });
+    let config = CodexConfig {
+        cli_version: "0.167.1".to_string(),
+        surveyed_models: vec!["gpt-6-luna".to_string()],
+        request_timeout_ms: 5_000,
+        ..CodexConfig::default()
+    };
+    let gateway = CodexGateway::new(supervisor(), config).with_piped(spawner.clone());
+
+    // Fake server: initialize, thread/start (observed model + CLI echo),
+    // turn/start, then one approval request answered with cancel, then a
+    // completion notification.
+    let peer = tokio::spawn(async move {
+        let (srv_read, mut srv_write) = loop {
+            if let Some(pipes) = spawner.server.lock().expect("server slot").take() {
+                break pipes;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        // One read loop: the `initialized` notification may arrive ahead
+        // of the next request, so dispatch on content, not on position.
+        let mut lines = BufReader::new(srv_read).lines();
+        let mut phase = 0;
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .expect("peer read")
+                .expect("server still open");
+            if line.contains("\"method\":\"initialized\"") {
+                continue;
+            }
+            match phase {
+                0 => {
+                    let req: Value = serde_json::from_str(&line).expect("initialize parses");
+                    assert_eq!(req["method"], "initialize");
+                    let id = req["id"].clone();
+                    srv_write
+                        .write_all(
+                            format!(
+                                "{{\"id\":{id},\"result\":{{\"userAgent\":\"test/0.167.1\",\"codexHome\":\"x\"}}}}\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .expect("peer writes initialize answer");
+                    phase = 1;
+                }
+                1 => {
+                    let req: Value = serde_json::from_str(&line).expect("thread/start parses");
+                    assert_eq!(req["method"], "thread/start");
+                    assert_eq!(req["params"]["model"], "gpt-6-luna");
+                    assert_eq!(req["params"]["allowProviderModelFallback"], false);
+                    let id = req["id"].clone();
+                    srv_write
+                        .write_all(
+                            format!(
+                                "{{\"id\":{id},\"result\":{{\"model\":\"gpt-6-luna\",\"thread\":{{\"id\":\"srv-thread-1\",\"cliVersion\":\"0.167.1\",\"model\":\"gpt-6-luna\",\"modelProvider\":\"openai\"}}}}}}\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .expect("peer writes thread answer");
+                    phase = 2;
+                }
+                2 => {
+                    let req: Value = serde_json::from_str(&line).expect("turn/start parses");
+                    assert_eq!(req["method"], "turn/start");
+                    assert_eq!(req["params"]["threadId"], "srv-thread-1");
+                    let id = req["id"].clone();
+                    srv_write
+                        .write_all(
+                            format!(
+                                "{{\"id\":{id},\"result\":{{\"turn\":{{\"id\":\"turn-7\"}}}}}}\n"
+                            )
+                            .as_bytes(),
+                        )
+                        .await
+                        .expect("peer writes turn answer");
+                    srv_write
+                        .write_all(
+                            b"{\"id\":11,\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"kind\":\"command\",\"threadId\":\"srv-thread-1\",\"turnId\":\"turn-7\",\"itemId\":\"exec-1\",\"command\":\"demo\",\"availableDecisions\":[\"accept\",\"cancel\"]}}\n",
+                        )
+                        .await
+                        .expect("peer asks approval");
+                    phase = 3;
+                }
+                _ => {
+                    let answer: Value = serde_json::from_str(&line).expect("answer parses");
+                    assert_eq!(answer["id"], 11);
+                    assert_eq!(
+                        answer["result"]["decision"], "cancel",
+                        "declined verdict reaches the wire as cancel: {answer}"
+                    );
+                    srv_write
+                        .write_all(
+                            b"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"srv-thread-1\",\"turn\":{\"id\":\"turn-7\",\"status\":\"completed\"}}}\n",
+                        )
+                        .await
+                        .expect("peer completes the turn");
+                    // Stay up like a real server: closing here would
+                    // correctly latch reconcile-required on the gateway.
+                    // The test aborts this handle at the end.
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    }
+                }
+            }
+        }
+    });
+
+    let session = gateway
+        .open(OpenSession {
+            attempt_id: AttemptId::from_u128(42),
+            profile: profile(),
+            workspace: "/tmp/e2e".to_string(),
+            resume_from: None,
+        })
+        .await
+        .expect("open attaches pipes");
+    let turn = gateway
+        .send(SendTurn {
+            session: session.clone(),
+            attempt_id: AttemptId::from_u128(42),
+            input: "do it".to_string(),
+            output_schema: None,
+            command_id: CommandId::from_u128(7),
+        })
+        .await
+        .expect("send runs initialize + thread/start + turn/start");
+    assert_eq!(turn.turn_id, "turn-7");
+
+    // The approval request arrives as an observation bound to the attempt.
+    let mut saw_approval = false;
+    for _ in 0..100 {
+        let observations = gateway.observe(&session).await.expect("observe drains");
+        if observations.iter().any(|o| o.dedup_key.contains("exec-1")) {
+            saw_approval = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw_approval, "server approval request observed");
+
+    let drained = gateway
+        .drain_requests(&session)
+        .await
+        .expect("drain persists once");
+    assert_eq!(drained.len(), 1);
+    assert_eq!(drained[0].attempt_id, Some(AttemptId::from_u128(42)));
+
+    gateway
+        .answer(ExternalAnswer {
+            key: drained[0].key.clone(),
+            payload: AnswerPayload::Plain("declined: no".to_string()),
+            scope: AnswerScope::Once,
+        })
+        .await
+        .expect("decline routes");
+
+    // Completion lands after the answer round-trip.
+    let mut saw_completed = false;
+    for _ in 0..100 {
+        let observations = gateway.observe(&session).await.expect("observe drains");
+        if observations
+            .iter()
+            .any(|o| o.dedup_key.contains("turn/completed"))
+        {
+            saw_completed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw_completed, "turn completion observed");
+    peer.abort();
+}
+
 /// Oversize frames close the transport instead of parsing partial events.
 #[tokio::test]
 async fn oversize_frame_closes_transport() {

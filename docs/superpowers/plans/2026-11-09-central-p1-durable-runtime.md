@@ -73,7 +73,7 @@
 ## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
 
 Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`,
-3 file sửa chưa commit). Các checkbox gốc giữ nguyên lịch sử; dưới đây là
+committed as `12e0217`). Các checkbox gốc giữ nguyên lịch sử; dưới đây là
 trạng thái mới, chỉ tick những gì phiên này chứng minh trực tiếp.
 
 - [x] Suite xác định xanh trên Linux: `plan_lifecycle` 11,

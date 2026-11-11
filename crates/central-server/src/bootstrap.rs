@@ -91,14 +91,16 @@ fn select_gateway(state_dir: &Path) -> (Arc<dyn AgentGateway>, &'static str) {
         surveyed_models: surveyed,
         ..central_infrastructure::codex::CodexConfig::default()
     };
-    let supervisor: Arc<dyn central_application::ports::ProcessSupervisor> =
-        Arc::new(central_infrastructure::process::OwnedProcessSupervisor::new());
-    (
-        Arc::new(central_infrastructure::codex::CodexGateway::new(
-            supervisor, config,
-        )),
-        "codex gateway configured",
+    // One owned supervisor plays both roles: process ownership/kill and
+    // the piped stdio the RPC attach rides on. Same process, same
+    // identity-checked kill path either way.
+    let supervisor = Arc::new(central_infrastructure::process::OwnedProcessSupervisor::new());
+    let gateway = central_infrastructure::codex::CodexGateway::new(
+        supervisor.clone() as Arc<dyn central_application::ports::ProcessSupervisor>,
+        config,
     )
+    .with_piped(supervisor as Arc<dyn central_infrastructure::process::PipedSpawner>);
+    (Arc::new(gateway), "codex gateway configured")
 }
 
 fn find_on_path(binary: &str) -> Option<PathBuf> {

@@ -1,0 +1,23 @@
+{
+  "name": "central-codex-adapter",
+  "cliVersion": "0.167.1",
+  "cliVersionAllowlist": ["0.167.0-alpha.3.2", "0.167.1"],
+  "transport": "stdio JSONL (JSON-RPC 2.0, one frame per line)",
+  "frameCapBytes": 8388608,
+  "notificationBufferCapacity": 256,
+  "allowProviderModelFallback": false,
+  "schemaProvenance": {
+    "generatedFromLiveCli": true,
+    "reason": "Verified live on 2026-11-11 against installed codex-cli 0.167.1 (Linux x86_64): raw JSON-RPC over app-server stdio on fixture-owned scratch — initialize, thread/start (observed model gpt-6-luna, effort low), turn/start plus turn/completed with result items. Full generate-json-schema capture (47 top-level + 423 v2 files) taken read-only the same day; subset below distills the wire surface Central uses.",
+    "schemaSource": "codex app-server generate-json-schema --experimental (captured 2026-11-11, kept outside the repo)",
+    "transcriptSource": "live probe sessions 2026-11-11 (ephemeral threads, fixture scratch only; transcripts observed in-session, not stored)",
+    "observedUserAgent": "0.167.1"
+  },
+  "policies": {
+    "timeoutAfterWrite": "OutcomeUnknown, never resend turn/start",
+    "oversizeFrame": "close transport, require reconciliation, never parse partial event",
+    "secretHandling": "logs and request errors redact token/secret/authorization material; no tokens or env in durable outbox",
+    "modelMismatch": "requested/observed model mismatch is a capability error, never silent fallback",
+    "usageSource": "usage is harvested from thread/tokenUsage/updated notifications, not from turn/completed (which carries no usage field)"
+  }
+}

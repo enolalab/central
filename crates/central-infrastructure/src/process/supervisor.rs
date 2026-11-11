@@ -28,6 +28,7 @@ use central_domain::Timestamp;
 
 use super::windows_job::{self, JobObject};
 
+pub use super::piped::{PipedSpawner, PipedStdio};
 pub use super::windows_job::{current_process_in_job, JobError, JobPlacement};
 
 /// Outcome of an identity-checked termination. `kill_count` is 1 only when
@@ -171,6 +172,144 @@ impl OwnedProcessSupervisor {
             .len())
     }
 
+    /// Shared spawn core: `piped` selects null stdio (fire-and-forget
+    /// helpers) or owned stdin/stdout pipes (RPC attach). Everything else —
+    /// kernel creation time, job containment, the supervised record — is
+    /// identical, so a piped child is killed exactly like a null-stdio one.
+    async fn spawn_with_stdio(
+        &self,
+        spec: &ProcessSpec,
+        piped: bool,
+    ) -> Result<
+        (
+            ProcessIdentity,
+            Option<(std::process::ChildStdin, std::process::ChildStdout)>,
+        ),
+        AppError,
+    > {
+        let mut command = Command::new(&spec.program);
+        command.args(&spec.args);
+        if piped {
+            // Owned pipes for RPC: the gateway consumes both ends, so a
+            // full buffer can never park the child. Stderr stays null.
+            command
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+        } else {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+        if let Some(dir) = spec.working_dir.as_ref() {
+            command.current_dir(dir);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // No console window for owned agent processes.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.spawn().map_err(|error| {
+            AppError::Transport(format!("spawn '{}' failed: {error}", spec.program))
+        })?;
+        let pipes = if piped {
+            let stdin = child.stdin.take().ok_or_else(|| {
+                AppError::Transport(format!(
+                    "spawn '{}' did not yield a piped stdin",
+                    spec.program
+                ))
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| {
+                AppError::Transport(format!(
+                    "spawn '{}' did not yield a piped stdout",
+                    spec.program
+                ))
+            })?;
+            Some((stdin, stdout))
+        } else {
+            None
+        };
+        let pid = child.id();
+        // The kernel creation time, never the wall clock on platforms where
+        // the stamp is load-bearing: a later liveness check compares it
+        // against live kernel truth, and a substituted clock would mismatch
+        // there — failing closed on every later terminate and leaking an
+        // unterminable record. Retry once for a transient query failure; a
+        // second failure fails the spawn loudly and reaps the child through
+        // its own handle, so no unidentifiable process is ever supervised or
+        // orphaned, and nothing is recorded.
+        let created_at_ms = match (self.creation_time)(pid) {
+            Ok(stamp) => stamp,
+            Err(first) => match (self.creation_time)(pid) {
+                Ok(stamp) => stamp,
+                Err(second) => {
+                    child.kill().ok();
+                    for _ in 0..100 {
+                        match child.try_wait() {
+                            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                            _ => break,
+                        }
+                    }
+                    return Err(AppError::Transport(format!(
+                        "cannot read kernel creation time of spawned pid {pid} \
+                         ({first}; retry: {second}); refusing to supervise an \
+                         unidentifiable process"
+                    )));
+                }
+            },
+        };
+        let ownership_id = Uuid::new_v4().to_string();
+        // Contain first, before the child can fork away from the job. When
+        // assignment fails (nested job, platform without jobs) the child
+        // stays supervised by handle only, and the per-process outcome is
+        // stored on the record — never swallowed — so `placement_of` reports
+        // it honestly even when the construction-time `placement()` probe
+        // still says `Enforced`.
+        let (job, per_process) = match (self.create_job)() {
+            Ok(job) => match (self.assign)(&job, pid) {
+                Ok(()) => (Some(job), JobPlacement::Enforced),
+                Err(error) => (
+                    None,
+                    JobPlacement::InstructionOnly(format!(
+                        "job assignment failed for pid {pid} ({error}); process is \
+                         supervised by handle only and its tree may outlive the supervisor"
+                    )),
+                ),
+            },
+            Err(error) => (
+                None,
+                JobPlacement::InstructionOnly(format!(
+                    "kill-on-close job unavailable ({error}); process is supervised by \
+                     handle only and its tree may outlive the supervisor"
+                )),
+            ),
+        };
+        let identity = ProcessIdentity {
+            pid,
+            created_at: Timestamp::from_millis(created_at_ms),
+            ownership_id: ownership_id.clone(),
+        };
+        self.state
+            .lock()
+            .map_err(|_| AppError::Storage("supervisor lock poisoned".to_string()))?
+            .children
+            .insert(
+                ownership_id,
+                SupervisedChild {
+                    pid,
+                    created_at_ms,
+                    child,
+                    job,
+                    placement: per_process,
+                    exited: None,
+                },
+            );
+        Ok((identity, pipes))
+    }
+
     /// Identity-checked termination with an observable kill count.
     pub async fn terminate_detailed(
         &self,
@@ -301,104 +440,8 @@ fn default_creation_time(pid: u32) -> Result<i64, JobError> {
 #[async_trait]
 impl ProcessSupervisor for OwnedProcessSupervisor {
     async fn spawn(&self, spec: &ProcessSpec) -> Result<ProcessIdentity, AppError> {
-        let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        if let Some(dir) = spec.working_dir.as_ref() {
-            command.current_dir(dir);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            // No console window for owned agent processes. Stdio stays null:
-            // the T2 contract carries no pipe handles, so buffered output
-            // could block the child; the stdio attach arrives with the RPC
-            // wiring that consumes it.
-            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-            command.creation_flags(CREATE_NO_WINDOW);
-        }
-        let mut child = command.spawn().map_err(|error| {
-            AppError::Transport(format!("spawn '{}' failed: {error}", spec.program))
-        })?;
-        let pid = child.id();
-        // The kernel creation time, never the wall clock on platforms where
-        // the stamp is load-bearing: a later liveness check compares it
-        // against live kernel truth, and a substituted clock would mismatch
-        // there — failing closed on every later terminate and leaking an
-        // unterminable record. Retry once for a transient query failure; a
-        // second failure fails the spawn loudly and reaps the child through
-        // its own handle, so no unidentifiable process is ever supervised or
-        // orphaned, and nothing is recorded.
-        let created_at_ms = match (self.creation_time)(pid) {
-            Ok(stamp) => stamp,
-            Err(first) => match (self.creation_time)(pid) {
-                Ok(stamp) => stamp,
-                Err(second) => {
-                    child.kill().ok();
-                    for _ in 0..100 {
-                        match child.try_wait() {
-                            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
-                            _ => break,
-                        }
-                    }
-                    return Err(AppError::Transport(format!(
-                        "cannot read kernel creation time of spawned pid {pid} \
-                         ({first}; retry: {second}); refusing to supervise an \
-                         unidentifiable process"
-                    )));
-                }
-            },
-        };
-        let ownership_id = Uuid::new_v4().to_string();
-        // Contain first, before the child can fork away from the job. When
-        // assignment fails (nested job, platform without jobs) the child
-        // stays supervised by handle only, and the per-process outcome is
-        // stored on the record — never swallowed — so `placement_of` reports
-        // it honestly even when the construction-time `placement()` probe
-        // still says `Enforced`.
-        let (job, per_process) = match (self.create_job)() {
-            Ok(job) => match (self.assign)(&job, pid) {
-                Ok(()) => (Some(job), JobPlacement::Enforced),
-                Err(error) => (
-                    None,
-                    JobPlacement::InstructionOnly(format!(
-                        "job assignment failed for pid {pid} ({error}); process is \
-                         supervised by handle only and its tree may outlive the supervisor"
-                    )),
-                ),
-            },
-            Err(error) => (
-                None,
-                JobPlacement::InstructionOnly(format!(
-                    "kill-on-close job unavailable ({error}); process is supervised by \
-                     handle only and its tree may outlive the supervisor"
-                )),
-            ),
-        };
-        let identity = ProcessIdentity {
-            pid,
-            created_at: Timestamp::from_millis(created_at_ms),
-            ownership_id: ownership_id.clone(),
-        };
-        self.state
-            .lock()
-            .map_err(|_| AppError::Storage("supervisor lock poisoned".to_string()))?
-            .children
-            .insert(
-                ownership_id,
-                SupervisedChild {
-                    pid,
-                    created_at_ms,
-                    child,
-                    job,
-                    placement: per_process,
-                    exited: None,
-                },
-            );
-        Ok(identity)
+        // Null stdio: fire-and-forget helpers nobody reads from.
+        Ok(self.spawn_with_stdio(spec, false).await?.0)
     }
 
     async fn inspect(&self, identity: &ProcessIdentity) -> Result<ProcessState, AppError> {
@@ -448,5 +491,43 @@ impl ProcessSupervisor for OwnedProcessSupervisor {
         // Refusals and already-exited are honest non-errors: nothing was
         // killed, and that is the safe outcome.
         self.terminate_detailed(identity).await.map(|_| ())
+    }
+}
+
+#[async_trait]
+impl PipedSpawner for OwnedProcessSupervisor {
+    async fn spawn_piped(
+        &self,
+        spec: &ProcessSpec,
+    ) -> Result<(ProcessIdentity, PipedStdio), AppError> {
+        let (identity, pipes) = self.spawn_with_stdio(spec, true).await?;
+        let (stdin, stdout) = pipes.expect("piped spawn always yields pipes");
+        let stdin = match tokio::process::ChildStdin::from_std(stdin) {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                // The child is already supervised; never orphan it on a
+                // conversion failure — terminate through the owned handle.
+                let _ = self.terminate_detailed(&identity).await;
+                return Err(AppError::Transport(format!(
+                    "cannot adopt piped stdin: {error}"
+                )));
+            }
+        };
+        let stdout = match tokio::process::ChildStdout::from_std(stdout) {
+            Ok(pipe) => pipe,
+            Err(error) => {
+                let _ = self.terminate_detailed(&identity).await;
+                return Err(AppError::Transport(format!(
+                    "cannot adopt piped stdout: {error}"
+                )));
+            }
+        };
+        Ok((
+            identity,
+            PipedStdio {
+                stdin: Box::new(stdin),
+                stdout: Box::new(stdout),
+            },
+        ))
     }
 }

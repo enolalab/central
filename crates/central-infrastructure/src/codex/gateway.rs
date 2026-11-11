@@ -10,7 +10,10 @@
 //! events. Anything not yet attached reports honestly instead of pretending.
 
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use central_application::contracts::{
@@ -19,12 +22,17 @@ use central_application::contracts::{
     SessionRef, TurnRef,
 };
 use central_application::ports::{AgentGateway, ProcessSupervisor};
-use central_domain::{AnswerPayload, AttemptId, AttemptStatus, Observation, ResolvedProfile};
+use central_domain::{
+    canonical_key, AnswerPayload, AttemptId, AttemptStatus, InboxKind, Observation, ResolvedProfile,
+};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+
+use crate::process::PipedSpawner;
 
 use super::requests::{normalize_request, observation_for, PendingRequestTable};
-use super::stdio::EventBuffer;
+use super::stdio::{BufferedEvent, EventBuffer, IncomingEvent, RpcClient};
 use super::version::{check_model_match, check_supported_version, parse_cli_version, VersionError};
-use super::wire::{parse_frame, sanitize_text, IncomingFrame, FRAME_CAP_BYTES};
+use super::wire::{parse_frame, sanitize_text, IncomingFrame, RpcId, FRAME_CAP_BYTES};
 
 /// Static configuration for one gateway instance.
 #[derive(Clone, Debug)]
@@ -73,12 +81,71 @@ impl Default for CodexConfig {
     }
 }
 
+/// Owned stdio halves of one supervised app-server child, joined into a
+/// single bidirectional stream for [`RpcClient`].
+struct ChildStdio {
+    stdin: Box<dyn AsyncWrite + Send + Unpin>,
+    stdout: Box<dyn AsyncRead + Send + Unpin>,
+}
+
+impl AsyncRead for ChildStdio {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ChildStdio {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_shutdown(cx)
+    }
+}
+
+/// Live RPC attachment of one session: the client plus handshake/thread
+/// state. Taken out of the session mutex for every blocking call so a
+/// long turn wait never holds a lock across an await.
+struct AttachedTransport {
+    client: RpcClient<ChildStdio>,
+    initialized: bool,
+    server_thread: Option<String>,
+}
+
+/// Wire route back to one server request: the JSON-RPC id to answer plus
+/// the original params (question ids live there). Memory-only, never
+/// persisted; dropped with the session.
+struct WireRoute {
+    id: RpcId,
+    kind: InboxKind,
+    params: serde_json::Value,
+}
+
 /// One live session: the correlation reference plus the owned process that
 /// backs it. The process is supervised (job-contained, identity-checked),
-/// so cancelling the session provably ends the process tree.
+/// so cancelling the session provably ends the process tree. When the
+/// gateway was built with a [`PipedSpawner`], the session additionally
+/// owns the stdio pipes the RPC attach rides on.
 struct ManagedSession {
     session: SessionRef,
     identity: ProcessIdentity,
+    profile: ResolvedProfile,
+    workspace: String,
+    resume_from: Option<SessionRef>,
+    io: Mutex<Option<AttachedTransport>>,
 }
 
 struct GatewayState {
@@ -90,6 +157,8 @@ struct GatewayState {
     /// durable inbox (persist-before-notice); answers route through this
     /// table with a Once scope.
     requests: PendingRequestTable,
+    /// Wire routes for drained requests, keyed by canonical request key.
+    wire_routes: HashMap<String, WireRoute>,
 }
 
 /// Codex app-server adapter. One instance per supervised process; the
@@ -97,6 +166,7 @@ struct GatewayState {
 /// never cross a process boundary (no accept replay after restart).
 pub struct CodexGateway {
     supervisor: Arc<dyn ProcessSupervisor>,
+    piped: Option<Arc<dyn PipedSpawner>>,
     config: CodexConfig,
     epoch: String,
     state: Mutex<GatewayState>,
@@ -106,6 +176,7 @@ impl CodexGateway {
     pub fn new(supervisor: Arc<dyn ProcessSupervisor>, config: CodexConfig) -> Self {
         Self {
             supervisor,
+            piped: None,
             epoch: uuid::Uuid::new_v4().to_string(),
             state: Mutex::new(GatewayState {
                 buffer: EventBuffer::new(config.notification_capacity),
@@ -113,9 +184,17 @@ impl CodexGateway {
                 closed_reason: None,
                 sessions: HashMap::new(),
                 requests: PendingRequestTable::new(),
+                wire_routes: HashMap::new(),
             }),
             config,
         }
+    }
+
+    /// Attach owned stdio pipes for RPC: without this, `open` supervises
+    /// the process but carries no transport and `send` refuses loudly.
+    pub fn with_piped(mut self, piped: Arc<dyn PipedSpawner>) -> Self {
+        self.piped = Some(piped);
+        self
     }
 
     /// The process supervisor this gateway will spawn through (T2 wiring).
@@ -220,6 +299,346 @@ impl CodexGateway {
         }
         Ok(())
     }
+
+    /// Take the RPC attachment out of a session for one blocking call. The
+    /// mutex is only held for the take: no lock is ever held across an
+    /// await. A missing attachment means the session was opened without a
+    /// piped spawner (supervision only) or another call holds it — either
+    /// way sending refuses loudly instead of writing nowhere.
+    fn take_transport(
+        &self,
+        session: &SessionRef,
+        attempt: AttemptId,
+    ) -> Result<TakenSession, DispatchError> {
+        let state = self.state.lock().expect("gateway state");
+        let managed = state.sessions.get(&attempt).ok_or_else(|| {
+            DispatchError::Rejected(format!("no live session for attempt {attempt}"))
+        })?;
+        if managed.session.thread_id != session.thread_id
+            || managed.session.instance_epoch != session.instance_epoch
+        {
+            return Err(DispatchError::Rejected(
+                "session reference does not match the live session".to_string(),
+            ));
+        }
+        let attached = managed
+            .io
+            .lock()
+            .expect("session io")
+            .take()
+            .ok_or_else(|| {
+                DispatchError::Rejected(
+                    "no attached stdio transport for this session (supervision only, \
+                     or another call holds it); refusing instead of writing nowhere"
+                        .to_string(),
+                )
+            })?;
+        Ok(TakenSession {
+            attempt_id: attempt,
+            local: managed.session.clone(),
+            profile: managed.profile.clone(),
+            workspace: managed.workspace.clone(),
+            resume_from: managed.resume_from.clone(),
+            attached,
+        })
+    }
+
+    /// Give the attachment back unless cancel removed the session meanwhile.
+    fn restore_transport(&self, taken: TakenSession) {
+        let state = self.state.lock().expect("gateway state");
+        let live = state
+            .sessions
+            .get(&taken.attempt_id)
+            .is_some_and(|managed| {
+                managed.session.thread_id == taken.local.thread_id
+                    && managed.session.instance_epoch == taken.local.instance_epoch
+            });
+        if live {
+            if let Some(managed) = state.sessions.get(&taken.attempt_id) {
+                *managed.io.lock().expect("session io") = Some(taken.attached);
+            }
+        }
+        // Otherwise the session is gone: the transport drops here with the
+        // dead process instead of being resurrected behind cancel.
+    }
+
+    /// Move newly arrived frames into the bounded buffer plus the request
+    /// table. Stops at the first quiet window; a closed transport latches
+    /// reconcile-required instead of losing events silently.
+    async fn pump(&self, client: &mut RpcClient<ChildStdio>) {
+        loop {
+            match client.poll_event(Duration::from_millis(50)).await {
+                Ok(IncomingEvent::Request { id, method, params }) => {
+                    let event = BufferedEvent {
+                        id: Some(id.clone()),
+                        method: method.clone(),
+                        params: params.clone(),
+                        is_request: true,
+                    };
+                    let mut state = self.state.lock().expect("gateway state");
+                    if let Some(normalized) = normalize_request(&self.epoch, &event) {
+                        let key = &normalized.key;
+                        let canonical = canonical_key(
+                            &key.session.provider,
+                            &key.session.instance_epoch,
+                            &key.session.thread_id,
+                            &key.turn_id,
+                            &key.item_id,
+                            &key.request_id,
+                        );
+                        state.wire_routes.insert(
+                            canonical,
+                            WireRoute {
+                                id,
+                                kind: normalized.kind,
+                                params,
+                            },
+                        );
+                        state.requests.record(normalized);
+                    }
+                    state.buffer.push(event);
+                }
+                Ok(IncomingEvent::Notification { method, params }) => {
+                    let mut state = self.state.lock().expect("gateway state");
+                    state.buffer.push(BufferedEvent {
+                        id: None,
+                        method,
+                        params,
+                        is_request: false,
+                    });
+                }
+                Err(super::wire::RpcError::Timeout(_)) => break,
+                Err(error) => {
+                    let mut state = self.state.lock().expect("gateway state");
+                    state.closed = true;
+                    state.closed_reason = Some(sanitize_text(&error.to_string()).into_owned());
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Drive the wire for one session, then hand the attachment back. Used
+    /// by `observe` (and after every `send`) so arrivals never sit in the
+    /// OS pipe while Central reports nothing. Best-effort: a missing or
+    /// busy transport simply skips the pump.
+    async fn pump_for(&self, session: &SessionRef, attempt: Option<AttemptId>) {
+        let taken = (|| {
+            let state = self.state.lock().expect("gateway state");
+            let (attempt_id, managed) =
+                match attempt.and_then(|id| state.sessions.get(&id).map(|managed| (id, managed))) {
+                    Some(found) => found,
+                    None => state
+                        .sessions
+                        .iter()
+                        .find(|(_, managed)| {
+                            managed.session.thread_id == session.thread_id
+                                && managed.session.instance_epoch == session.instance_epoch
+                        })
+                        .map(|(id, managed)| (*id, managed))?,
+                };
+            if managed.session.thread_id != session.thread_id
+                || managed.session.instance_epoch != session.instance_epoch
+            {
+                return None;
+            }
+            let attached = managed.io.lock().expect("session io").take()?;
+            Some(TakenSession {
+                attempt_id,
+                local: managed.session.clone(),
+                profile: managed.profile.clone(),
+                workspace: managed.workspace.clone(),
+                resume_from: managed.resume_from.clone(),
+                attached,
+            })
+        })();
+        if let Some(mut taken) = taken {
+            self.pump(&mut taken.attached.client).await;
+            self.restore_transport(taken);
+        }
+    }
+
+    /// `initialize` handshake once per attachment. A timeout after the
+    /// write is OutcomeUnknown (the server may yet answer); anything else
+    /// refuses without starting any thread or turn.
+    async fn ensure_initialized(
+        &self,
+        attached: &mut AttachedTransport,
+        timeout: Duration,
+    ) -> Result<(), DispatchError> {
+        if attached.initialized {
+            return Ok(());
+        }
+        let result = attached
+            .client
+            .request(
+                "initialize",
+                serde_json::json!({
+                    "clientInfo": {
+                        "name": "central",
+                        "title": "Central",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": { "experimentalApi": true },
+                }),
+                timeout,
+            )
+            .await
+            .map_err(Self::into_dispatch)?;
+        if !result.is_object() {
+            return Err(DispatchError::Rejected(
+                "initialize did not return a result object; refusing an unvalidated server"
+                    .to_string(),
+            ));
+        }
+        attached
+            .client
+            .notify("initialized", serde_json::json!({}))
+            .await
+            .map_err(Self::into_dispatch)?;
+        attached.initialized = true;
+        Ok(())
+    }
+
+    /// Bind the server thread once per attachment: resume the handover
+    /// thread when one was supplied, else start a fresh one on the
+    /// attempt's frozen profile. The observed model and server CLI build
+    /// must match what was requested and allowlisted — mismatch is a
+    /// capability error, never a silent fallback.
+    async fn ensure_thread(
+        &self,
+        taken: &mut TakenSession,
+        timeout: Duration,
+    ) -> Result<String, DispatchError> {
+        if let Some(thread) = taken.attached.server_thread.clone() {
+            return Ok(thread);
+        }
+        let client = &mut taken.attached.client;
+        let thread_id = if let Some(resume) = &taken.resume_from {
+            let result = client
+                .request(
+                    "thread/resume",
+                    serde_json::json!({ "threadId": resume.thread_id }),
+                    timeout,
+                )
+                .await
+                .map_err(Self::into_dispatch)?;
+            let id = result["thread"]["id"].as_str().ok_or_else(|| {
+                DispatchError::Rejected("thread/resume did not return a thread id".to_string())
+            })?;
+            if let Some(observed) = result.get("model").and_then(|m| m.as_str()) {
+                self.verify_model_match(&taken.profile.model, observed)
+                    .map_err(|error| DispatchError::Rejected(error.to_string()))?;
+            }
+            id.to_string()
+        } else {
+            let result = client
+                .request(
+                    "thread/start",
+                    serde_json::json!({
+                        "model": taken.profile.model,
+                        "cwd": taken.workspace,
+                        "sandbox": "workspace-write",
+                        "approvalPolicy": "on-request",
+                        "ephemeral": false,
+                        "allowProviderModelFallback": false,
+                        "config": { "model_reasoning_effort": taken.profile.effort },
+                    }),
+                    timeout,
+                )
+                .await
+                .map_err(Self::into_dispatch)?;
+            let observed = result["model"].as_str().ok_or_else(|| {
+                DispatchError::Rejected(
+                    "thread/start did not report the resolved model; refusing to run blind"
+                        .to_string(),
+                )
+            })?;
+            self.verify_model_match(&taken.profile.model, observed)
+                .map_err(|error| DispatchError::Rejected(error.to_string()))?;
+            if let Some(cli) = result["thread"]["cliVersion"].as_str() {
+                if cli != self.config.cli_version {
+                    return Err(DispatchError::Rejected(format!(
+                        "server CLI build '{cli}' does not match the allowlisted '{}'; \
+                         refusing an unvalidated protocol",
+                        self.config.cli_version,
+                    )));
+                }
+            }
+            result["thread"]["id"]
+                .as_str()
+                .ok_or_else(|| {
+                    DispatchError::Rejected("thread/start did not return a thread id".to_string())
+                })?
+                .to_string()
+        };
+        taken.attached.server_thread = Some(thread_id.clone());
+        Ok(thread_id)
+    }
+
+    /// One turn on the bound server thread, then pump arrivals into the
+    /// buffer. A timeout after the write is OutcomeUnknown: the turn may
+    /// still run server-side, so it is never resent.
+    async fn send_via(
+        &self,
+        taken: &mut TakenSession,
+        request: &SendTurn,
+        timeout: Duration,
+    ) -> Result<TurnRef, DispatchError> {
+        self.ensure_initialized(&mut taken.attached, timeout)
+            .await?;
+        let server_thread = self.ensure_thread(taken, timeout).await?;
+        let result = taken
+            .attached
+            .client
+            .request(
+                "turn/start",
+                serde_json::json!({
+                    "threadId": server_thread,
+                    "effort": taken.profile.effort,
+                    "input": [{ "type": "text", "text": request.input, "text_elements": [] }],
+                }),
+                timeout,
+            )
+            .await
+            .map_err(Self::into_dispatch)?;
+        let turn_id = result["turn"]["id"].as_str().ok_or_else(|| {
+            DispatchError::Rejected("turn/start did not return a turn id".to_string())
+        })?;
+        self.pump(&mut taken.attached.client).await;
+        Ok(TurnRef {
+            session: request.session.clone(),
+            turn_id: turn_id.to_string(),
+        })
+    }
+
+    fn into_dispatch(error: super::wire::RpcError) -> DispatchError {
+        use super::wire::RpcError as Wire;
+        match error {
+            Wire::OutcomeUnknown(message) | Wire::Closed(message) | Wire::Io(message) => {
+                DispatchError::OutcomeUnknown(message)
+            }
+            Wire::Rejected(message) | Wire::Protocol(message) | Wire::Timeout(message) => {
+                DispatchError::Rejected(message)
+            }
+            Wire::Oversize { len } => DispatchError::Rejected(format!(
+                "frame of {len} bytes exceeds the {FRAME_CAP_BYTES}-byte cap; \
+                 transport closed, reconcile before retrying"
+            )),
+        }
+    }
+}
+
+/// Session plus frozen dispatch inputs carried across a blocking gateway
+/// call. The transport inside is owned by the caller for the duration —
+/// never shared, never held across a lock.
+struct TakenSession {
+    attempt_id: AttemptId,
+    local: SessionRef,
+    profile: ResolvedProfile,
+    workspace: String,
+    resume_from: Option<SessionRef>,
+    attached: AttachedTransport,
 }
 
 fn into_capability(error: VersionError) -> AppError {
@@ -257,25 +676,50 @@ impl AgentGateway for CodexGateway {
 
     async fn open(&self, request: OpenSession) -> Result<SessionRef, AppError> {
         self.ensure_compatible()?;
-        // Spawn the app-server as an owned, job-contained process through
-        // the real supervisor. Stdio RPC attach rides on top of this in a
-        // later task; the session is correlation-bound to the process from
-        // birth so cancel/reconcile already operate on the right tree.
-        let identity = self
-            .supervisor
-            .spawn(&ProcessSpec {
-                program: self.config.binary.clone(),
-                args: self.config.app_server_args.clone(),
-                working_dir: None,
-            })
-            .await
-            .map_err(|error| match error {
-                AppError::Transport(message) => AppError::Transport(format!(
-                    "cannot spawn app-server '{}': {message}",
-                    self.config.binary
-                )),
-                other => other,
-            })?;
+        let spec = ProcessSpec {
+            program: self.config.binary.clone(),
+            args: self.config.app_server_args.clone(),
+            working_dir: None,
+        };
+        // Prefer owned pipes: the session is correlation-bound to the
+        // process from birth either way, but only the piped attach can
+        // later speak RPC. Without a piped spawner (unit tests, legacy
+        // callers) supervision alone still works and `send` refuses loudly.
+        let (identity, io) = if let Some(piped) = &self.piped {
+            let (identity, stdio) =
+                piped
+                    .spawn_piped(&spec)
+                    .await
+                    .map_err(|error| match error {
+                        AppError::Transport(message) => AppError::Transport(format!(
+                            "cannot spawn piped app-server '{}': {message}",
+                            self.config.binary
+                        )),
+                        other => other,
+                    })?;
+            let transport = AttachedTransport {
+                client: RpcClient::new(ChildStdio {
+                    stdin: stdio.stdin,
+                    stdout: stdio.stdout,
+                }),
+                initialized: false,
+                server_thread: None,
+            };
+            (identity, Some(transport))
+        } else {
+            let identity = self
+                .supervisor
+                .spawn(&spec)
+                .await
+                .map_err(|error| match error {
+                    AppError::Transport(message) => AppError::Transport(format!(
+                        "cannot spawn app-server '{}': {message}",
+                        self.config.binary
+                    )),
+                    other => other,
+                })?;
+            (identity, None)
+        };
         let session = SessionRef {
             provider: "codex".to_string(),
             instance_epoch: self.epoch.clone(),
@@ -286,26 +730,34 @@ impl AgentGateway for CodexGateway {
             ManagedSession {
                 session: session.clone(),
                 identity,
+                profile: request.profile,
+                workspace: request.workspace,
+                resume_from: request.resume_from,
+                io: Mutex::new(io),
             },
         );
         Ok(session)
     }
 
-    async fn send(&self, _request: SendTurn) -> Result<TurnRef, DispatchError> {
+    async fn send(&self, request: SendTurn) -> Result<TurnRef, DispatchError> {
         if let Err(error) = self.ensure_compatible() {
             return Err(DispatchError::Rejected(error.to_string()));
         }
-        // Nothing was written, so this is DefinitelyNotSent, not
-        // OutcomeUnknown. The timeout-after-write path lives in RpcClient.
-        Err(DispatchError::DefinitelyNotSent(
-            "live stdio transport not attached (waits for P2/T2 supervisor); \
-             no turn was written"
-                .to_string(),
-        ))
+        let mut taken = self.take_transport(&request.session, request.attempt_id)?;
+        let timeout = Duration::from_millis(self.config.request_timeout_ms.max(1));
+        let outcome = self.send_via(&mut taken, &request, timeout).await;
+        // The transport goes back unless cancel won the race and removed
+        // the session underneath us — then it is dropped with the dead
+        // process instead of being resurrected.
+        self.restore_transport(taken);
+        outcome
     }
 
     async fn observe(&self, session: &SessionRef) -> Result<Vec<Observation>, AppError> {
         self.ensure_compatible()?;
+        // Drive the wire first so arrivals never sit in the OS pipe while
+        // Central reports nothing. Best-effort: no transport, no pump.
+        self.pump_for(session, None).await;
         let mut state = self.state.lock().expect("gateway state");
         if state.closed {
             return Err(AppError::Transport(format!(
@@ -326,16 +778,28 @@ impl AgentGateway for CodexGateway {
         // Bind buffered events to the attempt that owns this session. Events
         // for other threads stay buffered for their own session; events no
         // live session owns are reconcile-required evidence, never silent
-        // drops and never fabricated Observations.
-        let attempt_id = state
+        // drops and never fabricated Observations. Wire params carry the
+        // SERVER thread id once attached, so match that when bound —
+        // falling back to the local correlation id for sessions that
+        // never attached (tests, legacy).
+        let found = state
             .sessions
             .iter()
             .find(|(_, managed)| {
                 managed.session.thread_id == session.thread_id
                     && managed.session.instance_epoch == session.instance_epoch
             })
-            .map(|(attempt_id, _)| *attempt_id);
-        let Some(attempt_id) = attempt_id else {
+            .map(|(attempt_id, managed)| {
+                let want = managed
+                    .io
+                    .lock()
+                    .expect("session io")
+                    .as_ref()
+                    .and_then(|attached| attached.server_thread.clone())
+                    .unwrap_or_else(|| session.thread_id.clone());
+                (*attempt_id, want)
+            });
+        let Some((attempt_id, want)) = found else {
             let pending = state.buffer.len();
             return Err(AppError::Transport(format!(
                 "reconcile-required: {pending} unattributed notification(s) for an unknown \
@@ -352,7 +816,7 @@ impl AgentGateway for CodexGateway {
                 .or_else(|| event.params.get("thread_id"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            if thread == session.thread_id {
+            if thread == want {
                 matched.push(observation_for(&epoch, attempt_id, &event));
             } else {
                 rest.push(event);
@@ -420,13 +884,145 @@ impl AgentGateway for CodexGateway {
             }
         }
         // Once scope: the table refuses unknown, not-yet-persisted and
-        // already-answered keys instead of resending.
-        self.state
-            .lock()
-            .expect("gateway state")
-            .requests
-            .consume_answer(&answer.key)
-            .map_err(|error: AppError| DispatchError::Rejected(error.to_string()))
+        // already-answered keys instead of resending. The table is consumed
+        // first: a wire failure afterwards surfaces as OutcomeUnknown and
+        // the table blocks any re-answer, forcing the next server request
+        // cycle instead of a blind resend.
+        let route = {
+            let mut state = self.state.lock().expect("gateway state");
+            state
+                .requests
+                .consume_answer(&answer.key)
+                .map_err(|error: AppError| DispatchError::Rejected(error.to_string()))?;
+            let canonical = canonical_key(
+                &answer.key.session.provider,
+                &answer.key.session.instance_epoch,
+                &answer.key.session.thread_id,
+                &answer.key.turn_id,
+                &answer.key.item_id,
+                &answer.key.request_id,
+            );
+            state.wire_routes.remove(&canonical)
+        };
+        let Some(route) = route else {
+            // No live wire route (legacy/test traffic, or the connection
+            // dropped after the request arrived): the Once scope above is
+            // the whole guarantee, nothing to write.
+            return Ok(());
+        };
+        // Shape the wire answer strictly from the domain verdict: only the
+        // exact approved/declined forms map to a decision, and questions
+        // need their server-side ids. Anything else refuses instead of
+        // guessing — a guessed accept/cancel would be a fabricated approval.
+        let result = match route.kind {
+            InboxKind::Approval => match &answer.payload {
+                AnswerPayload::Plain(text) if text == "approved" => {
+                    serde_json::json!({ "decision": "accept" })
+                }
+                AnswerPayload::Plain(text) if text.starts_with("declined:") => {
+                    serde_json::json!({ "decision": "cancel" })
+                }
+                _ => {
+                    return Err(DispatchError::Rejected(
+                        "approval payload must be the domain approved/declined verdict; \
+                         refusing to guess a wire decision"
+                            .to_string(),
+                    ));
+                }
+            },
+            InboxKind::Question => match &answer.payload {
+                AnswerPayload::Plain(text) => {
+                    let questions = route.params.get("questions").and_then(|q| q.as_array());
+                    let mut answers = serde_json::Map::new();
+                    for question in questions.into_iter().flatten() {
+                        if let Some(id) = question.get("id").and_then(|v| v.as_str()) {
+                            answers
+                                .insert(id.to_string(), serde_json::json!({ "answers": [text] }));
+                        }
+                    }
+                    if answers.is_empty() {
+                        return Err(DispatchError::Rejected(
+                            "server question carries no question ids; cannot shape the answer"
+                                .to_string(),
+                        ));
+                    }
+                    serde_json::json!({ "answers": answers })
+                }
+                AnswerPayload::Secret(_) => {
+                    return Err(DispatchError::Rejected(
+                        "secret answers must be resolved to plain text by the caller".to_string(),
+                    ));
+                }
+            },
+        };
+        // Write through the owning session's transport: the key carries the
+        // server thread id, so find the session bound to it.
+        let mut taken = {
+            let state = self.state.lock().expect("gateway state");
+            let found = state
+                .sessions
+                .iter()
+                .find(|(_, managed)| {
+                    managed
+                        .io
+                        .lock()
+                        .expect("session io")
+                        .as_ref()
+                        .and_then(|attached| attached.server_thread.clone())
+                        .is_some_and(|server| server == answer.key.session.thread_id)
+                })
+                .map(|(attempt_id, managed)| (*attempt_id, managed.session.clone()));
+            match found {
+                Some((attempt_id, local)) => {
+                    let attached = state
+                        .sessions
+                        .get(&attempt_id)
+                        .and_then(|managed| managed.io.lock().expect("session io").take())
+                        .ok_or_else(|| {
+                            DispatchError::Rejected(
+                                "the owning session's transport is busy or gone; \
+                                 the Once scope already consumed this answer, so a fresh \
+                                 server request is required instead of a resend"
+                                    .to_string(),
+                            )
+                        })?;
+                    let managed = state.sessions.get(&attempt_id).expect("session live");
+                    TakenSession {
+                        attempt_id,
+                        local,
+                        profile: managed.profile.clone(),
+                        workspace: managed.workspace.clone(),
+                        resume_from: managed.resume_from.clone(),
+                        attached,
+                    }
+                }
+                None => {
+                    return Err(DispatchError::Rejected(
+                        "no live session owns this request's thread; the Once scope \
+                         already consumed the answer"
+                            .to_string(),
+                    ));
+                }
+            }
+        };
+        let outcome = taken.attached.client.respond(&route.id, result).await;
+        self.restore_transport(taken);
+        outcome.map_err(|error| match error {
+            super::wire::RpcError::OutcomeUnknown(_)
+            | super::wire::RpcError::Closed(_)
+            | super::wire::RpcError::Io(_) => {
+                // The write may or may not have landed — but the table
+                // already consumed this answer, so it can never be resent.
+                // Surface OutcomeUnknown so the dispatcher reconciles and
+                // waits for the harness to re-ask.
+                DispatchError::OutcomeUnknown(
+                    "answer write failed after the Once scope consumed it; \
+                     reconcile and wait for a fresh server request, never resend"
+                        .to_string(),
+                )
+            }
+            other => DispatchError::Rejected(other.to_string()),
+        })
     }
 
     async fn drain_requests(&self, session: &SessionRef) -> Result<Vec<ExternalRequest>, AppError> {
@@ -439,10 +1035,24 @@ impl AgentGateway for CodexGateway {
                 managed.session.thread_id == session.thread_id
                     && managed.session.instance_epoch == session.instance_epoch
             })
-            .map(|(attempt_id, _)| *attempt_id);
-        Ok(state
-            .requests
-            .drain_for_thread(&session.thread_id, attempt_id))
+            .map(|(attempt_id, managed)| {
+                // Normalized keys carry the server thread id once attached.
+                let want = managed
+                    .io
+                    .lock()
+                    .expect("session io")
+                    .as_ref()
+                    .and_then(|attached| attached.server_thread.clone())
+                    .unwrap_or_else(|| session.thread_id.clone());
+                (*attempt_id, want)
+            });
+        let (attempt_id, want) = match attempt_id {
+            Some((id, want)) => (Some(id), want),
+            // No live session: legacy behavior drains by the presented
+            // thread with no owning attempt.
+            None => (None, session.thread_id.clone()),
+        };
+        Ok(state.requests.drain_for_thread(&want, attempt_id))
     }
 
     async fn cancel(&self, target: &ExecutionRef) -> Result<CancelObservation, AppError> {
@@ -487,10 +1097,25 @@ impl AgentGateway for CodexGateway {
 
     async fn reconcile(&self, target: &ExecutionRef) -> Result<ReconcileEvidence, AppError> {
         self.ensure_compatible()?;
-        let identity = {
+        let (identity, transport_note) = {
             let state = self.state.lock().expect("gateway state");
             match state.sessions.get(&target.attempt_id) {
-                Some(managed) => managed.identity.clone(),
+                Some(managed) => {
+                    let note = managed
+                        .io
+                        .lock()
+                        .expect("session io")
+                        .as_ref()
+                        .map(|attached| {
+                            format!(
+                                "rpc attached (initialized={}, thread={})",
+                                attached.initialized,
+                                attached.server_thread.as_deref().unwrap_or("unbound")
+                            )
+                        })
+                        .unwrap_or_else(|| "supervision only, no RPC transport".to_string());
+                    (managed.identity.clone(), note)
+                }
                 None => {
                     return Ok(ReconcileEvidence {
                         attempt_id: target.attempt_id,
@@ -503,12 +1128,15 @@ impl AgentGateway for CodexGateway {
             }
         };
         let state = self.supervisor.inspect(&identity).await?;
+        // Outcome stays honest: without a completed-turn record Central
+        // cannot claim the turn finished. The note tells the reconciler
+        // what channel exists for a follow-up thread/read.
         Ok(ReconcileEvidence {
             attempt_id: target.attempt_id,
-            status: AttemptStatus::Reconciling,
+            status: AttemptStatus::UnknownOutcome,
             detail: format!(
-                "owned app-server process {} is {state:?}; reconcile against thread/read; \
-                 stdio RPC attach arrives after P2/T2",
+                "owned app-server process {} is {state:?} ({transport_note}); outcome \
+                 unknown, re-read thread state before reuse",
                 identity.pid
             ),
         })

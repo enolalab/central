@@ -1,0 +1,120 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Central Codex app-server protocol subset (0.167.1, live-verified)",
+  "description": "Wire surface used by Central P2/T2, verified live against codex-cli 0.167.1 on 2026-11-11 (initialize/thread-start/turn-start/turn-completed over stdio JSON-RPC on fixture scratch). New server notifications vs 0.167.0-alpha.3.2 are tolerated as opaque buffered events, never parsed into domain facts.",
+  "provenance": {
+    "cliVersion": "0.167.1",
+    "schemaSource": "codex app-server generate-json-schema --experimental (captured 2026-11-11)",
+    "generatedFromLiveCli": true,
+    "observedUserAgent": "0.167.1"
+  },
+  "envelope": {
+    "transport": "JSONL over stdio (one JSON-RPC 2.0 frame per line, UTF-8, LF terminated)",
+    "frameCapBytes": 8388608,
+    "id": "client request ids are numbers; server request ids observed as numbers",
+    "request": { "id": "number|string", "method": "string", "params": "object" },
+    "response": { "id": "number|string", "result": "any, error absent": null },
+    "errorResponse": { "id": "number|string|null", "error": { "code": "integer", "message": "string" } },
+    "serverRequest": { "id": "number", "method": "string", "params": "object" },
+    "notification": { "method": "string", "params": "object", "id": "absent" }
+  },
+  "clientMethods": {
+    "initialize": {
+      "params": {
+        "clientInfo": { "name": "string", "title": "string", "version": "string" },
+        "capabilities": { "experimentalApi": true }
+      },
+      "result": {
+        "userAgent": "string (contains CLI version; observed 0.167.1)",
+        "codexHome": "string (REDACTED in fixtures)",
+        "platformFamily": "string",
+        "platformOs": "string"
+      },
+      "source": "live probe 2026-11-11: result keys exactly [codexHome, platformFamily, platformOs, userAgent]"
+    },
+    "initialized": {
+      "params": {},
+      "source": "live probe 2026-11-11: accepted, no response"
+    },
+    "thread/start": {
+      "params": {
+        "model": "string (requested model, e.g. gpt-6-luna)",
+        "cwd": "string",
+        "sandbox": ["read-only", "workspace-write", "danger-full-access"],
+        "approvalPolicy": ["untrusted", "on-request", "never"],
+        "approvalsReviewer": ["user", "auto_review", "guardian_subagent"],
+        "ephemeral": "boolean",
+        "experimentalRawEvents": "boolean",
+        "allowProviderModelFallback": false,
+        "config": { "model_reasoning_effort": "string" }
+      },
+      "result": {
+        "thread": { "id": "string (UUID)", "model": "string (OBSERVED model)", "modelProvider": "string" },
+        "model": "string (OBSERVE: requested/observed mismatch is a capability error)"
+      },
+      "source": "live probe 2026-11-11: observed model gpt-6-luna, reasoningEffort low, sandbox workspaceWrite honored"
+    },
+    "thread/resume": {
+      "params": { "threadId": "string (UUID)", "excludeTurns": "boolean" },
+      "result": { "thread": { "id": "string (UUID)" }, "model": "string" },
+      "source": "schema v2 ThreadResumeParams/Response (not live-exercised; resume stays best-effort)"
+    },
+    "thread/read": {
+      "params": { "threadId": "string (UUID)", "includeTurns": "boolean" },
+      "result": { "thread": { "id": "string (UUID)" }, "readState": "object" },
+      "source": "schema v2 ThreadReadParams/Response (reconcile evidence, best-effort)"
+    },
+    "turn/start": {
+      "params": {
+        "threadId": "string (UUID)",
+        "effort": "string",
+        "input": [{ "type": "text", "text": "string", "text_elements": "array" }]
+      },
+      "result": { "turn": { "id": "string (UUID)", "status": "inProgress|completed" } },
+      "source": "live probe 2026-11-11: immediate inProgress response; completion arrives as turn/completed notification with full result items"
+    }
+  },
+  "serverRequests": {
+    "item/commandExecution/requestApproval": {
+      "params": {
+        "kind": "command",
+        "threadId": "string (UUID)",
+        "turnId": "string (UUID)",
+        "itemId": "string",
+        "command": "string (REDACTED preview)",
+        "cwd": "string (REDACTED)",
+        "availableDecisions": ["accept", "cancel"]
+      },
+      "answer": { "decision": ["accept", "cancel"] },
+      "source": "still present in 0.167.1 ServerRequest.json; NOT live-exercised (model never requested approval in probes)"
+    },
+    "item/tool/requestUserInput": {
+      "params": {
+        "threadId": "string",
+        "turnId": "string",
+        "itemId": "string",
+        "questions": [{ "id": "string", "header": "string", "question": "string", "isSecret": "boolean", "options": [{ "label": "string" }] }],
+        "isBlocking": "boolean"
+      },
+      "answer": { "answers": "object" },
+      "source": "still present in 0.167.1 schemas; NOT live-exercised"
+    }
+  },
+  "serverNotifications": {
+    "thread/started": { "params": { "thread": { "id": "string (UUID)" } } },
+    "thread/status/changed": { "params": { "threadId": "string", "status": { "type": "idle|active" } } },
+    "turn/started": { "params": { "threadId": "string", "turn": { "id": "string" } } },
+    "turn/completed": { "params": { "threadId": "string", "turn": { "id": "string", "status": "completed" } } },
+    "item/started": { "params": { "threadId": "string", "turnId": "string" } },
+    "item/completed": { "params": { "threadId": "string", "turnId": "string" } },
+    "serverRequest/resolved": { "params": { "threadId": "string", "requestId": "number" } },
+    "thread/tokenUsage/updated": {
+      "params": { "threadId": "string", "turnId": "string", "tokenUsage": { "total": { "totalTokens": "integer", "inputTokens": "integer", "cachedInputTokens": "integer", "outputTokens": "integer" } } },
+      "note": "NEW vs 0.167.0-alpha.3.2 fixtures. This is the usage source: turn/completed carries no usage field. Observed turn: inputTokens 21601, cachedInputTokens 11520, outputTokens 8."
+    },
+    "account/rateLimits/updated": { "note": "NEW vs fixtures; buffered opaquely, never a domain fact" },
+    "account/updated": { "note": "NEW vs fixtures; buffered opaquely" },
+    "remoteControl/status/changed": { "note": "NEW vs fixtures; buffered opaquely" },
+    "mcpServer/startupStatus/updated": { "note": "NEW vs fixtures; buffered opaquely" }
+  }
+}

@@ -83,7 +83,8 @@
 
 ## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
 
-Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`).
+Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`,
+committed as `12e0217`).
 Các checkbox gốc giữ nguyên lịch sử.
 
 - [x] Suite xác định xanh: `verification` 5, `artifact_contract` 2 bài chạy
@@ -99,3 +100,7 @@ Các checkbox gốc giữ nguyên lịch sử.
   sát nên ghi nhận theo yêu cầu, không suy diễn fallback.
 - Smoke trên chạy ngoài daemon (đúng phạm vi manual của P2); workflow live
   qua daemon thuộc P4 và đang bị chặn — xem P4.
+- [x] Transport đã nối vào gateway (late 2026-11-11, cùng base, chưa
+  commit): `spawn_piped` + RPC attach (initialize/thread/turn/answer/
+  observe/reconcile), test duplex e2e + test piped spawn thật đều xanh;
+  workspace suite 243 passed. Chi tiết trong evidence, mục transport wiring.

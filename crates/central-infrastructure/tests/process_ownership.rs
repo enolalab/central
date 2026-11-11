@@ -206,6 +206,47 @@ async fn missing_binary_fails_without_side_effects() {
     }
 }
 
+/// Piped spawn carries owned stdio for RPC attach while keeping the
+/// exact same supervision: kernel identity, job containment and the
+/// identity-checked kill path. Unix-only: `cat` is the echo helper;
+/// Windows containment of piped children is covered by the job tests.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn piped_spawn_echoes_and_kills_by_handle() {
+    use central_infrastructure::process::PipedSpawner;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let supervisor = OwnedProcessSupervisor::new();
+    let (identity, mut stdio) = supervisor
+        .spawn_piped(&ProcessSpec {
+            program: "sh".to_string(),
+            args: vec!["-c".to_string(), "cat".to_string()],
+            working_dir: None,
+        })
+        .await
+        .expect("piped spawn");
+    stdio
+        .stdin
+        .write_all(b"ping\n")
+        .await
+        .expect("write to owned stdin");
+    let mut buf = [0u8; 5];
+    tokio::time::timeout(Duration::from_secs(5), stdio.stdout.read_exact(&mut buf))
+        .await
+        .expect("echo within budget")
+        .expect("read echo");
+    assert_eq!(&buf, b"ping\n");
+    // Still blocked in `cat`: the kill goes through the owned handle and
+    // counts exactly once, pipes included.
+    let report = supervisor
+        .terminate_detailed(&identity)
+        .await
+        .expect("terminate");
+    assert_eq!(report.kill_count, 1);
+    assert!(report.killed);
+    drop(stdio);
+}
+
 #[test]
 fn job_placement_is_published_never_silent() {
     let supervisor = OwnedProcessSupervisor::new();

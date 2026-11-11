@@ -97,7 +97,8 @@
 
 ## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
 
-Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`).
+Evidence: `docs/validation/2026-11-11-linux-fix-rerun.md` (base `a00a2b5`,
+committed as `12e0217`).
 Các checkbox gốc giữ nguyên lịch sử.
 
 - [x] Suite xác định xanh: `scheduler` 12, `quality_loop` 16, `budget` 4,
