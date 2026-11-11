@@ -2,13 +2,13 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Xây Central local bằng Rust, điều phối Codex theo kế hoạch user duyệt, lưu tiến độ và khôi phục an toàn, với web UI văn phòng pixel.
+**Goal:** Xây Central local bằng Rust, điều phối Codex theo kế hoạch user duyệt, lưu tiến độ và khôi phục an toàn, vận hành bằng CLI và API cho client độc lập.
 
-**Architecture:** Domain/application độc lập database, harness và UI. Một daemon sở hữu DuckDB; Codex app-server, Git và filesystem là adapter. CLI/web dùng cùng API; Central không có model/tool loop.
+**Architecture:** Domain/application độc lập database, harness và client. Một daemon sở hữu DuckDB; Codex app-server, Git và filesystem là adapter. CLI và client ngoài dùng cùng API có phiên bản; Central không có model/tool loop hoặc UI đi kèm.
 
-**Tech Stack:** Rust 1.99.1/MSVC, duckdb 1.20000.1 bundled, Tokio/Axum/Clap; Codex app-server JSONL/stdio; React/TypeScript/Vite và Canvas 2D.
+**Tech Stack:** Rust 1.99.1/MSVC, duckdb 1.20000.1 bundled, Tokio/Axum/Clap; Codex app-server JSONL/stdio; HTTP JSON, OpenAPI và SSE.
 
-**Spec:** `docs/superpowers/specs/2026-11-09-central-mvp-design.md`; visual reference `docs/superpowers/mockups/central-immersive-office-v1.html`.
+**Spec:** `docs/superpowers/specs/2026-11-09-central-mvp-design.md`, sửa phạm vi ngày 2026-11-10: CLI và API công khai cho client độc lập; mockup UI chỉ là lịch sử.
 
 ## Global Constraints
 
@@ -20,7 +20,8 @@
 - Usage không xác định khi có giới hạn tiền/token: giữ chờ việc mới trong run đó.
 - Sau restart chờ `central resume`; pause/hold để attempt đang chạy hoàn thành.
 - Windows x64 trước; không HA, worker remote hoặc RBAC tổ chức trong MVP.
-- Văn phòng pixel toàn màn hình; panel/chat theo ngữ cảnh, không dashboard cố định.
+- Không xây hoặc đóng gói UI; CLI là client chính thức, client ngoài dùng API có tài liệu.
+- API mở cho tích hợp, vẫn xác thực/cấp quyền; MVP loopback/local, một user.
 - Real-model test mặc định gpt-6-luna/low; không fallback model âm thầm.
 - Chỉ docs được viết trong lượt lập plan; mọi checkbox dưới đây chưa thực hiện.
 
@@ -30,7 +31,7 @@
 2. Request ID tái dùng sau harness restart: accept cũ không áp dụng — P2/T3.
 3. Windows Unicode/spaced path, junction thoát root: không ghi nhầm — P3/T5.
 4. Usage thiếu/đến trễ/cumulative lặp: hold đúng run, không tính hai lần — P3/T3.
-5. Tab stale duyệt revision cũ: conflict, không dispatch — P4/T1,T4.
+5. Client stale duyệt revision cũ hoặc reconnect sau restart: conflict/resnapshot, không tự dispatch — P4/T1.
 
 ## Chặng và đầu ra độc lập
 
@@ -39,20 +40,21 @@
 | [P1 — Durable runtime](2026-11-09-central-p1-durable-runtime.md) | Không | DuckDB gate, domain/transaction, daemon/API/CLI, restart qua fake agent |
 | [P2 — Codex workflow](2026-11-09-central-p2-codex-workflow.md) | P1 | Leader proposal, worker/verifier thật, approval/question và evidence |
 | [P3 — Reliable workflows](2026-11-09-central-p3-reliable-workflows.md) | P2 | DAG đồng thời, budget/retry/revision, Git integration và recovery |
-| [P4 — Immersive office](2026-11-09-central-p4-office-and-release.md) | P3 | UI theo mockup, đóng gói Windows và nghiệm thu sản phẩm |
+| [P4 — Public client API and CLI](2026-11-09-central-p4-client-api-and-cli.md) | P3 | Một task: API có tài liệu, CLI đủ chức năng, client độc lập và nghiệm thu runtime không UI |
 
-Thực thi tuần tự; UI shell có thể dựng với fixture trước nhưng không nghiệm thu
-trước runtime. Không chốt DuckDB khi P1/T1 chưa đạt. Mỗi task có commit riêng.
+Thực thi tuần tự; API được nghiệm thu bằng CLI và client ngoài, không cần UI.
+Không chốt DuckDB khi P1/T1 chưa đạt. Mỗi task có commit riêng.
 Không tạo hai DB backend để chứng minh abstraction. Unit/contract tests không gọi model.
 
 ## Hiện trạng và versions dự kiến
 
-Repo mới có docs/mockup/spikes, chưa có Cargo workspace/Git repo. Trước đó chưa
+Baseline ban đầu ngày 2026-11-09: repo mới có docs/mockup/spikes, chưa có Cargo workspace/Git repo. Trước đó chưa
 có Rust/Cargo trong PATH. Codex CLI 0.167.0-alpha.3.2 đã đăng nhập ChatGPT; Node
-24.22.1. Kiểm tra lại khi execution; không đổi auth/config cá nhân.
+24.22.1. Đây là lịch sử khảo sát, không là hiện trạng sau P1–P3. Kiểm tra lại khi
+execution; không đổi auth/config cá nhân.
 
 Toolchain: Rust 1.99.1, target x86_64-pc-windows-msvc, MSVC C++ build tools cho
-DuckDB bundled; Node 24.22.1 và pnpm 10 (lock patch thực tế khi bootstrap).
+DuckDB bundled. P4 không cần frontend toolchain hoặc Node ở runtime.
 Nếu thiếu thì cài nguồn chính thức theo quyền môi trường, không bỏ sandbox để lách lỗi.
 
 Versions được tra registry ngày 2026-11-09; chưa có nghĩa đã build tương thích:
@@ -64,8 +66,6 @@ Versions được tra registry ngày 2026-11-09; chưa có nghĩa đã build tư
 | serde / serde_json | `1.0.229` / `1.0.154` |
 | reqwest | `0.13.5`, CLI HTTP client, không gọi model |
 | fs2 / uuid / sha2 / tempfile | `0.4.3` / `1.29.2` / `0.11.1` / `3.27.0` |
-| React / React DOM | `19.3.1` |
-| Vite / TypeScript / Vitest / Playwright | `8.3.6` / `7.0.2` / `5.1.0` / `1.65.0` |
 
 Chỉ thêm async-trait/thiserror/windows-sys/tracing/tower-http/serde_yaml khi task
 cần; pin resolution trong lockfiles. Nếu version không tương thích, ghi evidence
@@ -86,8 +86,8 @@ crates/central-infrastructure/src/
   checks/                        # lệnh verify đã duyệt, không agent loop
 crates/central-server/src/       # composition root, runtime, HTTP/read models
 crates/central-cli/src/          # parse CLI/API client; không DB
-web/src/                        # React state, scene, contextual panels
-contracts/                      # plan/result schemas, Codex schema subset
+contracts/                      # public OpenAPI/events, plan/result, Codex subset
+examples/                       # client HTTP/SSE độc lập, không UI
 tests/fixtures/                 # tiny Git repo, RPC transcripts, fake harness
 scripts/                        # gates, packaging, opt-in model smoke
 docs/validation/                # evidence theo gate
@@ -209,16 +209,17 @@ là phần cần chứng minh, implementer viết setup đúng contracts này.
 | Mục 9: atomicity/outbox/artifact/recovery | P1/T1,T3,T4; P2/T5; P3/T6 |
 | Mục 10: adapter/profile/capability/subagent | P2/T1–T4, P3/T3 |
 | Mục 11: verification/workspace/integration | P2/T5, P3/T2,T4,T5 |
-| Mục 12: inbox/quyền/secret/stale answer | P2/T3, P4/T1,T4 |
-| Mục 13: budget/unknown/observability | P3/T3, P4/T1,T5 |
-| Mục 14: CLI/browser office | P1/T4, P4/T1–T6 |
-| Mục 15–18: giới hạn, nghiệm thu, version evidence | Gates từng chặng, P4/T6 |
+| Mục 12: inbox/quyền/secret/stale answer | P2/T3, P4/T1 |
+| Mục 13: budget/unknown/observability | P3/T3, P4/T1 |
+| Mục 14: CLI/public API/client ngoài | P1/T4, P4/T1 |
+| Mục 15–18: giới hạn, nghiệm thu, version evidence | Gates từng chặng, P4/T1 |
 
 Đã rà tên types/signatures và ordering: profile DTO/process port định nghĩa
 trước consumer; live stdio smoke sau supervisor; production Git workspaces ở P3,
 P2 chỉ chạy fixture-owned scratch. Secret payload không vào durable outbox;
 dispatched-unknown và usage-unknown là hai điều kiện khác nhau. Mỗi Review Focus
-có test ở task sở hữu. Bốn subplan có 21 task, tất cả có red/green/evidence và
+có test ở task sở hữu. Sau sửa phạm vi ngày 2026-11-10, bốn subplan có 16 task
+(P1: 4, P2: 5, P3: 6, P4: 1), tất cả có red/green/evidence và
 commit (storage spike dùng experiment assertions thay vì TDD sản phẩm).
 Các benchmark/build/test/model-call trong plan đều **chưa thực hiện**.
 
@@ -231,6 +232,6 @@ khi user chọn. Yêu cầu viết plan chưa bắt đầu execution.
 Nguồn: [Rust stable channel](https://static.rust-lang.org/dist/channel-rust-stable.toml),
 [DuckDB crate metadata](https://crates.io/api/v1/crates/duckdb/1.20000.1),
 [DuckDB concurrency](https://duckdb.org/docs/2.0/connect/concurrency),
-[Codex protocol](https://learn.chatgpt.com/docs/app-server); frontend versions từ
-npm registry. Bằng chứng local: `spikes/codex-lifecycle/CRASH-FINDINGS.md` và
+[Codex protocol](https://learn.chatgpt.com/docs/app-server),
+[OpenAPI](https://spec.openapis.org/oas/latest.html). Bằng chứng local: `spikes/codex-lifecycle/CRASH-FINDINGS.md` và
 `spikes/codex-app-server/FINDINGS.md`.

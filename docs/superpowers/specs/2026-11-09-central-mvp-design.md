@@ -2,9 +2,10 @@
 
 Trạng thái: **Baseline để lập implementation plan theo yêu cầu user**.
 Ngày: 2026-11-09, múi giờ Asia/Bangkok.
-Tài liệu tổng hợp các quyết định trong brainstorm; các lựa chọn do người viết
-đề xuất được ghi rõ. Sau khi chốt hướng UI, user yêu cầu viết plan. Việc lập
-plan đã được cho phép; chưa phải chỉ thị bắt đầu code hoặc cam kết đã có sản phẩm.
+Cập nhật phạm vi ngày 2026-11-10 theo yêu cầu user: Central cung cấp daemon,
+CLI và API cho client độc lập; không xây hoặc đóng gói UI. P4 đổi thành một
+task về API công khai và khả năng vận hành qua CLI. Các mockup UI được giữ làm
+lịch sử khảo sát. Việc sửa tài liệu không phải chỉ thị triển khai code.
 
 ## 1. Mục đích và ranh giới
 
@@ -25,7 +26,7 @@ Thành công: sau một gián đoạn, user biết việc nào đã hoàn tất,
 rõ; Central kiểm tra lại bằng chứng và tiếp tục đúng phạm vi đã duyệt, không
 âm thầm chạy lại thao tác có thể tạo tác động trùng.
 
-Thất bại dù UI có vẻ hoạt động: nhận lời agent nói xong làm bằng chứng duy nhất;
+Thất bại dù CLI/API có vẻ hoạt động: nhận lời agent nói xong làm bằng chứng duy nhất;
 mất approval sau restart; sửa kế hoạch không xin duyệt; retry mù; âm thầm đổi
 model/quyền; hoặc tuyên bố resume được chỉ vì phiên agent còn tồn tại.
 
@@ -70,25 +71,31 @@ model/quyền; hoặc tuyên bố resume được chỉ vì phiên agent còn t�
   xác nhận theo adapter; không đồng nghĩa rollback. `resume`: đối soát rồi chạy tiếp.
 - Leader là đầu mối cho câu hỏi worker; vượt phạm vi thì chuyển user.
 - Clean Architecture; DuckDB là lựa chọn storage dự kiến, cần qua bài thử phù hợp.
-- Web UI trên trình duyệt local theo hướng văn phòng pixel toàn màn hình. Chat
-  leader và các công cụ mở theo ngữ cảnh; không có sidebar/dashboard cố định.
+- Central không có UI đi kèm; CLI là client chính thức, dùng cùng API công khai
+  với các client độc lập. Ai cũng có thể xây UI theo hợp đồng API có tài liệu.
+- API mở cho tích hợp không đồng nghĩa truy cập vô danh. Client do user cấp quyền;
+  MVP vẫn là một user, loopback/local, không tự mở LAN hoặc Internet.
 
 ## 3. Phạm vi sản phẩm
 
 ### Có trong MVP
 
-CLI; daemon local; API dùng chung cho CLI và web UI local tối thiểu; một user;
+CLI; daemon local; API có phiên bản dùng chung cho CLI và client độc lập; một user;
 Codex adapter; nhiều profile; dependency DAG; giới hạn concurrency; task và
 integration verification; kế hoạch có phiên bản; approval/question inbox;
 checkpoint/bàn giao; artifact/provenance; fallback; retry có phân loại;
 pause/stop/resume; budget/accounting có biểu diễn phần chưa biết.
 
-CLI trước là lát cắt phát triển; web UI vẫn nằm trong phạm vi MVP hoàn chỉnh:
-danh sách run/task, timeline, diff/kế hoạch, approval/question, artifact và giới hạn.
+CLI đủ vận hành toàn bộ workflow. API cung cấp run/task/attempt, timeline,
+plan/revision/diff, hội thoại leader, approval/question, artifact/evidence,
+profile/capability, recovery và budget. OpenAPI, schema event, hướng dẫn kết nối
+và ví dụ client là đầu ra MVP; UI, frontend framework và SDK đa ngôn ngữ không
+thuộc phạm vi. Client không cần đọc DB/file nội bộ hoặc suy diễn domain transition.
 
 ### Chưa có
 
-Nhiều user/RBAC tổ chức, worker remote, hệ phân tán/HA, workflow dài nhiều tuần
+UI chính thức hoặc host frontend, nhiều user/RBAC tổ chức, API remote qua LAN/Internet,
+worker remote, hệ phân tán/HA, workflow dài nhiều tuần
 tự vận hành, plugin marketplace, tự rollback tác động bên ngoài, bảo đảm exactly-once
 cho mọi hành động, hay database/agent có thể thay nóng không cần migration.
 
@@ -97,9 +104,10 @@ cho mọi hành động, hay database/agent có thể thay nóng không cần mi
 - Windows x64 trước, theo môi trường đã khảo sát; giữ đường dẫn/process sau port
   để có thể bổ sung hệ điều hành khác. Chưa nghiệm thu đa nền tảng trong MVP.
 - Một daemon sở hữu storage và mutation của workspace; một user OS hiện tại là
-  chủ sở hữu. CLI/web là client, không ghi trực tiếp database.
+  chủ sở hữu. CLI và client độc lập không ghi trực tiếp database.
 - HTTP API local dùng loopback và token local được bảo vệ bằng quyền OS; không
-  mở cổng LAN mặc định. Web cần kiểm soát Origin và chống yêu cầu giả mạo.
+  mở cổng LAN. Client trình duyệt cần Origin allowlist tường minh và xác thực;
+  không bật wildcard CORS hoặc cấp quyền chỉ vì request đến từ localhost.
 - Không tự xóa evidence/workspace trong run chưa hoàn tất hoặc đang chờ đối soát.
   Dọn dữ liệu là thao tác tường minh; không xóa artifact còn được tham chiếu.
 
@@ -146,7 +154,7 @@ crates/
 ```
 
 Ban đầu adapter là module, chưa cần mỗi adapter một crate. Framework HTTP,
-thư viện CLI, thư viện Rust database/Git và UI framework để builder chọn, ghi
+thư viện CLI và thư viện Rust database/Git để builder chọn, ghi
 lý do trong implementation plan; không được làm thay đổi ranh giới trên.
 
 ### Các port có ý nghĩa nghiệp vụ
@@ -266,7 +274,7 @@ không mở thêm verifier/retry/leader attempt mới.
 ## 9. Persistence và khôi phục
 
 DuckDB dự kiến chạy embedded trong một daemon sở hữu file. Các mutation nghiệp
-vụ đi qua một hàng đợi ghi; CLI/UI/agent không truy cập file trực tiếp. Truy vấn
+vụ đi qua một hàng đợi ghi; CLI/client/agent không truy cập file trực tiếp. Truy vấn
 báo cáo không được làm scheduler bị block lâu. Không mở rộng ngay sang Quack hay
 multi-process DB access. Kiểm tra phiên bản Rust binding và DuckDB trên Windows.
 
@@ -416,52 +424,59 @@ cho worker, verifier, integrator, leader phát sinh, retry và fallback mới;
 attempt đang chạy vẫn được hoàn thành. Các run khác không bị hold theo.
 
 Đối soát không gọi model và thao tác đọc/xem trạng thái vẫn được thực hiện. Nếu
-cần gọi leader để xử lý thì phải chờ gate được mở. UI hiển thị phần usage thiếu,
+cần gọi leader để xử lý thì phải chờ gate được mở. CLI/API cung cấp phần usage thiếu,
 nguồn bằng chứng và lý do hold. User có thể giải quyết cách ghi nhận phần thiếu
 hoặc điều chỉnh chính sách ngân sách một cách tường minh, có audit; không sửa
 số liệu ước tính thành observed. `central resume` đơn thuần không xóa hold này.
 
-CLI/UI hiển thị trạng thái có lý do, phiên bản kế hoạch, attempt/profile/model,
+CLI/API cung cấp trạng thái có lý do, phiên bản kế hoạch, attempt/profile/model,
 chờ ai, evidence, mức xác minh và accounting chưa biết. Thông báo fallback,
 unknown outcome, cần user và hoàn thành; không lặp lại thông báo không đổi.
 Không ghi credentials vào journal/artifact; secret answer không được lưu plaintext
 trong trace thông thường. Chính sách secret persistence cần chọn trước khi hỗ
 trợ loại câu hỏi đó; MVP có thể yêu cầu nhập lại thay vì lưu.
 
-## 14. CLI và web UI
+## 14. CLI và API cho client độc lập
 
-### Hướng UI đã được user chọn
+### Ranh giới sản phẩm
 
-Trình duyệt local, văn phòng pixel toàn màn hình. User đã xem mockup dashboard,
-mockup office có cột chat cố định và chọn hướng không gian văn phòng, công cụ
-mở theo ngữ cảnh. Đây là hướng giao diện đã chốt; không có nghĩa mockup đã là
-sản phẩm hoạt động hay toàn bộ tài liệu đã được duyệt.
+Quyết định ngày 2026-11-10 thay hướng văn phòng pixel trước đây: Central phát hành
+daemon và CLI, không frontend, static assets hoặc lệnh `central ui`. Mockup ở
+`docs/superpowers/mockups/` là lịch sử, có thể tham khảo cho UI độc lập sau này.
+Client tự chọn cách trình bày; Central không quy định layout, nhân vật hay panel.
 
-- Văn phòng là màn hình chính; không ghim sidebar, bảng task hoặc cột chat.
-- Leader có vị trí/nhân vật riêng. Bấm leader hoặc nút Gặp leader để mở hội thoại;
-  lịch sử và nội dung đang soạn được giữ khi đóng/mở, xuyên suốt run.
-- Bấm worker/verifier/integrator để mở thông tin task, attempt, profile, trạng thái,
-  dependency, diff, cách verify và evidence. Đóng bảng trở về văn phòng.
-- Bảng trong phòng mở kế hoạch/revision/diff và thao tác duyệt; sổ công việc cung
-  cấp danh sách chữ theo ngữ cảnh để tra cứu và dùng bàn phím.
-- Approval/câu hỏi thể hiện bằng chỉ báo trên nhân vật và điểm truy cập chung.
-  Mở yêu cầu phải hiển thị đúng nội dung, scope và phiên bản; không duyệt chỉ bằng
-  click nhân vật hay câu đồng ý trong chat.
-- Thanh công cụ nhỏ truy cập leader, kế hoạch, sổ công việc và pause/resume.
-  Chỉ báo run, cần user, budget hold và trạng thái offline/unknown phải nhận biết
-  được mà không cần giữ các panel mở.
-- Trước khi có worker thực sự, chỗ ngồi chỉ là dự kiến; không vẽ nhân vật đang
-  làm việc để ngụ ý một phiên đã được khởi chạy.
-- Bố trí và animation chỉ trình bày trạng thái. Không dùng khoảng cách bàn, chuyển
-  động hoặc màu sắc làm căn cứ scheduling/verification. Unknown outcome phải có
-  nhãn riêng; không giả hoạt động khi không có bằng chứng.
-- Hỗ trợ nhãn chữ, thao tác bàn phím, giảm chuyển động và cách truy cập dạng danh
-  sách theo ngữ cảnh. Không bắt user nhận diện trạng thái chỉ từ pixel/màu.
+CLI là một consumer của cùng API mà client ngoài sử dụng. Domain/application giữ
+toàn bộ scheduling, approval, budget và verification; không có thao tác chỉ làm
+được bằng cách sửa DB/file nội bộ hoặc chạy business logic trong client.
 
-Tham chiếu hình thức: `docs/superpowers/mockups/central-immersive-office-v1.html`.
-Mockup tự chứa, dữ liệu giả và không kết nối agent. Các bảng debug/chọn tình huống
-demo không nằm trong UI sản phẩm. Chi tiết mobile, bố trí phòng và sprite cuối
-cùng để builder đề xuất; không xây game/editor trang trí cho MVP.
+### Hợp đồng API
+
+- HTTP JSON có version `/v1`, OpenAPI có thể tải và schema event có tài liệu.
+  DTO công khai tách khỏi snapshot lưu trữ và Codex wire protocol; không để thay
+  đổi Rust struct nội bộ vô tình thành breaking change cho client.
+- Đọc đủ run/task/attempt, plan/revision/diff, hội thoại, inbox, artifact/evidence,
+  profile/capability, usage và recovery. Danh sách/log/history có phân trang.
+- Các lệnh ghi dùng cùng application use case với CLI, command ID chống lặp và
+  revision/hash/epoch phù hợp. Receipt xác nhận commit lệnh; kết quả task đến sau.
+  Client khác đang giữ dữ liệu cũ nhận conflict, không tự cấp lại approval.
+- Snapshot nhất quán kèm cursor event bền vững; SSE và đọc event theo cursor giúp
+  nối lại, phát hiện khoảng thiếu và tải snapshot mới. Đổi daemon instance cần
+  đồng bộ lại trạng thái recovery; reconnect không tự resume hoặc trả lời inbox.
+- User cấp/thu hồi credential cho client với quyền đọc hoặc điều khiển. Credential
+  owner, client và agent bridge không hoán đổi quyền; actor được suy ra ở server.
+  Origin allowlist cho browser client là cấu hình user, không là cơ chế xác thực.
+- Browser example dùng `fetch` và đọc stream với Authorization header; không đưa
+  token vào URL. Không buộc client dùng cookie hoặc UI do Central host.
+- Tài liệu nêu rõ errors, idempotency, pagination, event replay, tương thích phiên
+  bản và capability chưa hỗ trợ. Không hứa exactly-once cho tác động bên ngoài.
+
+### Tiêu chí nghiệm thu client
+
+Một client ví dụ nhỏ chỉ dựa trên API được công bố phải đọc trạng thái, gửi lệnh,
+duyệt đúng revision, xử lý inbox và reconnect được; không import code nội bộ.
+CLI và client độc lập quan sát cùng trạng thái và cùng lỗi khi stale/không đủ quyền.
+Luồng worker -> verifier -> integration phải chạy qua daemon thật; fake test vẫn
+ghi rõ giới hạn, không thay bằng chứng live-model. Không cần xây một UI để nghiệm thu.
 
 ### CLI
 
@@ -475,15 +490,18 @@ central plan show|diff|approve ...
 central inbox
 central approve|decline ...
 central answer ...
+central chat ...
+central profiles ...
+central clients ...
+central events ...
 central logs ...
 central artifacts ...
 central sync ...
 central pause|stop|resume ...
-central ui
 ```
 
 Đóng CLI không đóng daemon. `start` chưa duyệt kế hoạch không cho implementation
-chạy. `ui` mở cùng dữ liệu qua API daemon. Agent không có endpoint tự approve plan.
+chạy. CLI có output máy đọc được cho automation. Agent không có endpoint tự approve plan.
 User auth và agent capability token cần tách quyền tại API dù chỉ có một user.
 
 ## 15. Bằng chứng đã có và giới hạn
@@ -517,8 +535,8 @@ phục hồi tác động bên ngoài tổng quát. Không nâng kết quả spi
 5. **Revision/tích hợp:** user sync commit, sửa kế hoạch khi đang chạy, tái sử dụng
    candidate cũ qua assessment, invalidation và ba mức verification.
 6. **Vận hành:** pause/stop/resume, quota/fallback có thông báo, budget gate, usage
-   unknown giữ chờ đúng run và chỉ mở khi đối soát/user xử lý, web UI local và
-   inbox dùng cùng application use case.
+   unknown giữ chờ đúng run và chỉ mở khi đối soát/user xử lý; CLI và client ngoài
+   điều khiển inbox qua cùng API/application use case, nối lại event sau restart.
 
 Kiểm thử domain bằng transition/invariant; application bằng port fake có failure
 injection; adapter bằng contract/integration test; end-to-end dùng một repo Git
@@ -534,7 +552,7 @@ giao lại; plan chưa duyệt không được thi hành; không có lời tự 
 
 Chọn thư viện và version phù hợp, schema SQL/index/migration, bảng transition
 đầy đủ, định dạng wire plan/result và công cụ bridge cho Codex, cách supervisor
-quản lý process identity/Windows sandbox, batching telemetry, UI framework,
+quản lý process identity/Windows sandbox, batching telemetry, API DTO/schema,
 API endpoint names và measured workload thresholds. Các lựa chọn phải giữ nguyên
 quyền user, transaction semantics, capability honesty và gate khôi phục đã nêu.
 
@@ -547,8 +565,9 @@ Reviewer nêu một câu hỏi về budget gate khi usage không xác định. U
 giữ chờ việc mới trong run đó cho đến khi đối soát được hoặc user xử lý. Quy tắc
 được đưa vào mục 2, mục 13 và nghiệm thu mục 16. Không còn câu hỏi sản phẩm đang
 chờ trả lời từ vòng review này. Sau vòng UI, user yêu cầu viết implementation
-plan trên baseline này. Các lựa chọn triển khai của người viết sẽ xuất hiện
-trong plan để review; yêu cầu viết plan không tự cho phép bắt đầu code.
+plan trên baseline này. Ngày 2026-11-10 user thay phạm vi bằng CLI và API cho client
+độc lập; P4 có một task, không xây UI. Các lựa chọn triển khai của người viết sẽ
+xuất hiện trong plan để review; yêu cầu viết plan không tự cho phép bắt đầu code.
 
 ## 18. Nguồn kỹ thuật
 
@@ -556,6 +575,9 @@ trong plan để review; yêu cầu viết plan không tự cho phép bắt đ�
 - DuckDB concurrency: https://duckdb.org/docs/2.0/connect/concurrency
 - DuckDB transactions: https://duckdb.org/docs/2.0/sql/statements/transactions
 - DuckDB crash recovery: https://duckdb.org/docs/2.0/guides/troubleshooting/crashes
+- OpenAPI: https://spec.openapis.org/oas/latest.html
+- SSE: https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events
+- Fetch/Authorization: https://developer.mozilla.org/en-US/docs/Web/API/Fetch_API/Using_Fetch
 
 Nguồn online được khảo sát trong cuộc thảo luận; implementation cần pin version
 thực tế và dùng schema/docs tương ứng. Các spike trong repository là bằng chứng

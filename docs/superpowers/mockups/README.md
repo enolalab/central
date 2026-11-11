@@ -1,5 +1,10 @@
 # Central local browser UI — discussion mockup
 
+**Scope update — 2026-11-10:** Central now targets daemon + CLI + a documented
+API for independent clients, with no bundled UI. These mockups preserve earlier
+design exploration; the UI choices and acceptance notes below are historical,
+not current MVP requirements. Anyone may use the public API to build a separate UI.
+
 `central-workspace-v1.html` is a standalone, self-contained HTML/CSS/JS mockup.
 It is disposable design material, not the Central web application. Open it in
 a browser, or serve through the brainstorming companion for recorded UI choices.
