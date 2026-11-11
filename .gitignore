@@ -5,3 +5,4 @@ target/
 *.duckdb.wal
 *.duckdb.*
 state/
+dist/
