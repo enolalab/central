@@ -18,7 +18,7 @@ use central_domain::RunId;
 
 use super::auth::{app_error_response, authenticate};
 use super::AppState;
-use crate::api::dto::{decode_cursor, encode_cursor, parse_limit};
+use crate::api::dto::{decode_cursor, encode_cursor, parse_limit, SNAPSHOT_EVENT_TAIL};
 use crate::api::errors::{error_response, ApiError};
 use crate::api::read_models::project_state;
 
@@ -94,11 +94,17 @@ pub async fn get_run(
             ));
         }
     }
-    // Full ordered history as projected views (legacy shape kept for
-    // the P1-P3 gates; new clients page through `/events` and stream).
+    // Bounded tail of the ordered history as projected views (legacy
+    // `events` shape kept for the P1-P3 gates, capped so the snapshot
+    // never grows with run age; new clients page through `/events`).
+    // Seqs are gapless from 1, so the count below the window is exactly
+    // the number of head events left out.
+    let tail_start = snapshot
+        .last_seq
+        .saturating_sub(u64::from(SNAPSHOT_EVENT_TAIL));
     let sequenced = state
         .store
-        .events_after(run_id, 0, u32::MAX)
+        .events_after(run_id, tail_start, SNAPSHOT_EVENT_TAIL)
         .await
         .map_err(app_error_response)?;
     let events: Vec<serde_json::Value> = sequenced
@@ -111,6 +117,8 @@ pub async fn get_run(
         "last_seq": snapshot.last_seq,
         "state": project_state(&snapshot.state),
         "events": events,
+        "events_truncated": tail_start > 0,
+        "events_omitted": tail_start,
         "quality": quality_summary(&snapshot.state),
     })))
 }

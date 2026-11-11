@@ -180,6 +180,125 @@ fn invalid_cursor_is_400_not_500() {
 }
 
 #[test]
+fn snapshot_and_logs_stay_bounded_on_large_histories() {
+    let dir = state_dir("events-bounded-history");
+    let server = start_server(&dir);
+    let run = create_run(&server, 181);
+    // Seed a history larger than one max page: each SetLimits with a
+    // fresh value commits exactly one event.
+    const EXTRA: u64 = 600;
+    for i in 0..EXTRA {
+        let id = 1000 + i as u128;
+        let tokens = 10_000 + i;
+        let (status, receipt) = post_command(
+            &server,
+            Some(&run),
+            id,
+            serde_json::json!({"SetLimits": {"limits": {"max_tokens": tokens, "max_cost_minor": null, "max_attempts": null, "max_duration_ms": null}}}),
+        );
+        assert_eq!(status, 200, "cmd {id}: {receipt}");
+    }
+    let snapshot = get_snapshot(&server, &run);
+    let last_seq = snapshot["last_seq"].as_u64().expect("last_seq");
+    assert!(last_seq > 500, "large history seeded: {last_seq}");
+    // The snapshot embeds a bounded tail, never the full history, and
+    // says so: consumers page /events for the rest.
+    let events = snapshot["events"].as_array().expect("events tail");
+    assert!(
+        events.len() <= 100,
+        "snapshot tail stays bounded: {} of {last_seq}",
+        events.len()
+    );
+    assert_eq!(
+        snapshot["events_truncated"], true,
+        "truncation signaled: {snapshot}"
+    );
+    assert_eq!(
+        snapshot["events_omitted"].as_u64().expect("omitted") + events.len() as u64,
+        last_seq,
+        "omitted count covers the head: {snapshot}"
+    );
+    assert_eq!(
+        events.first().expect("tail")["seq"].as_u64().expect("seq"),
+        last_seq - events.len() as u64 + 1,
+        "tail is the closing window"
+    );
+    assert_eq!(
+        events.last().expect("tail")["seq"].as_u64().expect("seq"),
+        last_seq,
+        "tail ends at the cursor"
+    );
+    // /events still pages the full history for consumers: walk every
+    // page to exhaustion and reassemble the whole log.
+    let mut seqs: Vec<u64> = Vec::new();
+    let mut after = "0".to_string();
+    loop {
+        let (status, body) = http(
+            "GET",
+            &server.addr,
+            &format!("/v1/runs/{run}/events?after={after}&limit=500"),
+            Some(&server.token()),
+            None,
+            &[],
+        );
+        assert_eq!(status, 200, "page after {after}: {body}");
+        let page: serde_json::Value = serde_json::from_str(&body).expect("page");
+        let items = page["items"].as_array().expect("items");
+        if items.is_empty() {
+            assert!(page["next_cursor"].is_null(), "exhausted: {page}");
+            break;
+        }
+        for item in items {
+            seqs.push(item["seq"].as_u64().expect("seq"));
+        }
+        after = page["next_cursor"].as_str().expect("cursor").to_string();
+    }
+    assert_eq!(seqs.len() as u64, last_seq, "whole log reassembles");
+    for (index, seq) in seqs.iter().enumerate() {
+        assert_eq!(*seq, index as u64 + 1, "gapless from the head");
+    }
+    // Logs return a bounded window with truncation signaled.
+    for limit in ["100", "500"] {
+        let (status, body) = http(
+            "GET",
+            &server.addr,
+            &format!("/v1/runs/{run}/logs?limit={limit}"),
+            Some(&server.token()),
+            None,
+            &[],
+        );
+        assert_eq!(status, 200, "logs limit={limit}: {body}");
+        let logs: serde_json::Value = serde_json::from_str(&body).expect("logs");
+        let bound: usize = limit.parse().expect("limit");
+        assert!(
+            logs["entries"].as_array().expect("entries").len() <= bound,
+            "logs window bounded: {logs}"
+        );
+        assert_eq!(logs["truncated"], true, "logs truncation signaled: {logs}");
+    }
+    // Small-history control: truncation signaling is exact, not sticky.
+    let fresh = create_run(&server, 1999);
+    let snapshot = get_snapshot(&server, &fresh);
+    assert_eq!(snapshot["events_truncated"], false, "fresh: {snapshot}");
+    assert_eq!(
+        snapshot["events_omitted"].as_u64().expect("omitted"),
+        0,
+        "fresh: {snapshot}"
+    );
+    let (status, body) = http(
+        "GET",
+        &server.addr,
+        &format!("/v1/runs/{fresh}/logs"),
+        Some(&server.token()),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "fresh logs: {body}");
+    let logs: serde_json::Value = serde_json::from_str(&body).expect("logs");
+    assert_eq!(logs["truncated"], false, "fresh logs: {logs}");
+}
+
+#[test]
 fn page_limit_is_bounded() {
     let dir = state_dir("events-bound");
     let server = start_server(&dir);

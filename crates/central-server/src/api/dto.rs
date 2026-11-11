@@ -12,6 +12,12 @@ use super::errors::{error_response, ApiError};
 pub const DEFAULT_LIMIT: u32 = 100;
 pub const MAX_LIMIT: u32 = 500;
 
+/// Embedded history tail: snapshots and other aggregate views embed at
+/// most one default page of the durable event history, never the full
+/// log, so their size stays flat as a run ages (Focus 5). Consumers
+/// page the rest through `/events`.
+pub const SNAPSHOT_EVENT_TAIL: u32 = 100;
+
 /// One page: `items` plus the cursor for the next page, or null when
 /// exhausted. Serialized inline by each handler (`items`/`next_cursor`).
 #[derive(Serialize)]

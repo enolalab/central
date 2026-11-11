@@ -392,6 +392,12 @@ components:
         revision: { type: integer }
         last_seq: { type: integer }
         state: { type: object }
+        events:
+          type: array
+          items: { type: object }
+          description: Bounded tail of the durable history (at most one default page of EventViewV1, newest last). Page GET /v1/runs/{id}/events for the rest; the tail alone never grows with run age.
+        events_truncated: { type: boolean, description: True when head events were left out of the tail; page /events from the head instead. }
+        events_omitted: { type: integer, description: Count of head events left out of the tail (0 when the full history fits). }
     EventViewV1:
       type: object
       required: [seq, run_id, kind, at, payload]

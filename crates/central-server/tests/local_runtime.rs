@@ -778,6 +778,220 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
     server.abort();
 }
 
+/// A store wrapper recording the largest `limit` ever passed to
+/// `events_after`. History reads must stay windowed (Focus 5): no
+/// handler may fetch the full durable history with a `u32::MAX`-scale
+/// limit and slice in memory.
+struct LimitProbeStore {
+    inner: std::sync::Arc<central_infrastructure::storage::DuckDbStore>,
+    max_limit: std::sync::Arc<std::sync::atomic::AtomicU32>,
+}
+
+#[async_trait::async_trait]
+impl central_application::ports::Store for LimitProbeStore {
+    async fn load(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<Option<central_domain::RunState>, central_application::contracts::AppError> {
+        central_application::ports::Store::load(&*self.inner, id).await
+    }
+    async fn receipt(
+        &self,
+        actor: central_domain::ActorId,
+        id: central_domain::CommandId,
+    ) -> Result<
+        Option<central_application::contracts::Receipt>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::receipt(&*self.inner, actor, id).await
+    }
+    async fn commit(
+        &self,
+        batch: central_application::contracts::CommitBatch,
+    ) -> Result<central_application::contracts::Receipt, central_application::contracts::AppError>
+    {
+        central_application::ports::Store::commit(&*self.inner, batch).await
+    }
+    async fn pending(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<
+        Vec<central_application::contracts::OutboxIntent>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::pending(&*self.inner, id).await
+    }
+    async fn list_run_ids(
+        &self,
+    ) -> Result<Vec<central_domain::RunId>, central_application::contracts::AppError> {
+        central_application::ports::Store::list_run_ids(&*self.inner).await
+    }
+    async fn outbox(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<
+        Vec<central_application::contracts::OutboxIntent>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::outbox(&*self.inner, id).await
+    }
+    async fn transition_outbox(
+        &self,
+        id: central_domain::IntentId,
+        expected: central_application::contracts::OutboxStatus,
+        next: central_application::contracts::OutboxStatus,
+    ) -> Result<bool, central_application::contracts::AppError> {
+        central_application::ports::Store::transition_outbox(&*self.inner, id, expected, next).await
+    }
+    async fn replace_state(
+        &self,
+        state: &central_domain::RunState,
+        expected_revision: central_domain::Revision,
+    ) -> Result<(), central_application::contracts::AppError> {
+        central_application::ports::Store::replace_state(&*self.inner, state, expected_revision)
+            .await
+    }
+    async fn events(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<Vec<central_domain::Event>, central_application::contracts::AppError> {
+        self.inner.events(id).await
+    }
+    async fn snapshot_with_cursor(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<
+        Option<central_application::ports::SnapshotWithCursor>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::snapshot_with_cursor(&*self.inner, id).await
+    }
+    async fn events_after(
+        &self,
+        id: central_domain::RunId,
+        after: u64,
+        limit: u32,
+    ) -> Result<
+        Vec<central_application::ports::SequencedEvent>,
+        central_application::contracts::AppError,
+    > {
+        self.max_limit
+            .fetch_max(limit, std::sync::atomic::Ordering::SeqCst);
+        central_application::ports::Store::events_after(&*self.inner, id, after, limit).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn history_reads_use_bounded_store_fetches() {
+    let dir = state_dir("bounded-fetch-probe");
+    let inner = std::sync::Arc::new(
+        central_infrastructure::storage::DuckDbStore::open(&dir.join("central.duckdb"))
+            .expect("open store"),
+    );
+    let max_limit = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let store: std::sync::Arc<dyn central_application::ports::Store> =
+        std::sync::Arc::new(LimitProbeStore {
+            inner,
+            max_limit: max_limit.clone(),
+        });
+    struct NoSync;
+    #[async_trait::async_trait]
+    impl central_application::ports::SyncIntake for NoSync {
+        async fn queue_user_commit(
+            &self,
+            _run: central_domain::RunId,
+            _repository: &str,
+            _commit: &str,
+        ) -> Result<
+            central_application::ports::UserSyncIntent,
+            central_application::contracts::AppError,
+        > {
+            Err(central_application::contracts::AppError::Capability(
+                "sync intake is not configured in this test".to_string(),
+            ))
+        }
+    }
+    let token = "bounded-probe-token".to_string();
+    let artifact_root = dir.join("artifacts");
+    let state = central_server::http::AppState {
+        store,
+        actor: central_domain::Actor::user(central_domain::ActorId::from_u128(0xbb)),
+        token: token.clone(),
+        clock: std::sync::Arc::new(central_server::bootstrap::SystemClock),
+        ids: std::sync::Arc::new(central_server::bootstrap::UuidIds),
+        agent: std::sync::Arc::new(central_server::bootstrap::UnavailableGateway),
+        sync_intake: std::sync::Arc::new(NoSync),
+        artifact_root: artifact_root.clone(),
+        artifacts: std::sync::Arc::new(
+            central_infrastructure::artifacts::FilesystemArtifactStore::open(&artifact_root)
+                .expect("artifact store"),
+        ),
+        instance_epoch: "test-epoch".to_string(),
+        origins: Vec::new(),
+        secrets: std::sync::Arc::new(central_application::inbox::SecretVault::new()),
+        fake_agent_enabled: false,
+        fake_counts: None,
+        shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        scan_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind test listener");
+    let addr = listener.local_addr().expect("local addr").to_string();
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, central_server::http::router(state)).await;
+    });
+
+    let (status, receipt) = post_command_addr(
+        &addr,
+        &token,
+        None,
+        900,
+        serde_json::json!({"CreateRun": {"goal": "g", "repository": "r"}}),
+    );
+    assert_eq!(status, 200, "create: {receipt}");
+    let run = receipt["run_id"].as_str().expect("run id").to_string();
+    for id in 901..906 {
+        let tokens = 1000 + (id - 901) as u64;
+        let (status, receipt) = post_command_addr(
+            &addr,
+            &token,
+            Some(&run),
+            id,
+            serde_json::json!({"SetLimits": {"limits": {"max_tokens": tokens, "max_cost_minor": null, "max_attempts": null, "max_duration_ms": null}}}),
+        );
+        assert_eq!(status, 200, "cmd {id}: {receipt}");
+    }
+    let (status, body) = http("GET", &addr, &format!("/v1/runs/{run}"), Some(&token), None);
+    assert_eq!(status, 200, "get run: {body}");
+    let (status, body) = http(
+        "GET",
+        &addr,
+        &format!("/v1/runs/{run}/logs"),
+        Some(&token),
+        None,
+    );
+    assert_eq!(status, 200, "get logs: {body}");
+    let (status, body) = http(
+        "GET",
+        &addr,
+        &format!("/v1/runs/{run}/logs?limit=500"),
+        Some(&token),
+        None,
+    );
+    assert_eq!(status, 200, "get logs max: {body}");
+
+    // No handler may fetch the full durable history: every events_after
+    // call stays within one page (the 500-row max page).
+    let observed = max_limit.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        observed > 0 && observed <= 500,
+        "history reads stay windowed, got limit {observed}"
+    );
+
+    server.abort();
+}
+
 #[test]
 fn outside_api_is_404_not_ui() {
     // P4 serves no UI: every non-API path is a stable 404 carrying the

@@ -46,9 +46,12 @@ pub async fn get_logs(
         })
         .transpose()?
         .unwrap_or(0);
-    let run_state = state
+    // Snapshot plus cursor in one read transaction: the cursor bounds
+    // the event tail fetch below, so the read never materializes the
+    // full durable history (Focus 5).
+    let snapshot = state
         .store
-        .load(run_id)
+        .snapshot_with_cursor(run_id)
         .await
         .map_err(app_error_response)?
         .ok_or_else(|| {
@@ -58,6 +61,8 @@ pub async fn get_logs(
                 format!("run {run_id} not found"),
             )
         })?;
+    let last_seq = snapshot.last_seq;
+    let run_state = &snapshot.state;
     // An attempt filter must belong to this run: foreign ids are 404,
     // never an empty page that hides the mistake.
     if let Some(raw_attempt) = query.get("attempt") {
@@ -96,21 +101,27 @@ pub async fn get_logs(
             })
         })
         .collect();
-    // Plus the redacted event tail for correlation (bounded by limit).
+    // Plus the redacted event tail for correlation: at most `limit`
+    // rows ending at the snapshot cursor, fetched as one bounded
+    // window (never the full history sliced in memory).
+    let tail_start = last_seq.saturating_sub(limit as u64);
     let tail = state
         .store
-        .events_after(run_id, 0, u32::MAX)
+        .events_after(run_id, tail_start, limit as u32)
         .await
         .map_err(app_error_response)?;
-    let start = tail.len().saturating_sub(limit);
-    for row in tail.iter().skip(start) {
+    for row in tail.iter() {
         entries.push(project_event(row.seq, &row.event));
     }
     let total = entries.len();
     let entries: Vec<serde_json::Value> = entries.into_iter().skip(offset).take(limit).collect();
+    // Any omission is signaled: a cut event head, a skipped page head,
+    // or entries left past this page.
+    let truncated = tail_start > 0 || offset > 0 || offset + entries.len() < total;
     Ok(Json(serde_json::json!({
         "run_id": run_id.to_string(),
         "total": total,
         "entries": entries,
+        "truncated": truncated,
     })))
 }
