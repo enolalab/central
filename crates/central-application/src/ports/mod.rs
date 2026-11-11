@@ -5,6 +5,7 @@ pub mod clock;
 pub mod ids;
 pub mod process;
 pub mod store;
+pub mod sync;
 pub mod workspace;
 
 pub use agent::AgentGateway;
@@ -13,4 +14,5 @@ pub use checks::{CheckEvidence, CheckRequest, CheckRunner};
 pub use clock::Clock;
 pub use ids::IdSource;
 pub use process::ProcessSupervisor;
-pub use store::Store;
+pub use store::{SequencedEvent, SnapshotWithCursor, Store};
+pub use sync::{SyncIntake, UserSyncIntent};

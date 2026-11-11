@@ -5,7 +5,10 @@
 use std::sync::{Arc, Mutex};
 
 use central_application::contracts::{AppError, CommitBatch, OutboxIntent, OutboxStatus, Receipt};
-use central_domain::{ActorId, CommandId, Event, Revision, RunId, RunState};
+use central_application::ports::store::{
+    ChatMessage, ClientRecord, SequencedEvent, SnapshotWithCursor, UserProfileRecord,
+};
+use central_domain::{ActorId, CommandId, Event, Revision, RunId, RunState, Timestamp};
 use duckdb::{params, Connection, OptionalExt, Transaction};
 
 use super::codec;
@@ -440,4 +443,242 @@ fn commit_in_transaction(
     .map_err(storage_error)?;
 
     Ok(batch.receipt.clone())
+}
+
+// ---------- P4 public API reads and writes ----------
+
+/// Snapshot plus durable cursor. Both SELECTs run back-to-back on the
+/// single writer thread, so no commit can land between them: the cursor
+/// covers exactly the returned snapshot.
+pub fn snapshot_with_cursor(
+    conn: &Connection,
+    id: RunId,
+) -> Result<Option<SnapshotWithCursor>, AppError> {
+    let state = load(conn, id)?;
+    let Some(state) = state else {
+        return Ok(None);
+    };
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(MAX(seq), 0) FROM events WHERE run_id = ?")
+        .map_err(storage_error)?;
+    let last_seq: i64 = stmt
+        .query_row(params![id.to_string()], |row| row.get(0))
+        .map_err(storage_error)?;
+    Ok(Some(SnapshotWithCursor {
+        state,
+        last_seq: u64::try_from(last_seq).unwrap_or_default(),
+    }))
+}
+
+/// Events strictly after `after`, in seq order, at most `limit` rows.
+pub fn events_after(
+    conn: &Connection,
+    id: RunId,
+    after: u64,
+    limit: u32,
+) -> Result<Vec<SequencedEvent>, AppError> {
+    let after = i64::try_from(after).unwrap_or(i64::MAX);
+    let limit = i64::from(limit);
+    let mut stmt = conn
+        .prepare(
+            "SELECT seq, event_json FROM events \
+             WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+        )
+        .map_err(storage_error)?;
+    let mut rows = stmt
+        .query(params![id.to_string(), after, limit])
+        .map_err(storage_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let seq: i64 = row.get(0).map_err(storage_error)?;
+        let json: String = row.get(1).map_err(storage_error)?;
+        out.push(SequencedEvent {
+            seq: u64::try_from(seq).unwrap_or_default(),
+            event: codec::decode_event(&json)?,
+        });
+    }
+    Ok(out)
+}
+
+pub fn create_client(conn: &Connection, record: &ClientRecord) -> Result<(), AppError> {
+    if record.client_id.trim().is_empty() {
+        return Err(AppError::Validation(
+            "client id must not be empty".to_string(),
+        ));
+    }
+    let encoded = codec::encode_client(record)?;
+    let changed = conn
+        .execute(
+            "INSERT INTO client_credentials (client_id, record_json) VALUES (?, ?)",
+            params![record.client_id, encoded],
+        )
+        .map_err(storage_error)?;
+    if changed != 1 {
+        return Err(AppError::Conflict(format!(
+            "client {} already exists",
+            record.client_id
+        )));
+    }
+    Ok(())
+}
+
+pub fn list_clients(conn: &Connection) -> Result<Vec<ClientRecord>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT record_json FROM client_credentials ORDER BY client_id")
+        .map_err(storage_error)?;
+    let mut rows = stmt.query([]).map_err(storage_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let json: String = row.get(0).map_err(storage_error)?;
+        out.push(codec::decode_client(&json)?);
+    }
+    Ok(out)
+}
+
+pub fn get_client(conn: &Connection, client_id: &str) -> Result<Option<ClientRecord>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT record_json FROM client_credentials WHERE client_id = ?")
+        .map_err(storage_error)?;
+    let json: Option<String> = stmt
+        .query_row(params![client_id], |row| row.get(0))
+        .optional()
+        .map_err(storage_error)?;
+    match json {
+        None => Ok(None),
+        Some(json) => Ok(Some(codec::decode_client(&json)?)),
+    }
+}
+
+/// Revoke a client. Monotonic: an already-revoked row stays revoked and
+/// still reports true; unknown ids report false, never an error.
+pub fn revoke_client(conn: &Connection, client_id: &str) -> Result<bool, AppError> {
+    let Some(record) = get_client(conn, client_id)? else {
+        return Ok(false);
+    };
+    if record.revoked {
+        return Ok(true);
+    }
+    let mut revoked = record;
+    revoked.revoked = true;
+    let encoded = codec::encode_client(&revoked)?;
+    let changed = conn
+        .execute(
+            "UPDATE client_credentials SET record_json = ? WHERE client_id = ?",
+            params![encoded, client_id],
+        )
+        .map_err(storage_error)?;
+    Ok(changed == 1)
+}
+
+/// Append one chat message; the per-run seq is assigned here on the
+/// writer thread, so concurrent appends can never share a seq.
+pub fn append_chat(
+    conn: &Connection,
+    run_id: RunId,
+    author: &str,
+    body: &str,
+    at: Timestamp,
+) -> Result<ChatMessage, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT COALESCE(MAX(seq), 0) FROM chat_messages WHERE run_id = ?")
+        .map_err(storage_error)?;
+    let max: i64 = stmt
+        .query_row(params![run_id.to_string()], |row| row.get(0))
+        .map_err(storage_error)?;
+    let message = ChatMessage {
+        seq: u64::try_from(max).unwrap_or_default() + 1,
+        run_id,
+        author: author.to_string(),
+        body: body.to_string(),
+        at,
+    };
+    let encoded = codec::encode_chat(&message)?;
+    conn.execute(
+        "INSERT INTO chat_messages (run_id, seq, message_json) VALUES (?, ?, ?)",
+        params![
+            run_id.to_string(),
+            i64::try_from(message.seq).unwrap_or(i64::MAX),
+            encoded
+        ],
+    )
+    .map_err(storage_error)?;
+    Ok(message)
+}
+
+pub fn chat_after(
+    conn: &Connection,
+    run_id: RunId,
+    after: u64,
+    limit: u32,
+) -> Result<Vec<ChatMessage>, AppError> {
+    let after = i64::try_from(after).unwrap_or(i64::MAX);
+    let limit = i64::from(limit);
+    let mut stmt = conn
+        .prepare(
+            "SELECT message_json FROM chat_messages \
+             WHERE run_id = ? AND seq > ? ORDER BY seq LIMIT ?",
+        )
+        .map_err(storage_error)?;
+    let mut rows = stmt
+        .query(params![run_id.to_string(), after, limit])
+        .map_err(storage_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let json: String = row.get(0).map_err(storage_error)?;
+        out.push(codec::decode_chat(&json)?);
+    }
+    Ok(out)
+}
+
+pub fn put_profile(conn: &Connection, record: &UserProfileRecord) -> Result<(), AppError> {
+    if record.profile_id.trim().is_empty() {
+        return Err(AppError::Validation(
+            "profile id must not be empty".to_string(),
+        ));
+    }
+    let encoded = codec::encode_profile(record)?;
+    let changed = conn
+        .execute(
+            "UPDATE user_profiles SET record_json = ? WHERE profile_id = ?",
+            params![encoded, record.profile_id],
+        )
+        .map_err(storage_error)?;
+    if changed == 0 {
+        conn.execute(
+            "INSERT INTO user_profiles (profile_id, record_json) VALUES (?, ?)",
+            params![record.profile_id, encoded],
+        )
+        .map_err(storage_error)?;
+    }
+    Ok(())
+}
+
+pub fn get_profile(
+    conn: &Connection,
+    profile_id: &str,
+) -> Result<Option<UserProfileRecord>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT record_json FROM user_profiles WHERE profile_id = ?")
+        .map_err(storage_error)?;
+    let json: Option<String> = stmt
+        .query_row(params![profile_id], |row| row.get(0))
+        .optional()
+        .map_err(storage_error)?;
+    match json {
+        None => Ok(None),
+        Some(json) => Ok(Some(codec::decode_profile(&json)?)),
+    }
+}
+
+pub fn list_profiles(conn: &Connection) -> Result<Vec<UserProfileRecord>, AppError> {
+    let mut stmt = conn
+        .prepare("SELECT record_json FROM user_profiles ORDER BY profile_id")
+        .map_err(storage_error)?;
+    let mut rows = stmt.query([]).map_err(storage_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let json: String = row.get(0).map_err(storage_error)?;
+        out.push(codec::decode_profile(&json)?);
+    }
+    Ok(out)
 }

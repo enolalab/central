@@ -13,8 +13,9 @@ use axum::Json;
 use central_application::Runtime;
 use central_domain::{AttemptId, RunId};
 
-use super::auth::{app_error_response, authenticate, error_response, ApiError};
+use super::auth::{app_error_response, authenticate};
 use super::AppState;
+use crate::api::errors::{error_response, ApiError};
 
 fn runtime_for(state: &AppState, run_id: RunId) -> Runtime {
     Runtime::new(
@@ -31,23 +32,30 @@ pub async fn post_reconcile_attempt(
     headers: HeaderMap,
     Path((raw_id, raw_attempt)): Path<(String, String)>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
     let run_id = raw_id.parse::<RunId>().map_err(|_| {
-        error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw_id}"))
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
     })?;
     let attempt_id = raw_attempt.parse::<AttemptId>().map_err(|_| {
         error_response(
             StatusCode::BAD_REQUEST,
+            "validation_failed",
             format!("invalid attempt id: {raw_attempt}"),
         )
     })?;
     let evidence = runtime_for(&state, run_id)
-        .reconcile_attempt(actor, attempt_id)
+        .reconcile_attempt(auth.actor, attempt_id)
         .await
         .map_err(app_error_response)?;
     let evidence = serde_json::to_value(&evidence).map_err(|error| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
             format!("cannot encode reconcile evidence: {error}"),
         )
     })?;

@@ -19,8 +19,12 @@ use tokio::sync::{mpsc, oneshot};
 use super::writer::FailPoint;
 use super::writer::{self, SharedFailPoint};
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 const MIGRATION_SQL: &str = include_str!("migrations/001_runtime.sql");
+// P4 public API tables (migration 002). 001 is never reinterpreted:
+// this batch only adds tables, and version gating below applies it to
+// upgraded P1-P3 databases exactly once.
+const MIGRATION_002_SQL: &str = include_str!("migrations/002_public_api.sql");
 const CHANNEL_CAPACITY: usize = 64;
 
 type Reply<T> = oneshot::Sender<Result<T, AppError>>;
@@ -69,6 +73,55 @@ enum WriterMessage {
         state: Box<RunState>,
         expected_revision: central_domain::Revision,
         reply: Reply<()>,
+    },
+    SnapshotWithCursor {
+        id: RunId,
+        reply: Reply<Option<central_application::ports::store::SnapshotWithCursor>>,
+    },
+    EventsAfter {
+        id: RunId,
+        after: u64,
+        limit: u32,
+        reply: Reply<Vec<central_application::ports::store::SequencedEvent>>,
+    },
+    CreateClient {
+        record: Box<central_application::ports::store::ClientRecord>,
+        reply: Reply<()>,
+    },
+    ListClients {
+        reply: Reply<Vec<central_application::ports::store::ClientRecord>>,
+    },
+    GetClient {
+        client_id: String,
+        reply: Reply<Option<central_application::ports::store::ClientRecord>>,
+    },
+    RevokeClient {
+        client_id: String,
+        reply: Reply<bool>,
+    },
+    AppendChat {
+        id: RunId,
+        author: String,
+        body: String,
+        at: central_domain::Timestamp,
+        reply: Reply<central_application::ports::store::ChatMessage>,
+    },
+    ChatAfter {
+        id: RunId,
+        after: u64,
+        limit: u32,
+        reply: Reply<Vec<central_application::ports::store::ChatMessage>>,
+    },
+    PutProfile {
+        record: Box<central_application::ports::store::UserProfileRecord>,
+        reply: Reply<()>,
+    },
+    GetProfile {
+        profile_id: String,
+        reply: Reply<Option<central_application::ports::store::UserProfileRecord>>,
+    },
+    ListProfiles {
+        reply: Reply<Vec<central_application::ports::store::UserProfileRecord>>,
     },
 }
 
@@ -239,6 +292,55 @@ fn writer_loop(
             } => {
                 let _ = reply.send(writer::replace_state(&conn, &state, expected_revision));
             }
+            WriterMessage::SnapshotWithCursor { id, reply } => {
+                let _ = reply.send(writer::snapshot_with_cursor(&conn, id));
+            }
+            WriterMessage::EventsAfter {
+                id,
+                after,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(writer::events_after(&conn, id, after, limit));
+            }
+            WriterMessage::CreateClient { record, reply } => {
+                let _ = reply.send(writer::create_client(&conn, &record));
+            }
+            WriterMessage::ListClients { reply } => {
+                let _ = reply.send(writer::list_clients(&conn));
+            }
+            WriterMessage::GetClient { client_id, reply } => {
+                let _ = reply.send(writer::get_client(&conn, &client_id));
+            }
+            WriterMessage::RevokeClient { client_id, reply } => {
+                let _ = reply.send(writer::revoke_client(&conn, &client_id));
+            }
+            WriterMessage::AppendChat {
+                id,
+                author,
+                body,
+                at,
+                reply,
+            } => {
+                let _ = reply.send(writer::append_chat(&conn, id, &author, &body, at));
+            }
+            WriterMessage::ChatAfter {
+                id,
+                after,
+                limit,
+                reply,
+            } => {
+                let _ = reply.send(writer::chat_after(&conn, id, after, limit));
+            }
+            WriterMessage::PutProfile { record, reply } => {
+                let _ = reply.send(writer::put_profile(&conn, &record));
+            }
+            WriterMessage::GetProfile { profile_id, reply } => {
+                let _ = reply.send(writer::get_profile(&conn, &profile_id));
+            }
+            WriterMessage::ListProfiles { reply } => {
+                let _ = reply.send(writer::list_profiles(&conn));
+            }
         }
     }
 }
@@ -261,12 +363,22 @@ fn initialize_schema(conn: &Connection) -> Result<(), AppError> {
     }
     conn.execute_batch(MIGRATION_SQL)
         .map_err(writer::storage_error)?;
-    if version == 0 {
-        conn.execute(
-            "INSERT INTO schema_migrations (version) VALUES (?)",
-            duckdb::params![SCHEMA_VERSION],
-        )
-        .map_err(writer::storage_error)?;
+    if version < 2 {
+        conn.execute_batch(MIGRATION_002_SQL)
+            .map_err(writer::storage_error)?;
+        if version == 0 {
+            conn.execute(
+                "INSERT INTO schema_migrations (version) VALUES (?)",
+                duckdb::params![SCHEMA_VERSION],
+            )
+            .map_err(writer::storage_error)?;
+        } else {
+            conn.execute(
+                "UPDATE schema_migrations SET version = ?",
+                duckdb::params![SCHEMA_VERSION],
+            )
+            .map_err(writer::storage_error)?;
+        }
     }
     Ok(())
 }
@@ -355,6 +467,158 @@ impl Store for DuckDbStore {
             reply,
         })
         .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn snapshot_with_cursor(
+        &self,
+        id: RunId,
+    ) -> Result<Option<central_application::ports::store::SnapshotWithCursor>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::SnapshotWithCursor { id, reply })
+            .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn events_after(
+        &self,
+        id: RunId,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<central_application::ports::store::SequencedEvent>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::EventsAfter {
+            id,
+            after,
+            limit,
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn create_client(
+        &self,
+        record: &central_application::ports::store::ClientRecord,
+    ) -> Result<(), AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::CreateClient {
+            record: Box::new(record.clone()),
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn list_clients(
+        &self,
+    ) -> Result<Vec<central_application::ports::store::ClientRecord>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::ListClients { reply }).await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn get_client(
+        &self,
+        client_id: &str,
+    ) -> Result<Option<central_application::ports::store::ClientRecord>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::GetClient {
+            client_id: client_id.to_string(),
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn revoke_client(&self, client_id: &str) -> Result<bool, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::RevokeClient {
+            client_id: client_id.to_string(),
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn append_chat(
+        &self,
+        run_id: RunId,
+        author: &str,
+        body: &str,
+        at: central_domain::Timestamp,
+    ) -> Result<central_application::ports::store::ChatMessage, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::AppendChat {
+            id: run_id,
+            author: author.to_string(),
+            body: body.to_string(),
+            at,
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn chat_after(
+        &self,
+        run_id: RunId,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<central_application::ports::store::ChatMessage>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::ChatAfter {
+            id: run_id,
+            after,
+            limit,
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn put_profile(
+        &self,
+        record: &central_application::ports::store::UserProfileRecord,
+    ) -> Result<(), AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::PutProfile {
+            record: Box::new(record.clone()),
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn get_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<central_application::ports::store::UserProfileRecord>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::GetProfile {
+            profile_id: profile_id.to_string(),
+            reply,
+        })
+        .await?;
+        wait.await
+            .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
+    }
+
+    async fn list_profiles(
+        &self,
+    ) -> Result<Vec<central_application::ports::store::UserProfileRecord>, AppError> {
+        let (reply, wait) = oneshot::channel();
+        self.send(WriterMessage::ListProfiles { reply }).await?;
         wait.await
             .map_err(|_| AppError::Storage("storage writer dropped its reply".to_string()))?
     }

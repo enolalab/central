@@ -9,7 +9,7 @@ use clap::{Parser, Subcommand};
 
 /// Central local runtime CLI. Every run operation talks to the single
 /// owning daemon over its loopback API; the CLI never opens the
-/// database itself.
+/// database itself and never writes queue files directly.
 #[derive(Parser)]
 #[command(name = "central", version, about)]
 pub struct Cli {
@@ -28,6 +28,8 @@ pub enum Commands {
         #[command(subcommand)]
         command: DaemonCommands,
     },
+    /// Show daemon/API discovery info and check the contract version.
+    Meta,
     /// Create a run (the daemon allocates its id).
     Init {
         #[arg(long)]
@@ -50,13 +52,15 @@ pub enum Commands {
         #[command(subcommand)]
         command: PlanCommands,
     },
-    /// Worker-result operations (validated import route when the live
-    /// structured channel is unavailable; committing lands in P2/T5).
+    /// Worker-result operations: validate locally, then import through
+    /// the daemon so the candidate is sealed and parked for
+    /// verification. Importing never marks a task passed.
     Result {
         #[command(subcommand)]
         command: ResultCommands,
     },
-    /// Handover operations (validated import route for new sessions).
+    /// Handover operations: validate locally, then import through the
+    /// daemon with evidence inspection.
     Handover {
         #[command(subcommand)]
         command: HandoverCommands,
@@ -88,7 +92,8 @@ pub enum Commands {
         reason: Option<String>,
     },
     /// Answer a pending question by inbox key. Exactly one of --message
-    /// (plain) or --secret (memory-only; never persisted) is required.
+    /// (plain) or --secret-stdin (read from stdin, never argv/history)
+    /// is required. Secrets are memory-only and never persisted.
     Answer {
         #[arg(long)]
         run: RunId,
@@ -99,17 +104,94 @@ pub enum Commands {
         #[arg(long)]
         message: Option<String>,
         #[arg(long)]
-        secret: Option<String>,
+        secret_stdin: bool,
+    },
+    /// Event operations: ordered replay with durable cursors.
+    Events {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Keep polling from the cursor (1 s interval) until interrupted.
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Bounded evidence reads for a run, optionally one attempt.
+    Logs {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        attempt: Option<AttemptId>,
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Keep polling until interrupted.
+        #[arg(long)]
+        follow: bool,
+    },
+    /// Artifact metadata and hash-verified content windows.
+    Artifacts {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        id: Option<String>,
+        /// Show content (bounded window; --offset/--limit apply).
+        #[arg(long)]
+        content: bool,
+        #[arg(long)]
+        offset: Option<usize>,
+        #[arg(long)]
+        limit: Option<usize>,
+    },
+    /// Leader conversation: post a message or read history. Posting is
+    /// discussion only and never approves, answers or dispatches.
+    Chat {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        message: Option<String>,
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long)]
+        limit: Option<u32>,
+    },
+    /// Agent profiles: user-supplied configuration with capability
+    /// assessment. Attempts keep their frozen copy.
+    Profiles {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
+    /// Client credentials: issue, list and revoke scoped tokens.
+    /// Owner only. Issuance prints the secret once; it is never stored.
+    Clients {
+        #[command(subcommand)]
+        command: ClientCommands,
     },
     /// Show the shared budget ledger of a run (limits, totals, unknown).
     Budget {
         #[arg(long)]
         run: RunId,
     },
-    /// Queue the user's commit for a run without touching the user
-    /// worktree: the commit is verified read-only and a sync intent is
-    /// appended under the state dir for the daemon to pick up. Never
-    /// checks out, stashes or pulls.
+    /// Resolve one missing-usage gap by explicit audited decision.
+    /// Releases the hold without fabricating observed usage.
+    UsageResolve {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        missing_key: String,
+        #[arg(long)]
+        note: String,
+    },
+    /// Recovery report: passive findings plus required user actions.
+    /// Never dispatches, answers or resumes.
+    Recovery {
+        #[arg(long)]
+        run: Option<RunId>,
+    },
+    /// Queue the user's commit through the daemon without touching the
+    /// user worktree: the commit is verified read-only daemon-side.
+    /// Never checks out, stashes or pulls.
     Sync {
         #[arg(long)]
         run: RunId,
@@ -144,6 +226,12 @@ pub enum Commands {
         run: RunId,
         #[arg(long)]
         attempt: AttemptId,
+    },
+    /// Owner-only maintenance: redacted state report (never a backup,
+    /// never credentials) or explicit dry-run garbage collection.
+    Maintenance {
+        #[command(subcommand)]
+        command: MaintenanceCommands,
     },
     /// Pause a running run (in-flight attempts finish).
     Pause {
@@ -195,13 +283,28 @@ pub enum PlanCommands {
         #[arg(long)]
         hash: Option<PlanHashArg>,
     },
+    /// Show one exact plan revision (or the pending/active pointer).
+    Show {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        hash: Option<String>,
+    },
+    /// Diff two exact plan revisions.
+    Diff {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+    },
 }
 
 #[derive(Subcommand)]
 pub enum ResultCommands {
-    /// Validate a worker-result JSON file against its schema: version,
-    /// attempt scope (flag and run state), contained paths, content hash.
-    /// Prints the hash; committing the candidate lands in P2/T5 verification.
+    /// Import a worker-result JSON file through the daemon: validated,
+    /// sealed and parked for verification. Never marks a task passed.
     Import {
         #[arg(long)]
         run: RunId,
@@ -214,13 +317,74 @@ pub enum ResultCommands {
 
 #[derive(Subcommand)]
 pub enum HandoverCommands {
-    /// Validate a handover JSON file against its schema: version, contained
-    /// artifact paths, verified/unverified separation, content hash.
+    /// Import a handover JSON file through the daemon with evidence
+    /// inspection. Unbacked claims stay unverified.
     Import {
         #[arg(long)]
         run: RunId,
         #[arg(long)]
         file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ProfileCommands {
+    /// List stored profiles with capability assessment.
+    List,
+    /// Show one profile.
+    Get {
+        #[arg(long)]
+        id: String,
+    },
+    /// Create or replace a profile from flags (config JSON optional).
+    Create {
+        #[arg(long)]
+        id: Option<String>,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        model: String,
+        #[arg(long)]
+        effort: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ClientCommands {
+    /// List clients (metadata only; owner only).
+    List,
+    /// Issue a scoped credential (owner only). Prints the secret once.
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        scope: String,
+        /// Bridge role (bridge scope only).
+        #[arg(long)]
+        role: Option<String>,
+        /// Bound attempt (bridge scope only).
+        #[arg(long)]
+        attempt: Option<AttemptId>,
+    },
+    /// Revoke a credential (owner only). Open streams close.
+    Revoke {
+        #[arg(long)]
+        id: String,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum MaintenanceCommands {
+    /// Redacted state report (never credentials).
+    Export,
+    /// Explicit dry-run garbage collection. Active, unknown or
+    /// referenced work is never a candidate.
+    Gc {
+        /// Required: deletion never runs without an explicit dry run.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 

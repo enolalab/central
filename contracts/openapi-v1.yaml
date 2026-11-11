@@ -1,0 +1,418 @@
+# Central Public Client API — OpenAPI 3.1.2 contract (v1.0.0).
+#
+# Human-readable mirror of contracts/openapi-v1.json, which is the
+# machine-readable document the daemon serves at /v1/openapi.json.
+# Both describe the same surface; the contract tests assert the JSON
+# mirror covers every served route. Secrets never appear in URLs,
+# logs, events or examples; the issuance secret is returned once and
+# never stored.
+
+openapi: 3.1.2
+info:
+  title: Central Public Client API
+  version: 1.0.0
+  description: >-
+    Versioned HTTP JSON API shared by the Central CLI and independent
+    clients. No UI is served. Auth is header-only bearer (owner token,
+    client token <client_id>.<secret>, or attempt-bound bridge token);
+    query-string tokens are ignored. Browser callers additionally pass
+    the owner-configured Origin allowlist; every request still needs
+    its bearer token, including SSE.
+
+security:
+  - bearer: []
+
+paths:
+  /healthz:
+    get:
+      summary: Minimal liveness probe. No auth, no secrets.
+      responses:
+        '200': { description: ok }
+
+  /v1/meta:
+    get:
+      summary: API version, instance epoch and real capabilities.
+      responses:
+        '200': { description: MetaV1 }
+        '401': { description: auth_required }
+
+  /v1/openapi.json:
+    get:
+      summary: This contract document.
+      responses:
+        '200': { description: OpenAPI 3.1.2 }
+
+  /v1/commands:
+    post:
+      summary: >-
+        Commit one command. CreateRun needs no run query; every other
+        command needs ?run=<id>. Same id plus same payload replays the
+        receipt; same id plus changed payload is 409. Scheduler-internal
+        and harness-internal commands are not operator rights (403).
+      responses:
+        '200': { description: ReceiptV1, plus a dispatch field for Resume/Stop }
+        '400': { description: validation_failed }
+        '401': { description: auth_required }
+        '403': { description: forbidden }
+        '404': { description: not_found }
+        '409': { description: stale_revision, stale_target or command_conflict }
+
+  /v1/runs:
+    get:
+      summary: Paginated run list (PageV1). Default limit 100, max 500.
+      responses:
+        '200': { description: PageV1 }
+        '400': { description: bad cursor or limit }
+
+  /v1/runs/{id}:
+    get:
+      summary: >-
+        Consistent snapshot with durable cursor (RunSnapshotV1).
+        ?known_epoch= proves a post-restart resnapshot; a stale epoch
+        is 409 resync_required.
+      responses:
+        '200': { description: RunSnapshotV1 }
+        '404': { description: not_found }
+        '409': { description: resync_required }
+
+  /v1/runs/{id}/tasks:
+    get:
+      summary: Task views with status, dependencies, verification linkage and wait reasons.
+      responses:
+        '200': { description: TaskViewV1 list }
+
+  /v1/runs/{id}/tasks/{task}:
+    get:
+      summary: One task view.
+      responses:
+        '200': { description: TaskViewV1 }
+        '404': { description: not_found }
+
+  /v1/runs/{id}/attempts/{attempt}:
+    get:
+      summary: One attempt view with frozen bindings and session evidence.
+      responses:
+        '200': { description: AttemptViewV1 }
+        '404': { description: not_found }
+
+  /v1/runs/{id}/plans:
+    get:
+      summary: Plan revisions with status and the pending/active pointers.
+      responses:
+        '200': { description: PlanViewV1 list }
+
+  /v1/runs/{id}/plans/{hash}:
+    get:
+      summary: One exact plan revision. Approvals target this hash, never an implicit latest.
+      responses:
+        '200': { description: PlanViewV1 }
+        '404': { description: not_found }
+
+  /v1/runs/{id}/plans/diff:
+    get:
+      summary: Diff two revisions (?from=&to=): added/removed/changed tasks and criteria moves.
+      responses:
+        '200': { description: PlanDiffV1 }
+        '404': { description: not_found }
+
+  /v1/runs/{id}/events:
+    get:
+      summary: >-
+        Cursor pages over the durable event log
+        (?after=&limit=&known_epoch=). A cursor beyond history is 409
+        resync_required.
+      responses:
+        '200': { description: EventViewV1 page }
+        '400': { description: invalid cursor or limit }
+        '409': { description: resync_required }
+
+  /v1/runs/{id}/events/stream:
+    get:
+      summary: >-
+        Authenticated SSE. Durable seq as event id, ?after= or
+        Last-Event-ID resume, 15 s keepalive, bounded backpressure, a
+        resync_required frame on gap or instance change. Header auth only.
+      responses:
+        '200': { description: text/event-stream }
+        '401': { description: auth_required }
+
+  /v1/runs/{id}/chat:
+    get:
+      summary: Durable conversation page. Discussion only.
+      responses:
+        '200': { description: ChatMessageViewV1 page }
+    post:
+      summary: >-
+        Post one message through the budget/pause gates. Never approves,
+        answers or dispatches. Owner or control only.
+      responses:
+        '200': { description: ChatMessageViewV1 }
+        '403': { description: forbidden }
+        '409': { description: run held or stopped }
+
+  /v1/runs/{id}/inbox:
+    get:
+      summary: Pending approval/question entries (redacted).
+      responses:
+        '200': { description: InboxViewV1 list }
+
+  /v1/runs/{id}/inbox/approve:
+    post:
+      summary: >-
+        Approve one action approval by canonical key plus preview hash.
+        Owner or control only; agent bridges never approve.
+      responses:
+        '200': { description: ReceiptV1 }
+        '403': { description: forbidden }
+        '409': { description: stale_target }
+
+  /v1/runs/{id}/inbox/decline:
+    post:
+      summary: Decline one action approval with a reason. Owner or control only.
+      responses:
+        '200': { description: ReceiptV1 }
+
+  /v1/runs/{id}/inbox/answer:
+    post:
+      summary: >-
+        Answer one question with exactly one of message or secret.
+        Secrets are memory-only and never persisted. Owner or control only.
+      responses:
+        '200': { description: ReceiptV1 }
+
+  /v1/runs/{id}/inbox/reconcile:
+    post:
+      summary: Passively reconcile inbox against one harness session. No sends. Owner or control only.
+      responses:
+        '200': { description: reconcile summary }
+
+  /v1/runs/{id}/attempts/{attempt_id}/reconcile:
+    post:
+      summary: Store harness evidence durably without starting inference. Owner or control only.
+      responses:
+        '200': { description: reconcile evidence }
+
+  /v1/runs/{id}/attempts/{attempt}/results:
+    post:
+      summary: >-
+        Import one worker result with binding and candidate validation.
+        Records durably and parks for verification; never marks pass.
+        Owner, control or the attempt's bridge.
+      responses:
+        '200': { description: receipt plus seal }
+        '403': { description: forbidden }
+        '404': { description: foreign attempt }
+
+  /v1/runs/{id}/handover:
+    post:
+      summary: >-
+        Import one session handover with evidence inspection. Unbacked
+        claims stay unverified. Owner, control or the predecessor's bridge.
+      responses:
+        '200': { description: receipt plus handover hash }
+
+  /v1/runs/{id}/usage:
+    get:
+      summary: Usage ledger with the observed/estimated/unknown split plus the admission reason.
+      responses:
+        '200': { description: UsageViewV1 }
+
+  /v1/runs/{id}/usage/resolve:
+    post:
+      summary: >-
+        Resolve one missing-final gap by explicit audited decision.
+        Releases the hold without fabricating observed usage. Owner or
+        control only.
+      responses:
+        '200': { description: ReceiptV1 }
+
+  /v1/runs/{id}/recovery:
+    get:
+      summary: Passive findings plus required user actions for one run. Never dispatches or resumes.
+      responses:
+        '200': { description: RecoveryViewV1 }
+
+  /v1/recovery:
+    get:
+      summary: Daemon-level recovery overview across runs plus the instance epoch.
+      responses:
+        '200': { description: recovery overview }
+
+  /v1/runs/{id}/artifacts:
+    get:
+      summary: ID-scoped artifact metadata with provenance.
+      responses:
+        '200': { description: ArtifactViewV1 list }
+
+  /v1/runs/{id}/artifacts/{artifact}:
+    get:
+      summary: One artifact's metadata. Path escapes are refused.
+      responses:
+        '200': { description: ArtifactViewV1 }
+        '404': { description: not_found }
+
+  /v1/runs/{id}/artifacts/{artifact}/content:
+    get:
+      summary: Hash-verified bytes with bounded offset/limit windows (1 MiB cap).
+      responses:
+        '200': { description: artifact content window }
+
+  /v1/runs/{id}/logs:
+    get:
+      summary: >-
+        Bounded run-scoped evidence reads (observations plus redacted
+        event tail). Live updates flow through the event stream.
+      responses:
+        '200': { description: log entries }
+        '400': { description: bad window }
+
+  /v1/runs/{id}/sync:
+    post:
+      summary: >-
+        Queue the user's commit daemon-side after read-only
+        verification. Never checks out, stashes or pulls. Owner or
+        control only.
+      responses:
+        '200': { description: queued sync }
+
+  /v1/runs/{id}/dispatch:
+    post:
+      summary: >-
+        Dispatch pending outbox intents once through the run gate.
+        Parked runs send nothing. Owner or control only.
+      responses:
+        '200': { description: dispatch summary }
+
+  /v1/profiles:
+    get:
+      summary: User-supplied profiles with live capability assessment.
+      responses:
+        '200': { description: ProfileViewV1 list }
+    post:
+      summary: Create or replace a profile. Attempts keep their frozen copy. Owner or control only.
+      responses:
+        '200': { description: ProfileViewV1 }
+
+  /v1/profiles/{id}:
+    get:
+      summary: One profile with its capability assessment.
+      responses:
+        '200': { description: ProfileViewV1 }
+        '404': { description: not_found }
+
+  /v1/clients:
+    get:
+      summary: Client metadata (no secrets, no hashes). Owner only.
+      responses:
+        '200': { description: ClientCredentialV1 list }
+        '403': { description: forbidden }
+    post:
+      summary: Issue a scoped credential. The secret is returned once, never stored. Owner only.
+      responses:
+        '200': { description: issuance answer }
+        '403': { description: forbidden }
+
+  /v1/clients/{id}/revoke:
+    post:
+      summary: >-
+        Revoke a credential. Effective on new requests immediately;
+        open streams close at the next tick. Owner only.
+      responses:
+        '200': { description: revocation }
+        '404': { description: not_found }
+
+  /v1/maintenance/export:
+    post:
+      summary: Redacted state report (never a database backup, never credentials). Owner only.
+      responses:
+        '200': { description: export report }
+
+  /v1/maintenance/gc:
+    post:
+      summary: >-
+        Dry-run-first garbage collection. Active, unknown or referenced
+        work is never a candidate; non-dry-run calls are refused. Owner only.
+      responses:
+        '200': { description: gc report }
+        '400': { description: dry run required }
+
+  /v1/shutdown:
+    post:
+      summary: Graceful daemon shutdown. Owner only.
+      responses:
+        '200': { description: status }
+        '403': { description: forbidden }
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      description: >-
+        Owner token, client token (<client_id>.<secret>) or bridge
+        token. Header only; query tokens are ignored.
+  schemas:
+    ApiErrorV1:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, details]
+          properties:
+            code:
+              type: string
+              enum: [validation_failed, auth_required, forbidden, not_found,
+                stale_revision, stale_target, command_conflict, conflict,
+                resync_required, capability_unavailable, transport_error,
+                internal_error]
+            message: { type: string }
+            details: { type: object }
+    CommandEnvelopeV1:
+      type: object
+      required: [id, command]
+      properties:
+        id: { type: string, format: uuid }
+        expected_revision: { type: [integer, 'null'] }
+        command: { type: object }
+    ReceiptV1:
+      type: object
+      required: [command_id, run_id, revision, result, payload_hash]
+      properties:
+        command_id: { type: string }
+        run_id: { type: string }
+        revision: { type: integer }
+        result: { type: string }
+        payload_hash: { type: string }
+    RunSnapshotV1:
+      type: object
+      required: [instance_epoch, revision, last_seq, state]
+      properties:
+        instance_epoch: { type: string }
+        revision: { type: integer }
+        last_seq: { type: integer }
+        state: { type: object }
+    EventViewV1:
+      type: object
+      required: [seq, run_id, kind, at, payload]
+      properties:
+        seq: { type: integer }
+        run_id: { type: string }
+        kind: { type: string }
+        at: { type: integer }
+        payload: { type: object }
+    PageV1:
+      type: object
+      required: [items, next_cursor]
+      properties:
+        items: { type: array, items: {} }
+        next_cursor: { type: [string, 'null'] }
+    ClientCredentialV1:
+      type: object
+      required: [client_id, name, scope, revoked]
+      properties:
+        client_id: { type: string }
+        name: { type: string }
+        scope: { type: string, enum: [read, control, bridge] }
+        expires_at: { type: [integer, 'null'] }
+        revoked: { type: boolean }

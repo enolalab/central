@@ -1,6 +1,6 @@
 use std::fmt;
 
-use crate::{PlanHash, TaskId};
+use crate::{AttemptId, PlanHash, TaskId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DomainError {
@@ -39,6 +39,8 @@ pub enum DomainError {
     QueueConflict(String),
     /// The named task is not part of this run.
     UnknownTask(TaskId),
+    /// The named attempt is not part of this run (P4 worker-result path).
+    UnknownAttempt(AttemptId),
 }
 
 impl fmt::Display for DomainError {
@@ -80,6 +82,7 @@ impl fmt::Display for DomainError {
             ),
             Self::QueueConflict(reason) => write!(f, "task is not queueable now: {reason}"),
             Self::UnknownTask(id) => write!(f, "unknown task: {id}"),
+            Self::UnknownAttempt(id) => write!(f, "unknown attempt: {id}"),
         }
     }
 }

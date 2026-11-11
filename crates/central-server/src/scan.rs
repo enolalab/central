@@ -79,11 +79,70 @@ impl ScanConfig {
     }
 }
 
-fn resolver(fake_agent: bool) -> Arc<central_application::scheduler::ProfileResolver> {
+/// Owner-supplied profile registry (P4 step 8): user profiles stored
+/// via the API, refreshed from the store on every scan pass. Attempts
+/// keep the frozen copy they dispatched with; a refresh never rewrites
+/// history — it only changes what future dispatches resolve.
+pub type ProfileCache = Arc<std::sync::RwLock<HashMap<String, ResolvedProfile>>>;
+
+pub fn empty_profile_cache() -> ProfileCache {
+    Arc::new(std::sync::RwLock::new(HashMap::new()))
+}
+
+fn profile_from_record(
+    record: &central_application::ports::store::UserProfileRecord,
+) -> ResolvedProfile {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    record.profile_id.hash(&mut hasher);
+    let digest = hasher.finish() as u128;
+    ResolvedProfile {
+        id: record
+            .profile_id
+            .parse()
+            .unwrap_or_else(|_| central_domain::ProfileId::from_u128(digest)),
+        provider: record.provider.clone(),
+        model: record.model.clone(),
+        effort: record.effort.clone(),
+        skills: Vec::new(),
+        subagents: Vec::new(),
+        permissions: Vec::new(),
+        fallbacks: Vec::new(),
+        hash: ContentHash::from_hex(format!("profile:{}", record.profile_id)),
+    }
+}
+
+/// Refresh the registry from the store. A failed refresh keeps the
+/// previous cache: dispatch waits rather than substituting.
+async fn refresh_profiles(store: &Arc<dyn Store>, cache: &ProfileCache) {
+    let Ok(records) = store.list_profiles().await else {
+        return;
+    };
+    let mut next = HashMap::new();
+    for record in records {
+        next.insert(record.profile_id.clone(), profile_from_record(&record));
+    }
+    if let Ok(mut guard) = cache.write() {
+        *guard = next;
+    }
+}
+
+fn resolver(
+    fake_agent: bool,
+    profiles: ProfileCache,
+) -> Arc<central_application::scheduler::ProfileResolver> {
     Arc::new(move |task: &Task| {
-        if task.profile_id.is_some() {
-            // No profile registry is wired yet: a pinned task waits for
-            // one rather than dispatching on a substituted profile.
+        if let Some(pinned) = task.profile_id.as_ref() {
+            // Pinned tasks resolve through the owner registry: a stored
+            // profile dispatches on its frozen copy, anything else waits
+            // rather than dispatching on a substituted profile.
+            let key = pinned.to_string();
+            if let Ok(guard) = profiles.read() {
+                if let Some(profile) = guard.get(&key) {
+                    return Some(profile.clone());
+                }
+            }
             return None;
         }
         if fake_agent {
@@ -101,6 +160,7 @@ fn scheduler_for(
     agent: &Arc<dyn AgentGateway>,
     actor: &Actor,
     config: &ScanConfig,
+    profiles: &ProfileCache,
 ) -> Result<Scheduler, central_application::contracts::AppError> {
     Scheduler::new(
         Arc::clone(store),
@@ -108,7 +168,7 @@ fn scheduler_for(
         Arc::clone(ids),
         Arc::clone(agent),
         config.scheduler.clone(),
-        resolver(config.fake_agent),
+        resolver(config.fake_agent, Arc::clone(profiles)),
         actor.clone(),
     )
 }
@@ -117,6 +177,7 @@ fn scheduler_for(
 /// A run that is not `Running` is skipped (it resumes only explicitly);
 /// a stale cadence entry is skipped via `should_tick`. Failures are
 /// per-run: one bad run never stops the scan of the rest.
+#[allow(clippy::too_many_arguments)]
 pub async fn tick_all(
     store: &Arc<dyn Store>,
     clock: &Arc<dyn Clock>,
@@ -124,9 +185,13 @@ pub async fn tick_all(
     agent: &Arc<dyn AgentGateway>,
     actor: &Actor,
     config: &ScanConfig,
+    profiles: &ProfileCache,
     last_tick: &mut HashMap<RunId, Timestamp>,
 ) -> (usize, usize, usize) {
-    let scheduler = match scheduler_for(store, clock, ids, agent, actor, config) {
+    // The owner registry refreshes every pass; a failed refresh keeps
+    // the previous cache, so dispatch waits rather than substituting.
+    refresh_profiles(store, profiles).await;
+    let scheduler = match scheduler_for(store, clock, ids, agent, actor, config, profiles) {
         Ok(scheduler) => scheduler,
         Err(error) => {
             eprintln!("central-server: scan scheduler unavailable: {error}");
@@ -189,6 +254,7 @@ pub fn spawn_scan_loop(
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_tick: HashMap<RunId, Timestamp> = HashMap::new();
+        let profiles = empty_profile_cache();
         let interval = Duration::from_millis(config.interval_ms.max(1));
         loop {
             tokio::select! {
@@ -202,6 +268,7 @@ pub fn spawn_scan_loop(
                 &agent,
                 &actor,
                 &config,
+                &profiles,
                 &mut last_tick,
             )
             .await;

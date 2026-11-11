@@ -1,8 +1,20 @@
-//! `POST /v1/commands` — the only write path. The body is a bare
-//! `CommandEnvelope` (which carries no run id by contract), so the
+//! `POST /v1/commands` — the only generic write path. The body is a
+//! bare `CommandEnvelope` (which carries no run id by contract), so the
 //! target run travels as the `?run=<uuid>` query parameter; a
 //! `CreateRun` command needs no target and the daemon allocates the
-//! run id. That choice is recorded in `docs/validation/p1-runtime.md`.
+//! run id.
+//!
+//! Public allowlist: scheduler-internal and harness-internal commands
+//! (`QueueAttempt`, `StartDispatch`, `AttemptRunning/Unknown`,
+//! `RequeueAttempt`, `AttemptFailed`, `ReopenTask`, `DeferRetry`,
+//! `NoteFallback`, `RecordExternalRequest`, `RecordObservation`) are
+//! never operator rights — the public gateway refuses them with 403
+//! even for the owner. They run inside the daemon (scheduler, scan,
+//! gateway observation) or through specialized endpoints (`results`,
+//! `handover`) that seal and validate first. `RecordWorkerResult` is
+//! the one durable harness-adjacent command: owner imports and the
+//! attempt-bound bridge may file it, and it parks for verification,
+// never passes over the generic gateway.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -14,8 +26,9 @@ use central_application::ports::{Clock, IdSource};
 use central_application::Runtime;
 use central_domain::{Command, CommandEnvelope, RunId};
 
-use super::auth::{app_error_response, authenticate, error_response, ApiError};
+use super::auth::{app_error_response, authenticate, Auth, AuthScope};
 use super::AppState;
+use crate::api::errors::{error_response, ApiError};
 
 fn runtime_for(state: &AppState, run_id: RunId) -> Runtime {
     Runtime::new(
@@ -29,13 +42,64 @@ fn runtime_for(state: &AppState, run_id: RunId) -> Runtime {
     .with_secrets(Arc::clone(&state.secrets))
 }
 
+/// Whether `auth` may issue `command` over the public gateway.
+/// System/agent commands are not operator rights: 403 for everyone,
+/// including the owner. A bridge token may only file its own
+/// attempt's worker result.
+fn authorize_command(
+    auth: &Auth,
+    envelope_run: Option<RunId>,
+    command: &Command,
+) -> Result<(), ApiError> {
+    let forbidden_system = || {
+        error_response(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "scheduler-internal commands are not public operator rights",
+        )
+    };
+    match command {
+        Command::QueueAttempt { .. }
+        | Command::StartDispatch { .. }
+        | Command::AttemptRunning { .. }
+        | Command::AttemptUnknown { .. }
+        | Command::RequeueAttempt { .. }
+        | Command::AttemptFailed { .. }
+        | Command::ReopenTask { .. }
+        | Command::DeferRetry { .. }
+        | Command::NoteFallback { .. }
+        | Command::RecordExternalRequest { .. }
+        | Command::RecordObservation { .. } => Err(forbidden_system()),
+        Command::RecordWorkerResult { attempt, .. } => match &auth.scope {
+            AuthScope::Owner | AuthScope::Control => Ok(()),
+            AuthScope::Bridge { attempt: bound, .. } if bound == attempt => Ok(()),
+            AuthScope::Bridge { .. } => Err(error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "bridge tokens file results only for their bound attempt",
+            )),
+            AuthScope::Read => Err(error_response(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "read tokens cannot write",
+            )),
+        },
+        _ => {
+            // Every other (user-level) command needs workflow rights;
+            // read and bridge scopes never pass here.
+            let _ = envelope_run;
+            auth.require_control()
+        }
+    }
+}
+
 pub async fn post_command(
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
     Json(envelope): Json<CommandEnvelope>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
     let is_create = matches!(envelope.command, Command::CreateRun { .. });
     let run_id = if is_create {
         state.ids.next_run_id()
@@ -43,17 +107,23 @@ pub async fn post_command(
         let raw = query.get("run").ok_or_else(|| {
             error_response(
                 StatusCode::BAD_REQUEST,
+                "validation_failed",
                 "non-create commands require ?run=<run-id>",
             )
         })?;
         raw.parse::<RunId>().map_err(|_| {
-            error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw}"))
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                format!("invalid run id: {raw}"),
+            )
         })?
     };
+    authorize_command(&auth, Some(run_id), &envelope.command)?;
 
     let runtime = runtime_for(&state, run_id);
     let receipt = runtime
-        .execute(actor, envelope.clone())
+        .execute(auth.actor.clone(), envelope.clone())
         .await
         .map_err(app_error_response)?;
 
@@ -75,6 +145,7 @@ pub async fn post_command(
     let receipt = serde_json::to_value(&receipt).map_err(|error| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
             format!("cannot encode receipt: {error}"),
         )
     })?;
@@ -122,9 +193,14 @@ pub async fn dispatch(
     headers: HeaderMap,
     axum::extract::Path(raw_id): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
     let run_id = raw_id.parse::<RunId>().map_err(|_| {
-        error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw_id}"))
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
     })?;
     let runtime = runtime_for(&state, run_id);
     let summary = runtime
@@ -144,7 +220,8 @@ pub async fn shutdown(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_owner()?;
     if let Ok(mut slot) = state.shutdown.lock() {
         if let Some(sender) = slot.take() {
             let _ = sender.send(());

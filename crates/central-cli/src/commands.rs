@@ -1,7 +1,11 @@
 //! CLI command implementations. All run operations go through the
 //! daemon API; the only local files touched are the daemon discovery
-//! files (`server.json`, `daemon.token`, `daemon.log`).
+//! files (`server.json`, `daemon.token`, `daemon.log`). Every command
+//! prints stable JSON and exits nonzero with the daemon's error code
+//! on failure. Secrets never travel via argv: `--secret-stdin` reads
+//! them from stdin.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -11,7 +15,10 @@ use central_domain::{
 use central_infrastructure::process::{spawn_detached, DetachPlacement, ALREADY_RUNNING_EXIT_CODE};
 
 use crate::client::{health_ok, read_server_info, resolve_state_dir, DaemonClient};
-use crate::{Cli, Commands, DaemonCommands, HandoverCommands, PlanCommands, ResultCommands};
+use crate::{
+    Cli, ClientCommands, Commands, DaemonCommands, HandoverCommands, MaintenanceCommands,
+    PlanCommands, ProfileCommands, ResultCommands,
+};
 
 fn print_json(value: &serde_json::Value) {
     println!(
@@ -29,6 +36,7 @@ pub fn execute(cli: Cli) -> i32 {
     let state_dir = resolve_state_dir(cli.state_dir.clone());
     match &cli.command {
         Commands::Daemon { command } => daemon(&state_dir, command),
+        Commands::Meta => meta(&state_dir),
         Commands::Init { goal, repository } => {
             let client = match client(&state_dir) {
                 Ok(client) => client,
@@ -84,6 +92,12 @@ pub fn execute(cli: Cli) -> i32 {
         Commands::Result { command } => result(&state_dir, command),
         Commands::Handover { command } => handover_cmd(&state_dir, command),
         Commands::Budget { run } => budget(&state_dir, run),
+        Commands::UsageResolve {
+            run,
+            missing_key,
+            note,
+        } => usage_resolve(&state_dir, run, missing_key, note),
+        Commands::Recovery { run } => recovery(&state_dir, run.as_ref()),
         Commands::Sync {
             run,
             commit,
@@ -124,8 +138,42 @@ pub fn execute(cli: Cli) -> i32 {
             key,
             preview_hash,
             message,
-            secret,
-        } => inbox_answer(&state_dir, run, key, preview_hash, message, secret),
+            secret_stdin,
+        } => inbox_answer(&state_dir, run, key, preview_hash, message, *secret_stdin),
+        Commands::Events {
+            run,
+            after,
+            limit,
+            follow,
+        } => events(&state_dir, run, after.as_deref(), *limit, *follow),
+        Commands::Logs {
+            run,
+            attempt,
+            limit,
+            follow,
+        } => logs(&state_dir, run, attempt.as_ref(), *limit, *follow),
+        Commands::Artifacts {
+            run,
+            id,
+            content,
+            offset,
+            limit,
+        } => artifacts(&state_dir, run, id.as_deref(), *content, *offset, *limit),
+        Commands::Chat {
+            run,
+            message,
+            after,
+            limit,
+        } => chat(
+            &state_dir,
+            run,
+            message.as_deref(),
+            after.as_deref(),
+            *limit,
+        ),
+        Commands::Profiles { command } => profiles(&state_dir, command),
+        Commands::Clients { command } => clients(&state_dir, command),
+        Commands::Maintenance { command } => maintenance(&state_dir, command),
     }
 }
 
@@ -139,6 +187,18 @@ fn current_revision(client: &DaemonClient, run: &RunId) -> Result<Revision, Stri
         .as_u64()
         .ok_or("run response has no revision")?;
     Ok(Revision(revision))
+}
+
+/// Whether the run snapshot contains the attempt (the projected
+/// `state.attempts` is an array, never a map).
+fn snapshot_has_attempt(view: &serde_json::Value, attempt: &AttemptId) -> bool {
+    view["state"]["attempts"]
+        .as_array()
+        .is_some_and(|attempts| {
+            attempts
+                .iter()
+                .any(|entry| entry["attempt_id"] == attempt.to_string())
+        })
 }
 
 fn send_command(
@@ -159,6 +219,23 @@ fn send_command(
         None => "/v1/commands".to_string(),
     };
     client.post_json(&path, &body)
+}
+
+/// Discovery: the daemon's version, instance and real capabilities.
+/// The version check already ran in `DaemonClient::discover`; this
+/// prints the same document for scripts and independent clients.
+fn meta(state_dir: &Path) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.get("/v1/meta") {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
 }
 
 /// Passively reconcile one attempt through the daemon: the harness
@@ -206,53 +283,72 @@ fn budget(state_dir: &Path, run: &RunId) -> i32 {
         Ok(client) => client,
         Err(code) => return code,
     };
-    match client.get(&format!("/v1/runs/{run}")) {
+    match client.get(&format!("/v1/runs/{run}/usage")) {
         Ok(view) => {
-            print_json(&serde_json::json!({
-                "run_id": run.to_string(),
-                "revision": view["state"]["revision"],
-                "usage": view["state"]["usage"],
-                "holds": view["state"]["holds"],
-            }));
+            print_json(&view);
             0
         }
         Err(message) => fail(&message),
     }
 }
 
-/// Queue the user's commit for a run. The repository defaults to the
-/// run's own repository from the daemon; the commit is verified read-only
-/// and the worktree is never touched — no checkout, stash or pull. The
-/// intent lands in the state-dir sync queue for the daemon to pick up.
-fn sync(state_dir: &Path, run: &RunId, commit: &str, repository: Option<&Path>) -> i32 {
-    let repo: PathBuf = match repository {
-        Some(dir) => dir.to_path_buf(),
-        None => {
-            let client = match client(state_dir) {
-                Ok(client) => client,
-                Err(code) => return code,
-            };
-            match client.get(&format!("/v1/runs/{run}")) {
-                Ok(view) => match view["state"]["repository"].as_str() {
-                    Some(dir) => PathBuf::from(dir),
-                    None => return fail("run response has no repository"),
-                },
-                Err(message) => return fail(&message),
-            }
-        }
+/// Resolve one missing-usage gap by explicit audited decision. The
+/// hold releases without converting anything missing into observed.
+fn usage_resolve(state_dir: &Path, run: &RunId, missing_key: &str, note: &str) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
     };
-    match central_infrastructure::workspace::queue_user_commit(state_dir, *run, &repo, commit) {
-        Ok(intent) => {
-            print_json(&serde_json::json!({
-                "status": "queued",
-                "run_id": run.to_string(),
-                "commit": intent.commit,
-                "repository": intent.repository,
-                "dirty_fingerprint": intent.dirty_fingerprint,
-            }));
+    match client.post_json(
+        &format!("/v1/runs/{run}/usage/resolve"),
+        &serde_json::json!({ "missing_key": missing_key, "note": note }),
+    ) {
+        Ok(receipt) => {
+            print_json(&receipt);
             0
         }
-        Err(message) => fail(&message.to_string()),
+        Err(message) => fail(&message),
+    }
+}
+
+/// Recovery report for one run (or the daemon overview without --run).
+/// Passive findings plus required actions; never dispatches or resumes.
+fn recovery(state_dir: &Path, run: Option<&RunId>) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let result = match run {
+        Some(run) => client.get(&format!("/v1/runs/{run}/recovery")),
+        None => client.get("/v1/recovery"),
+    };
+    match result {
+        Ok(view) => {
+            print_json(&view);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Queue the user's commit through the daemon: the commit is verified
+/// read-only daemon-side and the worktree is never touched — no
+/// checkout, stash or pull. The CLI never writes queue files.
+fn sync(state_dir: &Path, run: &RunId, commit: &str, repository: Option<&Path>) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let mut body = serde_json::json!({ "commit": commit });
+    if let Some(repository) = repository {
+        body["repository"] = serde_json::Value::String(repository.to_string_lossy().into_owned());
+    }
+    match client.post_json(&format!("/v1/runs/{run}/sync"), &body) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
     }
 }
 
@@ -365,12 +461,34 @@ fn plan(state_dir: &Path, command: &PlanCommands) -> i32 {
                 Err(message) => fail(&message),
             }
         }
+        PlanCommands::Show { run, hash } => {
+            let path = match hash {
+                Some(hash) => format!("/v1/runs/{run}/plans/{hash}"),
+                None => format!("/v1/runs/{run}/plans"),
+            };
+            match client.get(&path) {
+                Ok(value) => {
+                    print_json(&value);
+                    0
+                }
+                Err(message) => fail(&message),
+            }
+        }
+        PlanCommands::Diff { run, from, to } => {
+            match client.get(&format!("/v1/runs/{run}/plans/diff?from={from}&to={to}")) {
+                Ok(value) => {
+                    print_json(&value);
+                    0
+                }
+                Err(message) => fail(&message),
+            }
+        }
     }
 }
 
-/// Validate a worker-result file: schema, attempt scope against the flag
-/// and the run state, contained paths. Prints the content hash; the report
-/// proposes a candidate only — committing it lands in P2/T5 verification.
+/// Import a worker-result file through the daemon: validated, sealed
+/// and parked for verification. Importing never marks a task passed —
+/// only an independent verifier verdict can do that.
 fn result(state_dir: &Path, command: &ResultCommands) -> i32 {
     let ResultCommands::Import { run, attempt, file } = command;
     let text = match std::fs::read_to_string(file) {
@@ -393,7 +511,7 @@ fn result(state_dir: &Path, command: &ResultCommands) -> i32 {
     };
     match client.get(&format!("/v1/runs/{run}")) {
         Ok(view) => {
-            if view["state"]["attempts"][attempt.to_string()].is_null() {
+            if !snapshot_has_attempt(&view, attempt) {
                 return fail(&format!(
                     "foreign candidate: attempt {attempt} does not belong to run {run}"
                 ));
@@ -401,20 +519,18 @@ fn result(state_dir: &Path, command: &ResultCommands) -> i32 {
         }
         Err(message) => return fail(&message),
     }
-    print_json(&serde_json::json!({
-        "schema": central_application::handover::WORKER_RESULT_SCHEMA,
-        "attempt_id": attempt.to_string(),
-        "candidate_path": result.candidate_path,
-        "candidate_hash": result.candidate_hash.as_str(),
-        "result_hash": central_application::handover::worker_result_hash(&result).as_str(),
-        "status": "validated; committing the candidate lands in P2/T5 verification",
-    }));
-    0
+    match client.post_text(&format!("/v1/runs/{run}/attempts/{attempt}/results"), &text) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
 }
 
-/// Validate a handover file: schema, contained artifact paths, and the
-/// verified/unverified separation. Prints the content hash for the new
-/// session to quote when it resumes.
+/// Import a handover file through the daemon with evidence inspection.
+/// Unbacked claims stay unverified; the new session must inspect
+/// evidence before writing.
 fn handover_cmd(state_dir: &Path, command: &HandoverCommands) -> i32 {
     let HandoverCommands::Import { run, file } = command;
     let text = match std::fs::read_to_string(file) {
@@ -431,7 +547,7 @@ fn handover_cmd(state_dir: &Path, command: &HandoverCommands) -> i32 {
     };
     match client.get(&format!("/v1/runs/{run}")) {
         Ok(view) => {
-            if view["state"]["attempts"][handover.predecessor.to_string()].is_null() {
+            if !snapshot_has_attempt(&view, &handover.predecessor) {
                 return fail(&format!(
                     "foreign handover: predecessor {} does not belong to run {run}",
                     handover.predecessor,
@@ -440,15 +556,13 @@ fn handover_cmd(state_dir: &Path, command: &HandoverCommands) -> i32 {
         }
         Err(message) => return fail(&message),
     }
-    print_json(&serde_json::json!({
-        "schema": central_application::handover::HANDOVER_SCHEMA,
-        "predecessor": handover.predecessor.to_string(),
-        "handover_hash": central_application::handover::handover_hash(&handover).as_str(),
-        "verified_facts": handover.verified_facts.len(),
-        "unverified_notes": handover.unverified_notes.len(),
-        "status": "validated; the new session must inspect evidence before writing",
-    }));
-    0
+    match client.post_text(&format!("/v1/runs/{run}/handover"), &text) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
 }
 
 /// List the durable inbox entries of a run: pending, answered, resolved
@@ -510,17 +624,29 @@ fn inbox_decline(
     }
 }
 
-/// Answer a pending question. Exactly one of message (plain) or secret
-/// (memory-only, never persisted) is sent; the daemon rejects both or
-/// neither before anything is committed.
+/// Answer a pending question. Exactly one of message (plain) or a
+/// secret read from stdin (memory-only, never argv or shell history)
+/// is sent; the daemon rejects both or neither before anything commits.
 fn inbox_answer(
     state_dir: &Path,
     run: &RunId,
     key: &str,
     preview_hash: &str,
     message: &Option<String>,
-    secret: &Option<String>,
+    secret_stdin: bool,
 ) -> i32 {
+    let secret = if secret_stdin {
+        let mut text = String::new();
+        match std::io::stdin().read_to_string(&mut text) {
+            Ok(_) => Some(text.trim_end_matches(['\r', '\n']).to_string()),
+            Err(error) => return fail(&format!("cannot read secret from stdin: {error}")),
+        }
+    } else {
+        None
+    };
+    if message.is_some() == secret.as_ref().is_some_and(|text| !text.is_empty()) {
+        return fail("answer needs exactly one of --message or --secret-stdin");
+    }
     let client = match client(state_dir) {
         Ok(client) => client,
         Err(code) => return code,
@@ -531,6 +657,276 @@ fn inbox_answer(
     ) {
         Ok(receipt) => {
             print_json(&receipt);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Ordered event replay with durable cursors. `--follow` polls from
+/// the cursor every second until interrupted; every page prints the
+/// `next_cursor` to resume from.
+fn events(
+    state_dir: &Path,
+    run: &RunId,
+    after: Option<&str>,
+    limit: Option<u32>,
+    follow: bool,
+) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let mut cursor = after.map(|text| text.to_string());
+    loop {
+        let mut path = format!("/v1/runs/{run}/events");
+        let mut query = Vec::new();
+        if let Some(after) = &cursor {
+            query.push(format!("after={after}"));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(&query.join("&"));
+        }
+        match client.get(&path) {
+            Ok(page) => {
+                print_json(&page);
+                match page["next_cursor"].as_str() {
+                    Some(next) if follow => {
+                        cursor = Some(next.to_string());
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    _ => return 0,
+                }
+            }
+            Err(message) => return fail(&message),
+        }
+    }
+}
+
+/// Bounded evidence reads, optionally for one attempt. `--follow`
+/// polls until interrupted.
+fn logs(
+    state_dir: &Path,
+    run: &RunId,
+    attempt: Option<&AttemptId>,
+    limit: Option<u32>,
+    follow: bool,
+) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    loop {
+        let mut path = format!("/v1/runs/{run}/logs");
+        let mut query = Vec::new();
+        if let Some(attempt) = attempt {
+            query.push(format!("attempt={attempt}"));
+        }
+        if let Some(limit) = limit {
+            query.push(format!("limit={limit}"));
+        }
+        if !query.is_empty() {
+            path.push('?');
+            path.push_str(&query.join("&"));
+        }
+        match client.get(&path) {
+            Ok(value) => {
+                print_json(&value);
+                if !follow {
+                    return 0;
+                }
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            Err(message) => return fail(&message),
+        }
+    }
+}
+
+/// Artifact metadata, or a hash-verified content window for one id.
+fn artifacts(
+    state_dir: &Path,
+    run: &RunId,
+    id: Option<&str>,
+    content: bool,
+    offset: Option<usize>,
+    limit: Option<usize>,
+) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let result = match (id, content) {
+        (None, _) => client.get(&format!("/v1/runs/{run}/artifacts")),
+        (Some(id), false) => client.get(&format!("/v1/runs/{run}/artifacts/{id}")),
+        (Some(id), true) => {
+            let mut path = format!("/v1/runs/{run}/artifacts/{id}/content");
+            let mut query = Vec::new();
+            if let Some(offset) = offset {
+                query.push(format!("offset={offset}"));
+            }
+            if let Some(limit) = limit {
+                query.push(format!("limit={limit}"));
+            }
+            if !query.is_empty() {
+                path.push('?');
+                path.push_str(&query.join("&"));
+            }
+            client.get(&path)
+        }
+    };
+    match result {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Post a discussion message, or read history. Posting never approves,
+/// answers or dispatches — it is discussion only.
+fn chat(
+    state_dir: &Path,
+    run: &RunId,
+    message: Option<&str>,
+    after: Option<&str>,
+    limit: Option<u32>,
+) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    if let Some(message) = message {
+        return match client.post_json(
+            &format!("/v1/runs/{run}/chat"),
+            &serde_json::json!({ "body": message }),
+        ) {
+            Ok(value) => {
+                print_json(&value);
+                0
+            }
+            Err(message) => fail(&message),
+        };
+    }
+    let mut path = format!("/v1/runs/{run}/chat");
+    let mut query = Vec::new();
+    if let Some(after) = after {
+        query.push(format!("after={after}"));
+    }
+    if let Some(limit) = limit {
+        query.push(format!("limit={limit}"));
+    }
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(&query.join("&"));
+    }
+    match client.get(&path) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+fn profiles(state_dir: &Path, command: &ProfileCommands) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let result = match command {
+        ProfileCommands::List => client.get("/v1/profiles"),
+        ProfileCommands::Get { id } => client.get(&format!("/v1/profiles/{id}")),
+        ProfileCommands::Create {
+            id,
+            name,
+            provider,
+            model,
+            effort,
+        } => {
+            let mut body = serde_json::json!({
+                "name": name,
+                "provider": provider,
+                "model": model,
+            });
+            if let Some(id) = id {
+                body["profile_id"] = serde_json::Value::String(id.clone());
+            }
+            if let Some(effort) = effort {
+                body["effort"] = serde_json::Value::String(effort.clone());
+            }
+            client.post_json("/v1/profiles", &body)
+        }
+    };
+    match result {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Client credentials (owner only). Issuance prints the secret once —
+/// it is never stored, and `--secret`-style argv never carries one.
+fn clients(state_dir: &Path, command: &ClientCommands) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let result = match command {
+        ClientCommands::List => client.get("/v1/clients"),
+        ClientCommands::Create {
+            name,
+            scope,
+            role,
+            attempt,
+        } => {
+            let mut body = serde_json::json!({ "name": name, "scope": scope });
+            if let Some(role) = role {
+                body["role"] = serde_json::Value::String(role.clone());
+            }
+            if let Some(attempt) = attempt {
+                body["attempt"] = serde_json::Value::String(attempt.to_string());
+            }
+            client.post_json("/v1/clients", &body)
+        }
+        ClientCommands::Revoke { id } => {
+            client.post_json(&format!("/v1/clients/{id}/revoke"), &serde_json::json!({}))
+        }
+    };
+    match result {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Owner-only maintenance over the same use cases as the API: a
+/// redacted report, or an explicit dry-run collection preview.
+fn maintenance(state_dir: &Path, command: &MaintenanceCommands) -> i32 {
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let result = match command {
+        MaintenanceCommands::Export => {
+            client.post_json("/v1/maintenance/export", &serde_json::json!({}))
+        }
+        MaintenanceCommands::Gc { dry_run } => client.post_json(
+            "/v1/maintenance/gc",
+            &serde_json::json!({ "dry_run": dry_run }),
+        ),
+    };
+    match result {
+        Ok(value) => {
+            print_json(&value);
             0
         }
         Err(message) => fail(&message),

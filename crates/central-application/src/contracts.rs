@@ -37,6 +37,33 @@ impl fmt::Display for AppError {
 
 impl std::error::Error for AppError {}
 
+impl AppError {
+    /// Stable public error code for the v1 API (`ApiErrorV1.code`).
+    /// Clients must match on this, never on the human message.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Validation(_) => "validation_failed",
+            Self::Conflict(message) => {
+                let lower = message.to_lowercase();
+                if lower.contains("expected revision") || lower.contains("stale revision") {
+                    "stale_revision"
+                } else if lower.contains("stale") || lower.contains("does not match") {
+                    "stale_target"
+                } else if message.contains("command id already used") {
+                    "command_conflict"
+                } else {
+                    "conflict"
+                }
+            }
+            Self::Forbidden(_) => "forbidden",
+            Self::Storage(_) => "internal_error",
+            Self::Capability(_) => "capability_unavailable",
+            Self::Transport(_) => "transport_error",
+            Self::NotFound(_) => "not_found",
+        }
+    }
+}
+
 impl From<DomainError> for AppError {
     fn from(error: DomainError) -> Self {
         match error {
@@ -48,7 +75,8 @@ impl From<DomainError> for AppError {
             | DomainError::QueueConflict(_) => Self::Conflict(error.to_string()),
             DomainError::UnknownPlan(_)
             | DomainError::UnknownRequest(_)
-            | DomainError::UnknownTask(_) => Self::NotFound(error.to_string()),
+            | DomainError::UnknownTask(_)
+            | DomainError::UnknownAttempt(_) => Self::NotFound(error.to_string()),
             other => Self::Validation(other.to_string()),
         }
     }

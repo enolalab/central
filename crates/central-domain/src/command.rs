@@ -142,6 +142,11 @@ pub enum Command {
     DeferRetry {
         attempt: AttemptId,
         not_before: Timestamp,
+        /// Policy bound carried with the command (P3). Command envelopes
+        /// written before P3 lack it; the default is the hardcoded bound
+        /// those envelopes were decided under (`MAX_RETRIES_DEFAULT` = 3),
+        /// so replay means exactly what the writer meant. (P4 replay-compat.)
+        #[serde(default = "default_defer_max_retries")]
         max_retries: u32,
     },
     /// Set the run's shared count/token/time limits (plus the optional
@@ -241,6 +246,24 @@ pub enum Command {
         decision: ReuseDecision,
         current: ReuseBindings,
     },
+    /// Durably record one worker result (P4): the attempt completed with
+    /// the sealed candidate and its task parks in `AwaitingVerification`.
+    /// The application pre-seals via `seal_candidate` (membership,
+    /// containment and hash binding); the domain enforces the state
+    /// transition, the actor gate and the criteria binding. Recording
+    /// never marks a task `Succeeded` — only an independent verifier
+    /// verdict via `SubmitVerification` can do that. Worker role (agent
+    /// bridge scoped to the attempt) or user (owner import).
+    RecordWorkerResult {
+        attempt: AttemptId,
+        input_hash: ContentHash,
+        candidate_hash: ContentHash,
+        criteria_hash: ContentHash,
+    },
+}
+
+fn default_defer_max_retries() -> u32 {
+    crate::MAX_RETRIES_DEFAULT
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -5,6 +5,14 @@ use crate::{
     InboxOutcome, PlanHash, ProfileId, RunId, TaskId, Timestamp, VerificationOutcome,
 };
 
+/// Default for [`Event::VerificationDisputed::decision`] when decoding
+/// event rows written before P4: the routing answer of a dispute was
+/// always [`QualityDecision::Disputed`], so old rows decode to exactly
+/// what the code that wrote them meant. (P4 replay-compat ledger item.)
+fn default_disputed_decision() -> QualityDecision {
+    QualityDecision::Disputed
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Event {
     RunCreated {
@@ -189,6 +197,7 @@ pub enum Event {
         task: TaskId,
         reason: String,
         disputes_used: u8,
+        #[serde(default = "default_disputed_decision")]
         decision: QualityDecision,
         by: ActorId,
         at: Timestamp,
@@ -238,6 +247,13 @@ pub enum Event {
     /// One quarantined result assessed: what it may become under the
     /// active revision. History is append-only; the assessment never
     /// rewrites the quarantined provenance.
+    ///
+    /// Replay note (P4 ledger): this variant and
+    /// [`Event::StaleCandidateRecorded`] were introduced in unreleased P3
+    /// with their full field set — no released event log predates them, so
+    /// there are no old rows missing fields. If a field is ever added to
+    /// either variant after the P4 release, it must carry
+    /// `#[serde(default)]` (or a documented migration) before shipping.
     ReuseAssessed {
         run_id: RunId,
         attempt_id: AttemptId,
@@ -245,6 +261,94 @@ pub enum Event {
         by: ActorId,
         at: Timestamp,
     },
+    /// One worker result durably recorded: the attempt completed with the
+    /// sealed candidate, and its task parks in `AwaitingVerification`.
+    /// Recording never marks a task `Succeeded` — only an independent
+    /// verifier verdict via `SubmitVerification` can do that.
+    WorkerResultRecorded {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        task: TaskId,
+        input_hash: ContentHash,
+        candidate_hash: ContentHash,
+        criteria_hash: ContentHash,
+        by: ActorId,
+        at: Timestamp,
+    },
+}
+
+impl Event {
+    /// The run this event belongs to.
+    pub fn run_id(&self) -> RunId {
+        match self {
+            Self::RunCreated { run_id, .. }
+            | Self::PlanProposed { run_id, .. }
+            | Self::PlanApproved { run_id, .. }
+            | Self::RunPaused { run_id, .. }
+            | Self::RunStopped { run_id, .. }
+            | Self::RunResumed { run_id, .. }
+            | Self::InboxRequestRecorded { run_id, .. }
+            | Self::InboxAnswered { run_id, .. }
+            | Self::InboxResolved { run_id, .. }
+            | Self::ObservationRecorded { run_id, .. }
+            | Self::AttemptQueued { run_id, .. }
+            | Self::AttemptDispatching { run_id, .. }
+            | Self::AttemptRunning { run_id, .. }
+            | Self::AttemptUnknown { run_id, .. }
+            | Self::AttemptRequeued { run_id, .. }
+            | Self::AttemptFailed { run_id, .. }
+            | Self::TaskReopened { run_id, .. }
+            | Self::AttemptRetryDeferred { run_id, .. }
+            | Self::LimitsSet { run_id, .. }
+            | Self::UsageReconciled { run_id, .. }
+            | Self::UsageGapResolved { run_id, .. }
+            | Self::FallbackTaken { run_id, .. }
+            | Self::VerificationSubmitted { run_id, .. }
+            | Self::VerificationDisputed { run_id, .. }
+            | Self::RepairAttemptQueued { run_id, .. }
+            | Self::PlanRevisionProposed { run_id, .. }
+            | Self::PlanRevisionApproved { run_id, .. }
+            | Self::StaleCandidateRecorded { run_id, .. }
+            | Self::ReuseAssessed { run_id, .. }
+            | Self::WorkerResultRecorded { run_id, .. } => *run_id,
+        }
+    }
+
+    /// When the decision committed this event (UTC ms).
+    pub fn at(&self) -> Timestamp {
+        match self {
+            Self::RunCreated { at, .. }
+            | Self::PlanProposed { at, .. }
+            | Self::PlanApproved { at, .. }
+            | Self::RunPaused { at, .. }
+            | Self::RunStopped { at, .. }
+            | Self::RunResumed { at, .. }
+            | Self::InboxRequestRecorded { at, .. }
+            | Self::InboxAnswered { at, .. }
+            | Self::InboxResolved { at, .. }
+            | Self::ObservationRecorded { at, .. }
+            | Self::AttemptQueued { at, .. }
+            | Self::AttemptDispatching { at, .. }
+            | Self::AttemptRunning { at, .. }
+            | Self::AttemptUnknown { at, .. }
+            | Self::AttemptRequeued { at, .. }
+            | Self::AttemptFailed { at, .. }
+            | Self::TaskReopened { at, .. }
+            | Self::AttemptRetryDeferred { at, .. }
+            | Self::LimitsSet { at, .. }
+            | Self::UsageReconciled { at, .. }
+            | Self::UsageGapResolved { at, .. }
+            | Self::FallbackTaken { at, .. }
+            | Self::VerificationSubmitted { at, .. }
+            | Self::VerificationDisputed { at, .. }
+            | Self::RepairAttemptQueued { at, .. }
+            | Self::PlanRevisionProposed { at, .. }
+            | Self::PlanRevisionApproved { at, .. }
+            | Self::StaleCandidateRecorded { at, .. }
+            | Self::ReuseAssessed { at, .. }
+            | Self::WorkerResultRecorded { at, .. } => *at,
+        }
+    }
 }
 
 /// Intended side effects for the application layer to persist as outbox

@@ -1052,6 +1052,7 @@ async fn scan_tick_all_leaves_parked_run_untouched() {
     let ids: Arc<dyn IdSource> = h.ids.clone();
     let agent: Arc<dyn AgentGateway> = h.gateway.clone();
     let mut last_tick = HashMap::new();
+    let profiles = central_server::scan::empty_profile_cache();
     let (ticked, sent, _) = tick_all(
         &store,
         &clock,
@@ -1059,6 +1060,7 @@ async fn scan_tick_all_leaves_parked_run_untouched() {
         &agent,
         &system(),
         &ScanConfig::disabled(true),
+        &profiles,
         &mut last_tick,
     )
     .await;

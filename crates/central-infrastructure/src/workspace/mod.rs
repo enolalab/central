@@ -691,3 +691,43 @@ pub fn queue_user_commit(
         .map_err(|error| AppError::Storage(format!("cannot flush sync queue: {error}")))?;
     Ok(intent)
 }
+
+/// Daemon-side [`SyncIntake`](central_application::ports::SyncIntake):
+/// the same read-only verification and queue append as
+/// [`queue_user_commit`], owned by the daemon so the CLI never writes
+/// queue files directly (P4). The worktree stays untouched.
+pub struct DaemonSyncIntake {
+    state_dir: PathBuf,
+}
+
+impl DaemonSyncIntake {
+    pub fn new(state_dir: PathBuf) -> Self {
+        Self { state_dir }
+    }
+}
+
+#[async_trait::async_trait]
+impl central_application::ports::SyncIntake for DaemonSyncIntake {
+    async fn queue_user_commit(
+        &self,
+        run: RunId,
+        repository: &str,
+        commit: &str,
+    ) -> Result<central_application::ports::UserSyncIntent, AppError> {
+        // Blocking git probes on the async runtime: offload to a worker
+        // thread so the daemon never stalls its loop on a slow repo.
+        let state_dir = self.state_dir.clone();
+        let repo = PathBuf::from(repository);
+        let commit = commit.to_string();
+        let intent =
+            tokio::task::spawn_blocking(move || queue_user_commit(&state_dir, run, &repo, &commit))
+                .await
+                .map_err(|error| AppError::Storage(format!("sync worker failed: {error}")))??;
+        Ok(central_application::ports::UserSyncIntent {
+            run: intent.run,
+            commit: intent.commit,
+            repository: intent.repository,
+            dirty_fingerprint: intent.dirty_fingerprint,
+        })
+    }
+}

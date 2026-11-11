@@ -379,9 +379,15 @@ fn auth_cannot_be_claimed_in_body() {
     let receipt: serde_json::Value = serde_json::from_str(&receipt).expect("receipt");
     let run = receipt["run_id"].as_str().expect("run");
     let view = get_run(&server, run);
-    let created = &view["events"][0]["RunCreated"];
-    assert_eq!(created["by"].as_str().expect("by"), server.owner_actor());
-    assert_ne!(created["by"].as_str().expect("by"), claimed);
+    // P4 projects events as views (`kind`/`payload`); the recorded
+    // actor is still the token-derived owner, never the body claim.
+    let created = &view["events"][0];
+    assert_eq!(created["kind"], "RunCreated");
+    assert_eq!(
+        created["payload"]["by"].as_str().expect("by"),
+        server.owner_actor()
+    );
+    assert_ne!(created["payload"]["by"].as_str().expect("by"), claimed);
 }
 
 #[test]
@@ -613,6 +619,26 @@ impl central_application::ports::Store for DispatchFailStore {
     ) -> Result<Vec<central_domain::Event>, central_application::contracts::AppError> {
         self.inner.events(id).await
     }
+    async fn snapshot_with_cursor(
+        &self,
+        id: central_domain::RunId,
+    ) -> Result<
+        Option<central_application::ports::SnapshotWithCursor>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::snapshot_with_cursor(&*self.inner, id).await
+    }
+    async fn events_after(
+        &self,
+        id: central_domain::RunId,
+        after: u64,
+        limit: u32,
+    ) -> Result<
+        Vec<central_application::ports::SequencedEvent>,
+        central_application::contracts::AppError,
+    > {
+        central_application::ports::Store::events_after(&*self.inner, id, after, limit).await
+    }
 }
 
 fn post_command_addr(
@@ -652,7 +678,25 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
             inner,
             fail_pending: fail_pending.clone(),
         });
+    struct NoSync;
+    #[async_trait::async_trait]
+    impl central_application::ports::SyncIntake for NoSync {
+        async fn queue_user_commit(
+            &self,
+            _run: central_domain::RunId,
+            _repository: &str,
+            _commit: &str,
+        ) -> Result<
+            central_application::ports::UserSyncIntent,
+            central_application::contracts::AppError,
+        > {
+            Err(central_application::contracts::AppError::Capability(
+                "sync intake is not configured in this test".to_string(),
+            ))
+        }
+    }
     let token = "dispatch-error-token".to_string();
+    let artifact_root = dir.join("artifacts");
     let state = central_server::http::AppState {
         store,
         actor: central_domain::Actor::user(central_domain::ActorId::from_u128(0xaa)),
@@ -660,6 +704,14 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
         clock: std::sync::Arc::new(central_server::bootstrap::SystemClock),
         ids: std::sync::Arc::new(central_server::bootstrap::UuidIds),
         agent: std::sync::Arc::new(central_server::bootstrap::UnavailableGateway),
+        sync_intake: std::sync::Arc::new(NoSync),
+        artifact_root: artifact_root.clone(),
+        artifacts: std::sync::Arc::new(
+            central_infrastructure::artifacts::FilesystemArtifactStore::open(&artifact_root)
+                .expect("artifact store"),
+        ),
+        instance_epoch: "test-epoch".to_string(),
+        origins: Vec::new(),
         secrets: std::sync::Arc::new(central_application::inbox::SecretVault::new()),
         fake_agent_enabled: false,
         fake_counts: None,
@@ -727,12 +779,15 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
 }
 
 #[test]
-fn ui_not_built_returns_clear_503() {
+fn outside_api_is_404_not_ui() {
+    // P4 serves no UI: every non-API path is a stable 404 carrying the
+    // error code contract, never a 503 and never static assets.
     let dir = state_dir("ui");
     let server = start_server(&dir);
     let (status, body) = http("GET", &server.addr, "/", None, None);
-    assert_eq!(status, 503);
-    assert!(body.contains("not built"), "clear 503 body: {body}");
+    assert_eq!(status, 404);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("404 json");
+    assert_eq!(value["error"]["code"], "not_found", "code: {value}");
     let (status, _) = http("GET", &server.addr, "/healthz", None, None);
     assert_eq!(status, 200);
 }

@@ -5,11 +5,11 @@ use crate::{
     admission, apply_usage, assess_impact, blocking_dependencies, check_report, covering_attempt,
     criteria_changed, decide_quality, describe_criteria_impact, inbox, is_confirmed_terminal,
     live_attempt_count, release_settled_claims, render_input, retry_used, sync_budget_holds,
-    validate_plan, Actor, ActorKind, Admission, AnswerPayload, Attempt, AttemptStatus, Command,
-    CommandEnvelope, ContentHash, DomainError, Effect, Event, HoldReason, InboxEntry, InboxKey,
-    InboxKind, InboxOutcome, InboxStatus, PlanDocumentV1, PlanHash, PlanRevision, PlanStatus,
-    QualityDecision, ReuseBindings, ReuseDecision, RunControl, RunState, StaleCandidate, Task,
-    TaskId, TaskStatus, Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
+    validate_plan, Actor, ActorKind, Admission, AnswerPayload, Attempt, AttemptId, AttemptStatus,
+    Command, CommandEnvelope, ContentHash, DomainError, Effect, Event, HoldReason, InboxEntry,
+    InboxKey, InboxKind, InboxOutcome, InboxStatus, PlanDocumentV1, PlanHash, PlanRevision,
+    PlanStatus, QualityDecision, ReuseBindings, ReuseDecision, RunControl, RunState,
+    StaleCandidate, Task, TaskId, TaskStatus, Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -917,7 +917,116 @@ pub fn decide(
             decision,
             current,
         } => assess_reuse_decision(state, actor, *attempt, *decision, current, now),
+
+        Command::RecordWorkerResult {
+            attempt,
+            input_hash,
+            candidate_hash,
+            criteria_hash,
+        } => record_worker_result(
+            state,
+            actor,
+            *attempt,
+            input_hash,
+            candidate_hash,
+            criteria_hash,
+            now,
+        ),
     }
+}
+
+/// Durably record one worker result (P4 durable worker-done command).
+///
+/// Worker role or user only: the leader can never file a result for its
+/// own plan, and the verifier/system never complete work. The attempt
+/// must be live (queued through running, including unknown outcome after
+/// reconcile proves no duplicate send); a terminal attempt is a replay
+/// or a foreign result and is refused. The criteria must match the
+/// task's current criteria — a result sealed under moved criteria is
+/// stale and must be re-sealed, never recorded. Recording parks the task
+/// in `AwaitingVerification` and completes the attempt; it never marks
+/// `Succeeded`, and a task that already succeeded on identical bytes
+/// keeps its acceptance (same-bytes re-record is a no-op park).
+fn record_worker_result(
+    state: &RunState,
+    actor: &Actor,
+    attempt: AttemptId,
+    input_hash: &ContentHash,
+    candidate_hash: &ContentHash,
+    criteria_hash: &ContentHash,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_created(state)?;
+    if !matches!(actor.kind, ActorKind::Worker | ActorKind::User) {
+        return Err(DomainError::Forbidden);
+    }
+    let attempt_state = state
+        .attempts
+        .get(&attempt)
+        .ok_or(DomainError::UnknownAttempt(attempt))?;
+    let task_id = attempt_state.task_id;
+    let task_state = state
+        .tasks
+        .get(&task_id)
+        .ok_or(DomainError::UnknownTask(task_id))?;
+    if !matches!(
+        attempt_state.status,
+        AttemptStatus::Queued
+            | AttemptStatus::Dispatching
+            | AttemptStatus::Running
+            | AttemptStatus::WaitingForApproval
+            | AttemptStatus::WaitingForInput
+            | AttemptStatus::Reconciling
+            | AttemptStatus::UnknownOutcome
+    ) {
+        return Err(DomainError::InvalidTransition(format!(
+            "attempt {attempt} is {:?}; only a live attempt can record a worker result",
+            attempt_state.status,
+        )));
+    }
+    if criteria_hash != &crate::criteria_hash_for(&task_state.verify) {
+        return Err(DomainError::InvalidTransition(format!(
+            "stale worker result for task {task_id}: criteria changed since the seal; \
+             criteria change only through an approved plan revision, re-seal and resubmit",
+        )));
+    }
+    // The input binding itself is sealed by the application layer
+    // (`seal_candidate` checks membership before issuing this command);
+    // the hashes travel here so the event carries the exact seal.
+    let mut next = state.clone();
+    if let Some(record) = next.attempts.get_mut(&attempt) {
+        record.status = AttemptStatus::Completed;
+    }
+    if let Some(task_record) = next.tasks.get_mut(&task_id) {
+        let same_acceptance = task_record.status == TaskStatus::Succeeded
+            && next
+                .verified_outputs
+                .get(&task_id)
+                .is_some_and(|accepted| accepted == candidate_hash);
+        if same_acceptance {
+            // Same bytes re-recorded: the acceptance still stands.
+        } else {
+            if task_record.status == TaskStatus::Succeeded {
+                next.verified_outputs.remove(&task_id);
+            }
+            task_record.status = TaskStatus::AwaitingVerification;
+        }
+    }
+    release_settled_claims(&mut next);
+    Ok(finish(
+        next.clone(),
+        vec![Event::WorkerResultRecorded {
+            run_id: next.id,
+            attempt_id: attempt,
+            task: task_id,
+            input_hash: input_hash.clone(),
+            candidate_hash: candidate_hash.clone(),
+            criteria_hash: criteria_hash.clone(),
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
 }
 
 /// Propose an immutable revision of the active plan (P3 Task 4).

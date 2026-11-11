@@ -6,7 +6,9 @@
 //! plus the preview hash the user saw. A plan hash is not a key and fails
 //! as unknown. Secret answers travel the memory-only vault path — the
 //! durable command, receipt and outbox intent carry the random reference
-//! only, never the credential.
+//! only, never the credential. Entries project redacted: secret previews
+//! are withheld at the source. Writes need workflow rights (owner or
+//! control); agent bridges use the results endpoints, never inbox.
 
 use std::sync::Arc;
 
@@ -18,8 +20,10 @@ use central_application::Runtime;
 use central_domain::{ContentHash, InboxKey, RunId};
 use serde::Deserialize;
 
-use super::auth::{app_error_response, authenticate, error_response, ApiError};
+use super::auth::{app_error_response, authenticate};
 use super::AppState;
+use crate::api::errors::{error_response, ApiError};
+use crate::api::read_models::project_inbox_entry;
 
 fn runtime_for(state: &AppState, run_id: RunId) -> Runtime {
     Runtime::new(
@@ -64,6 +68,7 @@ fn receipt_json(
     serde_json::to_value(receipt).map_err(|error| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
             format!("cannot encode receipt: {error}"),
         )
     })
@@ -74,21 +79,28 @@ pub async fn get_inbox(
     headers: HeaderMap,
     Path(raw_id): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    authenticate(&state, &headers)?;
+    authenticate(&state, &headers).await?;
     let run_id = raw_id.parse::<RunId>().map_err(|_| {
-        error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw_id}"))
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
     })?;
     let run_state = state
         .store
         .load(run_id)
         .await
         .map_err(app_error_response)?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, format!("run {run_id} not found")))?;
-    let mut entries: Vec<serde_json::Value> = run_state
-        .inbox
-        .values()
-        .map(|entry| serde_json::to_value(entry).unwrap_or(serde_json::Value::Null))
-        .collect();
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("run {run_id} not found"),
+            )
+        })?;
+    let mut entries: Vec<serde_json::Value> =
+        run_state.inbox.values().map(project_inbox_entry).collect();
     entries.sort_by(|left, right| left["key"].as_str().cmp(&right["key"].as_str()));
     Ok(Json(serde_json::json!({
         "run_id": run_id.to_string(),
@@ -134,7 +146,13 @@ async fn current_revision(
         .load(run_id)
         .await
         .map_err(app_error_response)?
-        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, format!("run {run_id} not found")))?;
+        .ok_or_else(|| {
+            error_response(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                format!("run {run_id} not found"),
+            )
+        })?;
     Ok(run_state.revision)
 }
 
@@ -144,14 +162,19 @@ pub async fn post_approve(
     Path(raw_id): Path<String>,
     Json(body): Json<KeyBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
     let run_id = raw_id.parse::<RunId>().map_err(|_| {
-        error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw_id}"))
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
     })?;
-    let key =
-        parse_key(&body.key).map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+    let key = parse_key(&body.key)
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, "validation_failed", message))?;
     let preview_hash = parse_hash(&body.preview_hash)
-        .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, "validation_failed", message))?;
     let revision = current_revision(&state, run_id).await?;
     let envelope = central_domain::CommandEnvelope {
         id: state.ids.next_command_id(),
@@ -159,7 +182,7 @@ pub async fn post_approve(
         command: central_domain::Command::ApproveAction { key, preview_hash },
     };
     let receipt = runtime_for(&state, run_id)
-        .execute(actor, envelope)
+        .execute(auth.actor, envelope)
         .await
         .map_err(app_error_response)?;
     state.scan_notify.notify_one();
@@ -172,18 +195,24 @@ pub async fn post_decline(
     Path(raw_id): Path<String>,
     Json(body): Json<DeclineBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
     let run_id = raw_id.parse::<RunId>().map_err(|_| {
-        error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw_id}"))
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
     })?;
-    let key =
-        parse_key(&body.key).map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+    let key = parse_key(&body.key)
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, "validation_failed", message))?;
     let preview_hash = parse_hash(&body.preview_hash)
-        .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, "validation_failed", message))?;
     let reason = body.reason.unwrap_or_default();
     if reason.trim().is_empty() {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
+            "validation_failed",
             "a decline needs a reason for the harness",
         ));
     }
@@ -198,7 +227,7 @@ pub async fn post_decline(
         },
     };
     let receipt = runtime_for(&state, run_id)
-        .execute(actor, envelope)
+        .execute(auth.actor, envelope)
         .await
         .map_err(app_error_response)?;
     state.scan_notify.notify_one();
@@ -211,14 +240,19 @@ pub async fn post_answer(
     Path(raw_id): Path<String>,
     Json(body): Json<AnswerBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
     let run_id = raw_id.parse::<RunId>().map_err(|_| {
-        error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw_id}"))
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
     })?;
-    let key =
-        parse_key(&body.key).map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+    let key = parse_key(&body.key)
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, "validation_failed", message))?;
     let preview_hash = parse_hash(&body.preview_hash)
-        .map_err(|message| error_response(StatusCode::BAD_REQUEST, message))?;
+        .map_err(|message| error_response(StatusCode::BAD_REQUEST, "validation_failed", message))?;
     let has_message = body
         .message
         .as_ref()
@@ -227,6 +261,7 @@ pub async fn post_answer(
     if has_message == has_secret {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
+            "validation_failed",
             "answer needs exactly one of message or secret",
         ));
     }
@@ -235,13 +270,14 @@ pub async fn post_answer(
         if secret.is_empty() {
             return Err(error_response(
                 StatusCode::BAD_REQUEST,
+                "validation_failed",
                 "secret answer must not be empty",
             ));
         }
         // Memory-only vault path: the durable intent carries the random
         // reference only. The vault lives in AppState, shared with dispatch.
         runtime
-            .answer_secret(actor, key, preview_hash, secret)
+            .answer_secret(auth.actor, key, preview_hash, secret)
             .await
             .map_err(app_error_response)?
     } else {
@@ -257,7 +293,7 @@ pub async fn post_answer(
             },
         };
         runtime
-            .execute(actor, envelope)
+            .execute(auth.actor, envelope)
             .await
             .map_err(app_error_response)?
     };
@@ -271,18 +307,24 @@ pub async fn post_reconcile(
     Path(raw_id): Path<String>,
     Json(body): Json<ReconcileBody>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let actor = authenticate(&state, &headers)?;
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
     let run_id = raw_id.parse::<RunId>().map_err(|_| {
-        error_response(StatusCode::BAD_REQUEST, format!("invalid run id: {raw_id}"))
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
     })?;
     let summary = runtime_for(&state, run_id)
-        .reconcile_inbox(&actor, &body.session)
+        .reconcile_inbox(&auth.actor, &body.session)
         .await
         .map_err(app_error_response)?;
     state.scan_notify.notify_one();
     let summary = serde_json::to_value(&summary).map_err(|error| {
         error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
             format!("cannot encode reconcile summary: {error}"),
         )
     })?;

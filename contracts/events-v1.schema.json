@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://central.local/contracts/events-v1.schema.json",
+  "title": "Central EventViewV1",
+  "description": "One durable event as served by GET /v1/runs/{id}/events and the SSE stream. seq is the per-run durable sequence (the SSE event id); kind is the domain variant name; at is UTC milliseconds; payload is the redacted variant body. Clients must treat events as notifications and public data, never replay them to compute domain state.",
+  "type": "object",
+  "required": ["seq", "run_id", "kind", "at", "payload"],
+  "properties": {
+    "seq": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Durable per-run sequence. Strictly increasing; survives restarts."
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F-]{36}$"
+    },
+    "kind": {
+      "type": "string",
+      "minLength": 1,
+      "examples": ["RunCreated", "PlanApproved", "WorkerResultRecorded", "VerificationSubmitted"]
+    },
+    "at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Commit time, UTC milliseconds since the Unix epoch."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Redacted variant body. Never carries credentials."
+    }
+  },
+  "additionalProperties": false
+}

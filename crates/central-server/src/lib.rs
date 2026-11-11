@@ -1,3 +1,4 @@
+pub mod api;
 pub mod bootstrap;
 pub mod http;
 pub mod recovery;

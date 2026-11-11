@@ -54,3 +54,37 @@ pub fn encode_receipt(receipt: &Receipt) -> Result<String, AppError> {
 pub fn decode_receipt(json: &str) -> Result<Receipt, AppError> {
     decode(json, "command receipt")
 }
+
+pub fn encode_client(
+    record: &central_application::ports::store::ClientRecord,
+) -> Result<String, AppError> {
+    encode(record, "client credential")
+}
+
+pub fn decode_client(
+    json: &str,
+) -> Result<central_application::ports::store::ClientRecord, AppError> {
+    decode(json, "client credential")
+}
+
+pub fn encode_chat(
+    message: &central_application::ports::store::ChatMessage,
+) -> Result<String, AppError> {
+    encode(message, "chat message")
+}
+
+pub fn decode_chat(json: &str) -> Result<central_application::ports::store::ChatMessage, AppError> {
+    decode(json, "chat message")
+}
+
+pub fn encode_profile(
+    record: &central_application::ports::store::UserProfileRecord,
+) -> Result<String, AppError> {
+    encode(record, "user profile")
+}
+
+pub fn decode_profile(
+    json: &str,
+) -> Result<central_application::ports::store::UserProfileRecord, AppError> {
+    decode(json, "user profile")
+}

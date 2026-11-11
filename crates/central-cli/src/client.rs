@@ -1,7 +1,9 @@
 //! Minimal loopback HTTP client for the daemon API. The CLI never
 //! opens the database: it discovers the daemon through `server.json`
 //! and authenticates with the owner token in `daemon.token`, both in
-//! the state directory.
+//! the state directory. Discovery verifies the contract version
+//! (`/v1/meta` must report `api: v1`) so a stale CLI fails fast with
+//! a clear message instead of misreading a newer daemon.
 
 use std::path::{Path, PathBuf};
 
@@ -56,11 +58,21 @@ impl DaemonClient {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .map_err(|error| format!("cannot build http client: {error}"))?;
-        Ok(Self {
+        let client = Self {
             addr: info.addr,
             token,
             http,
-        })
+        };
+        // Endpoint discovery plus version check: the CLI speaks public
+        // API v1 and nothing else.
+        let meta = client.get("/v1/meta")?;
+        if meta["api"] != "v1" {
+            return Err(format!(
+                "daemon API version mismatch (want v1, daemon says {}); update the CLI",
+                meta["api"]
+            ));
+        }
+        Ok(client)
     }
 
     pub fn get(&self, path: &str) -> Result<serde_json::Value, String> {
@@ -88,12 +100,31 @@ impl DaemonClient {
         Self::decode(response)
     }
 
+    pub fn post_text(&self, path: &str, body: &str) -> Result<serde_json::Value, String> {
+        let response = self
+            .http
+            .post(format!("http://{}{path}", self.addr))
+            .bearer_auth(&self.token)
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .map_err(|error| format!("request failed: {error}"))?;
+        Self::decode(response)
+    }
+
     fn decode(response: reqwest::blocking::Response) -> Result<serde_json::Value, String> {
         let status = response.status();
         let text = response
             .text()
             .map_err(|error| format!("cannot read response: {error}"))?;
         if !status.is_success() {
+            // Surface the daemon's stable error code, not just HTTP.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) {
+                if let Some(code) = value["error"]["code"].as_str() {
+                    let message = value["error"]["message"].as_str().unwrap_or(&text);
+                    return Err(format!("daemon returned {status} [{code}]: {message}"));
+                }
+            }
             return Err(format!("daemon returned {status}: {text}"));
         }
         serde_json::from_str(&text).map_err(|error| format!("invalid daemon JSON: {error}"))

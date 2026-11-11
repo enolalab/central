@@ -1,0 +1,101 @@
+{
+  "note": "Redacted example payloads for the Central public v1 API. No values here are real credentials: tokens are shown as <owner-token> / <client_id>.<secret> placeholders and must be supplied from the daemon's state directory or a one-time issuance answer.",
+  "create_run_command": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "expected_revision": null,
+    "command": {
+      "CreateRun": {
+        "goal": "Migrate module A, keep the API compatible",
+        "repository": "D:/work/module-a"
+      }
+    }
+  },
+  "approve_plan_command": {
+    "id": "00000000-0000-0000-0000-000000000002",
+    "expected_revision": 2,
+    "command": {
+      "ApprovePlan": {
+        "plan_hash": "<64-hex-chars-from-plan-show-or-pending_plan>"
+      }
+    }
+  },
+  "receipt": {
+    "command_id": "00000000-0000-0000-0000-000000000001",
+    "run_id": "00000000-0000-0000-0000-0000000000aa",
+    "revision": 1,
+    "result": "applied",
+    "payload_hash": "<64-hex-chars>"
+  },
+  "error_stale_revision": {
+    "error": {
+      "code": "stale_revision",
+      "message": "conflict: expected revision 2 but run is at revision 3",
+      "details": {}
+    }
+  },
+  "snapshot": {
+    "instance_epoch": "<daemon-boot-uuid>",
+    "revision": 3,
+    "last_seq": 7,
+    "state": {
+      "run_id": "00000000-0000-0000-0000-0000000000aa",
+      "control": "Running",
+      "holds": [],
+      "active_plan": "<64-hex-chars>"
+    }
+  },
+  "event": {
+    "seq": 7,
+    "run_id": "00000000-0000-0000-0000-0000000000aa",
+    "kind": "RunResumed",
+    "at": 1797465600000,
+    "payload": {
+      "run_id": "00000000-0000-0000-0000-0000000000aa",
+      "by": "00000000-0000-0000-0000-0000000000bb",
+      "at": 1797465600000
+    }
+  },
+  "page": {
+    "items": [],
+    "next_cursor": null
+  },
+  "issue_client": {
+    "name": "laptop-reader",
+    "scope": "read"
+  },
+  "issuance_answer": {
+    "client_id": "00000000-0000-0000-0000-0000000000cc",
+    "name": "laptop-reader",
+    "scope": "read",
+    "secret": "<shown-once-never-stored>",
+    "expires_at": null
+  },
+  "post_chat": {
+    "body": "Should we split task A before the next dispatch?"
+  },
+  "create_profile": {
+    "profile_id": "codex-low",
+    "name": "Codex low effort",
+    "provider": "codex",
+    "model": "gpt-6-luna",
+    "effort": "low",
+    "config": {}
+  },
+  "worker_result": {
+    "version": 1,
+    "attemptId": "00000000-0000-0000-0000-0000000000dd",
+    "inputHash": "<64-hex-chars>",
+    "candidatePath": "out/result.txt",
+    "candidateHash": "<64-hex-chars>",
+    "evidencePaths": ["out/tests.log"],
+    "summary": "Implemented task A; see evidence."
+  },
+  "resolve_gap": {
+    "missing_key": "codex:epoch-1:turn-3",
+    "note": "Provider dashboard shows 412 tokens for the missing turn; holding no further work until the final arrives."
+  },
+  "sync": {
+    "commit": "<40-hex-chars>",
+    "repository": null
+  }
+}

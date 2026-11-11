@@ -28,6 +28,104 @@ pub struct DaemonConfig {
     pub fake_agent: bool,
 }
 
+/// Owner-configured Codex harness (`codex.json` in the state directory,
+/// written by the owner — never fetched from the network):
+/// `{ "binary": "codex", "cli_version": "0.167.0-alpha.3.2",
+///    "surveyed_models": ["gpt-6-luna"] }`.
+/// Every field is validated before the gateway is built: the binary
+/// must resolve on `PATH`, the CLI version must pass the allowlist,
+/// and provider model fallback stays off. Anything missing or invalid
+/// keeps the `UnavailableGateway` — dispatch then defers with a
+/// capability error instead of serving fake output.
+fn select_gateway(state_dir: &Path) -> (Arc<dyn AgentGateway>, &'static str) {
+    let path = state_dir.join("codex.json");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => {
+            return (
+                Arc::new(UnavailableGateway),
+                "no codex.json: no agent gateway configured",
+            )
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(_) => {
+            return (
+                Arc::new(UnavailableGateway),
+                "codex.json is not valid JSON: ignoring harness config",
+            )
+        }
+    };
+    let binary = value["binary"].as_str().unwrap_or("codex");
+    if find_on_path(binary).is_none() {
+        return (
+            Arc::new(UnavailableGateway),
+            "codex binary not found on PATH: ignoring harness config",
+        );
+    }
+    let cli_version = value["cli_version"]
+        .as_str()
+        .unwrap_or(central_infrastructure::codex::SUPPORTED_CLI_VERSION);
+    let version_ok = central_infrastructure::codex::parse_cli_version(cli_version)
+        .map(|parsed| central_infrastructure::codex::check_supported_version(&parsed).is_ok())
+        .unwrap_or(false);
+    if !version_ok {
+        return (
+            Arc::new(UnavailableGateway),
+            "codex CLI version not allowlisted: ignoring harness config",
+        );
+    }
+    let surveyed: Vec<String> = value["surveyed_models"]
+        .as_array()
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|model| model.as_str().map(|model| model.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let config = central_infrastructure::codex::CodexConfig {
+        binary: binary.to_string(),
+        cli_version: cli_version.to_string(),
+        surveyed_models: surveyed,
+        ..central_infrastructure::codex::CodexConfig::default()
+    };
+    let supervisor: Arc<dyn central_application::ports::ProcessSupervisor> =
+        Arc::new(central_infrastructure::process::OwnedProcessSupervisor::new());
+    (
+        Arc::new(central_infrastructure::codex::CodexGateway::new(
+            supervisor, config,
+        )),
+        "codex gateway configured",
+    )
+}
+
+fn find_on_path(binary: &str) -> Option<PathBuf> {
+    if binary.contains('/') || binary.contains('\\') {
+        let path = PathBuf::from(binary);
+        return path.is_file().then_some(path);
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        #[cfg(windows)]
+        for name in [format!("{binary}.exe"), binary.to_string()] {
+            let candidate = dir.join(&name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let candidate = dir.join(binary);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
 #[derive(Debug)]
 pub enum BootstrapError {
     AlreadyRunning,
@@ -366,11 +464,21 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
                 ),
             )
         } else {
-            (Arc::new(UnavailableGateway), None)
+            // P4 step 8: the owner-configured Codex gateway when
+            // `codex.json` validates, else the capability-closed
+            // gateway that defers instead of faking.
+            let (gateway, note) = select_gateway(&config.state_dir);
+            eprintln!("central-server: gateway: {note}");
+            (gateway, None)
         };
     #[cfg(not(feature = "test-support"))]
-    let (agent, fake_counts): (Arc<dyn AgentGateway>, Option<crate::http::FakeCounts>) =
-        (Arc::new(UnavailableGateway), None);
+    let (agent, fake_counts): (Arc<dyn AgentGateway>, Option<crate::http::FakeCounts>) = {
+        // Release builds never serve the fake agent; the real gateway
+        // still needs the owner's explicit `codex.json`.
+        let (gateway, note) = select_gateway(&config.state_dir);
+        eprintln!("central-server: gateway: {note}");
+        (gateway, None)
+    };
 
     // (4) Startup recovery: park nonterminal runs, mark dispatching
     // work unknown, send nothing.
@@ -406,6 +514,16 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let scan_notify = Arc::new(tokio::sync::Notify::new());
+    // This boot's instance id: snapshots and cursors bind to it, and a
+    // restart rotates it so old cursors fail fast with resync_required.
+    let instance_epoch = Uuid::new_v4().to_string();
+    let origins = crate::http::origin::OriginConfig::load(&config.state_dir).allowed;
+    let artifacts = Arc::new(
+        central_infrastructure::artifacts::FilesystemArtifactStore::open(
+            config.state_dir.join("artifacts"),
+        )
+        .map_err(BootstrapError::Storage)?,
+    );
     let state = AppState {
         store,
         actor,
@@ -413,6 +531,13 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
         clock,
         ids,
         agent,
+        sync_intake: Arc::new(central_infrastructure::workspace::DaemonSyncIntake::new(
+            config.state_dir.clone(),
+        )),
+        artifact_root: config.state_dir.join("artifacts"),
+        artifacts,
+        instance_epoch,
+        origins,
         // Fresh per process: secrets never survive a restart by construction.
         secrets: Arc::new(central_application::inbox::SecretVault::new()),
         fake_agent_enabled: config.fake_agent && cfg!(feature = "test-support"),
