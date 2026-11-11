@@ -109,3 +109,7 @@ Các checkbox gốc giữ nguyên lịch sử.
 - [ ] Reboot/manual Windows acceptance chưa thực hiện; không suy từ
   process kill/restart. Gate PowerShell (`test-workflow-recovery.ps1`)
   không chạy lại trên host này (thiếu `pwsh`).
+- [x] Dispatcher provision scratch thật cho attempt (late, chưa commit):
+  `attempt_scratch_root` + 2 test mới (`provision + cleanup +
+  defer-khi-root-hỏng`); daemon bật root này để live turn có cwd owned.
+  Đây là scratch cô lập, KHÔNG phải Git worktree/sealed candidate.

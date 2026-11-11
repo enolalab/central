@@ -260,20 +260,69 @@ allowlist extended to the verified `0.167.1`, wiring + acceptance now.
 - Still open (NOT claimed): a live worker leg through the daemon —
   `dispatcher` passes only a workspace *label* (`workspace_label`, "no
   directory is created here"), so a live `thread/start` has no real
-  fixture-owned cwd yet; wiring dispatch to P3 worktrees + the
-  approval-answer loop + result import is the next chunk. Deliberately
-  not attempted live (a wrong cwd could put workspace-write outside
-  fixture scratch). Approval request+cancel still unverified against the
-  real server (gateway path is e2e-tested on duplex).
+  fixture-owned cwd yet — SUPERSEDED below: per-attempt scratch
+  provisioning landed in the dispatcher this session (honest scratch, not
+  Git sealing), and leg 1 ran live on it. Approval request+cancel still
+  unverified against the real server (gateway path is e2e-tested on duplex).
+
+## Live acceptance leg 1: worker → sealed → verifier → Succeeded (2026-11-11 late)
+
+State dir (kept): `/tmp/central-livework-hw4maaks` (run
+`dae039d0-08c3-48e1-a4f2-6b238453497a`). Daemon = release-like binary with
+the wired gateway, cwd `/tmp`, scan 500ms, truthful `codex.json`
+(`0.167.1`, surveyed `gpt-6-luna`).
+
+- Worker dispatch: scan loop queued + dispatched one implementation task
+  (attempt `b5384114`, pinned profile `gpt-6-luna`/low) into provisioned
+  scratch `attempt-scratch/<run>/<attempt>`. The model created `calc.py`
+  (`sha256:2ce8d715…`, bool-rejecting add) and `test_calc.py`
+  (`sha256:50bc95b7…`) and executed Python in the scratch
+  (`__pycache__/calc.cpython-314.pyc` present). Owner re-ran the
+  assertions directly: `add(1,2)==3` ok, `add(True,1)` raises TypeError.
+  Zero approvals were requested; nothing ran outside the scratch.
+- Usage for the daemon worker turn: **unknown** — the probe polled the
+  wrong session source so no reconcile ever ran during the turn, and the
+  post-restart gateway had no live session to read from. No numbers were
+  invented; the ledger holds zero observed tokens (no limits were set, so
+  no hold triggered — correct per design). Equivalent direct-CLI turns
+  recorded usage earlier (worker in≈62984/out 187; verifier in 21709/out 45).
+- Restart/recovery: daemon killed + rebooted on the same state dir →
+  run parked `AwaitingResume`, recovery endpoint lists the explicit
+  resume action plus the stale-session finding (`reconcile before
+  resume`), zero sends before the explicit `resume` (revision 7,
+  `Running`). No orphaned agent processes after either shutdown
+  (verified via `ps`; only third-party processes remain).
+- Result import (owner, after inspecting the real bytes): `POST
+  .../attempts/.../results` → revision 8, sealed `candidate_hash
+  2ce8d715…` (== file bytes), `criteria_hash e8e4157d…` (==
+  server-computed task criteria), status `awaiting_verification`.
+  `input_hash` = sha256 of the task objective text (owner-computed and
+  stated; the seal binds it consistently for the verdict).
+- Verifier (independent live thread `01a1ca90`, separate app-server
+  session, read-only sandbox, ephemeral, `gpt-6-luna`/low, no edits):
+  judged byte-identical copies (`sha256` match) → `CRITERION 1: PASS`,
+  `CRITERION 2: PASS` with evidence lines; usage in 21709/out 45.
+- Verdict via `SubmitVerification` (owner): subject + criteria hashes
+  match the seal, evidence cites the sealed input hash, findings name the
+  independent thread and the owner re-run, `verifier_thread` differs from
+  the worker session (independence check passes), no same-session
+  override, tracked source untouched. Revision 9 → task **Succeeded**,
+  `repair_rounds_used: 0`.
+- NOT done: Git integration through the daemon (prepare/promote have no
+  daemon caller — port + contract tests only). Next build item, not a
+  claim. Windows/packaging/reboot gates unchanged (no `pwsh` on host).
 
 ## Assessment
 
 The two Linux gates that were red are now green on this host with the
-containment fix and `cfg(windows)` gating, and a bounded 2-turn live
-Codex smoke (worker edit + independent verifier pass) is proven with
-usage recorded. MVP acceptance is still **not** complete: the live
-daemon workflow, Windows/release gates and reboot acceptance remain
-unverified, so no plan or the MVP may be marked accepted on this evidence.
+containment fix and `cfg(windows)` gating; transport wiring and
+dispatcher scratch provisioning are implemented with maintained tests
+(full suite green). Proven live: worker → sealed → verifier →
+Succeeded through the daemon/API (leg 1), plus the restart barrier.
+MVP acceptance is still **not** complete: Git integration through the
+daemon, usage ledgering of live turns, Windows/release gates and reboot
+acceptance remain unverified, so no plan or the MVP may be marked
+accepted on this evidence.
 
 Machine-local raw logs from the prior run remain under `/tmp` as listed
 in `2026-11-11-linux-rerun.md`; this rerun's full-suite output was

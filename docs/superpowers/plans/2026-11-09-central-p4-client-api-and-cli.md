@@ -144,11 +144,14 @@ Các checkbox gốc giữ nguyên lịch sử; dưới đây là trạng thái m
 - [x] Allowlist đã mở `0.167.1` kèm subset live-verified (late 2026-11-11,
   cùng base, chưa commit); probe daemon xác nhận gateway `configured`,
   profile `gpt-6-luna` capability `supported`, dispatch 0, shutdown sạch.
-- [ ] Workflow live worker → verifier → integration qua daemon: **BỊ CHẶN +
-  UNVERIFIED** — `dispatcher` mới truyền workspace *label* (chưa có
-  worktree thật cho `thread/start` cwd); nối dispatch→worktree P3 + vòng
-  approval + import kết quả là chunk tiếp theo, cố ý chưa chạy live để
-  tránh workspace-write ngoài scratch fixture.
+- [x] Worker → sealed → verifier → Succeeded LIVE qua daemon/API (late,
+  chưa commit): worker thật (`gpt-6-luna`) tạo file trong scratch được
+  provision, seal khớp hash byte thật + criteria server, verifier live
+  độc lập PASS/PASS (thread riêng), verdict qua `SubmitVerification`,
+  task Succeeded, repair 0. State dir giữ tại
+  `/tmp/central-livework-hw4maaks`. Chi tiết trong evidence, mục leg 1.
+- [ ] Git integration qua daemon (prepare/promote chưa có caller ngoài
+  tests): **UNVERIFIED**, là build item tiếp theo, không tuyên bố.
 - [ ] Client độc lập, e2e gate (`test-mvp-e2e.ps1`), đóng gói/zip Windows,
   smoke zip không Rust/Node, reboot thủ công: chưa chạy lại (thiếu `pwsh`
   trên host này). Không suy từ kết quả Linux.

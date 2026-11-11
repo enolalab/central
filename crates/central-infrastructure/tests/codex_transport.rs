@@ -846,6 +846,12 @@ async fn attached_transport_speaks_verified_protocol() {
                     );
                     srv_write
                         .write_all(
+                            b"{\"method\":\"thread/tokenUsage/updated\",\"params\":{\"threadId\":\"srv-thread-1\",\"turnId\":\"turn-7\",\"tokenUsage\":{\"total\":{\"totalTokens\":21609,\"inputTokens\":21601,\"cachedInputTokens\":11520,\"outputTokens\":8},\"modelContextWindow\":258400}}}\n",
+                        )
+                        .await
+                        .expect("peer reports usage");
+                    srv_write
+                        .write_all(
                             b"{\"method\":\"turn/completed\",\"params\":{\"threadId\":\"srv-thread-1\",\"turn\":{\"id\":\"turn-7\",\"status\":\"completed\"}}}\n",
                         )
                         .await
@@ -910,8 +916,10 @@ async fn attached_transport_speaks_verified_protocol() {
         .await
         .expect("decline routes");
 
-    // Completion lands after the answer round-trip.
+    // Completion lands after the answer round-trip, with usage evidence
+    // carried as a human-readable note (not ledgered).
     let mut saw_completed = false;
+    let mut saw_usage = false;
     for _ in 0..100 {
         let observations = gateway.observe(&session).await.expect("observe drains");
         if observations
@@ -919,11 +927,21 @@ async fn attached_transport_speaks_verified_protocol() {
             .any(|o| o.dedup_key.contains("turn/completed"))
         {
             saw_completed = true;
+        }
+        if observations.iter().any(|o| {
+            o.detail.contains("in=21601")
+                && o.detail.contains("cached_in=11520")
+                && o.detail.contains("out=8")
+        }) {
+            saw_usage = true;
+        }
+        if saw_completed && saw_usage {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(saw_completed, "turn completion observed");
+    assert!(saw_usage, "token usage observed as evidence note");
     peer.abort();
 }
 

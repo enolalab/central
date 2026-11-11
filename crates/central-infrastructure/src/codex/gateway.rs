@@ -641,6 +641,33 @@ struct TakenSession {
     attached: AttachedTransport,
 }
 
+/// Human-readable usage note for a `thread/tokenUsage/updated` payload.
+/// Evidence only: the ledger never reads this string.
+fn usage_note(params: &serde_json::Value) -> String {
+    fn num(params: &serde_json::Value, path: &[&str]) -> String {
+        let mut current = params;
+        for key in path {
+            match current.get(*key) {
+                Some(next) => current = next,
+                None => return "unknown".to_string(),
+            }
+        }
+        current
+            .as_u64()
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    }
+    format!(
+        "usage total={} in={} cached_in={} out={} reasoning={} context={} (observed on the wire, not ledgered)",
+        num(params, &["tokenUsage", "total", "totalTokens"]),
+        num(params, &["tokenUsage", "total", "inputTokens"]),
+        num(params, &["tokenUsage", "total", "cachedInputTokens"]),
+        num(params, &["tokenUsage", "total", "outputTokens"]),
+        num(params, &["tokenUsage", "total", "reasoningOutputTokens"]),
+        num(params, &["tokenUsage", "modelContextWindow"]),
+    )
+}
+
 fn into_capability(error: VersionError) -> AppError {
     AppError::Capability(error.to_string())
 }
@@ -817,7 +844,16 @@ impl AgentGateway for CodexGateway {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
             if thread == want {
-                matched.push(observation_for(&epoch, attempt_id, &event));
+                let mut observation = observation_for(&epoch, attempt_id, &event);
+                // Usage arrives on its own notification, never inside
+                // turn/completed: keep the counts as a human-readable
+                // evidence note. This is not ledgering — the shared
+                // budget only moves through the audited user resolve
+                // path, and unknown stays unknown until then.
+                if event.method == "thread/tokenUsage/updated" {
+                    observation.detail = usage_note(&event.params);
+                }
+                matched.push(observation);
             } else {
                 rest.push(event);
             }

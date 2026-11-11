@@ -552,7 +552,12 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
     // parked — only an explicit Resume reopens their gate — and dispatch
     // rechecks every gate, so the loop can never send before resume.
     // `CENTRAL_SCAN_MS=0` disables it (deterministic tests).
-    let scan_config = crate::scan::ScanConfig::from_env(state.fake_agent_enabled);
+    let mut scan_config = crate::scan::ScanConfig::from_env(state.fake_agent_enabled);
+    // Live turns need a real, owned working directory: every dispatched
+    // attempt gets its own scratch leaf under the state dir (explicit,
+    // per-attempt, never the repo). This is scratch isolation, not Git
+    // sealing — worktrees stay on the workspace integration path.
+    scan_config.scheduler.attempt_scratch_root = Some(config.state_dir.join("attempt-scratch"));
     if scan_config.enabled() {
         crate::scan::spawn_scan_loop(
             Arc::clone(&state.store) as Arc<dyn central_application::ports::Store>,

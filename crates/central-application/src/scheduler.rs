@@ -50,6 +50,10 @@ pub struct SchedulerConfig {
     pub resources: BTreeMap<TaskId, Vec<String>>,
     pub poll_interval_ms: i64,
     pub retry_policy: RetryPolicy,
+    /// Optional root for per-attempt scratch directories (see
+    /// [`Dispatcher::with_attempt_scratch_root`]). `None` keeps dispatch
+    /// on inert workspace labels.
+    pub attempt_scratch_root: Option<std::path::PathBuf>,
 }
 
 impl Default for SchedulerConfig {
@@ -59,6 +63,7 @@ impl Default for SchedulerConfig {
             resources: BTreeMap::new(),
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
             retry_policy: RetryPolicy::default(),
+            attempt_scratch_root: None,
         }
     }
 }
@@ -181,6 +186,7 @@ impl Scheduler {
         .with_fallbacks(Arc::clone(&self.fallbacks))
         .with_retry_policy(self.config.retry_policy.clone())
         .with_max_parallel(self.config.max_parallel)
+        .with_attempt_scratch_root(self.config.attempt_scratch_root.clone())
     }
 
     /// Whether the daemon's periodic scan is due.

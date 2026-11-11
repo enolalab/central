@@ -87,6 +87,7 @@ struct FakeGateway {
     script: Mutex<SendScript>,
     block_sends: AtomicBool,
     release_sends: AtomicBool,
+    workspaces: Mutex<Vec<String>>,
 }
 
 impl FakeGateway {
@@ -99,7 +100,12 @@ impl FakeGateway {
             script: Mutex::new(SendScript::Ok),
             block_sends: AtomicBool::new(false),
             release_sends: AtomicBool::new(false),
+            workspaces: Mutex::new(Vec::new()),
         }
+    }
+
+    fn workspaces(&self) -> Vec<String> {
+        self.workspaces.lock().expect("lock").clone()
     }
 
     fn set_script(&self, script: SendScript) {
@@ -153,8 +159,12 @@ impl AgentGateway for FakeGateway {
         })
     }
 
-    async fn open(&self, _request: OpenSession) -> Result<SessionRef, AppError> {
+    async fn open(&self, request: OpenSession) -> Result<SessionRef, AppError> {
         self.opens.fetch_add(1, Ordering::SeqCst);
+        self.workspaces
+            .lock()
+            .expect("lock")
+            .push(request.workspace.clone());
         Ok(SessionRef {
             provider: "fake".to_string(),
             instance_epoch: "epoch-1".to_string(),
@@ -585,6 +595,7 @@ fn default_config() -> SchedulerConfig {
         max_parallel: 2,
         resources: BTreeMap::new(),
         poll_interval_ms: 5_000,
+        attempt_scratch_root: None,
     }
 }
 
@@ -597,6 +608,7 @@ fn port_config(m: TaskId, n: TaskId) -> SchedulerConfig {
         max_parallel: 2,
         resources,
         poll_interval_ms: 5_000,
+        attempt_scratch_root: None,
     }
 }
 
@@ -620,6 +632,92 @@ async fn two_ticks_do_not_duplicate() {
 
     let max_parallel = scheduler.config().max_parallel;
     assert_eq!(max_parallel, 2);
+}
+
+/// Dispatch with a scratch root provisions one isolated directory per
+/// attempt and hands that real path to the gateway — never the repo, never
+/// an invented path. Cleanup removes exactly the owned leaf.
+#[tokio::test]
+async fn dispatch_provisions_isolated_scratch_per_attempt() {
+    use central_application::dispatcher::{cleanup_attempt_scratch, provision_attempt_scratch};
+
+    let harness = Harness::new();
+    let (a, b, _c) = harness.approved_run().await;
+    let root = std::env::temp_dir().join(format!(
+        "central-scratch-{}-{}",
+        std::process::id(),
+        harness.ids.next_attempt_id().uuid().as_u128()
+    ));
+    let mut config = default_config();
+    config.attempt_scratch_root = Some(root.clone());
+    let scheduler = harness.scheduler(config);
+
+    let report: ScheduleReport = scheduler.tick(harness.run_id).await.expect("tick");
+    assert!(report.sent >= 2, "both attempts dispatch: {report:?}");
+
+    for task in [a, b] {
+        let attempts = harness.attempts_of(task);
+        assert_eq!(attempts.len(), 1);
+        let dir = root
+            .join(harness.run_id.to_string())
+            .join(attempts[0].id.to_string());
+        assert!(dir.is_dir(), "scratch provisioned: {}", dir.display());
+    }
+    let seen = harness.gateway.workspaces();
+    assert!(
+        seen.iter().all(|w| w.starts_with(root.to_str().unwrap())),
+        "gateway sessions carry real scratch paths: {seen:?}"
+    );
+
+    // Direct unit coverage for the refusal paths: nothing can be
+    // created under a regular file.
+    let sentinel = root.join("sentinel");
+    std::fs::write(&sentinel, b"not a dir").expect("sentinel file");
+    let first = harness.attempts_of(a)[0].id;
+    assert!(provision_attempt_scratch(&sentinel.join("leaf"), harness.run_id, first).is_err());
+
+    // Explicit cleanup removes exactly the owned leaf, then reports false.
+    assert!(cleanup_attempt_scratch(&root, harness.run_id, first).expect("cleanup"));
+    assert!(!root
+        .join(harness.run_id.to_string())
+        .join(first.to_string())
+        .exists());
+    assert!(!cleanup_attempt_scratch(&root, harness.run_id, first).expect("recleanup"));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// An unusable scratch root defers the dispatch: the attempt stays queued,
+/// nothing is sent, and no working directory is invented.
+#[tokio::test]
+async fn unusable_scratch_root_defers_without_sending() {
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    // A regular file is not a directory root: provisioning must fail.
+    let file_root = std::env::temp_dir().join(format!(
+        "central-scratch-file-{}-{}",
+        std::process::id(),
+        harness.ids.next_attempt_id().uuid().as_u128()
+    ));
+    std::fs::write(&file_root, b"not a dir").expect("sentinel file");
+    let mut config = default_config();
+    config.attempt_scratch_root = Some(file_root.clone());
+    let scheduler = harness.scheduler(config);
+
+    let _report: ScheduleReport = scheduler.tick(harness.run_id).await.expect("tick");
+    assert_eq!(harness.gateway.send_count(), 0, "nothing sent");
+    let attempts = harness.attempts_of(a);
+    assert_eq!(
+        attempts.len(),
+        1,
+        "attempt queued, never claimed past scratch"
+    );
+    let state = harness.store.load_sync(harness.run_id);
+    assert_eq!(
+        state.attempts[&attempts[0].id].status,
+        AttemptStatus::Queued,
+        "unusable root defers, never fails or sends"
+    );
+    std::fs::remove_file(&file_root).ok();
 }
 
 #[tokio::test]

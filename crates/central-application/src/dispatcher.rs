@@ -22,6 +22,7 @@
 //! the harness still serves the attempt's resolved profile and model.
 
 use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use central_domain::{
@@ -50,6 +51,13 @@ pub struct Dispatcher {
     retry_policy: RetryPolicy,
     max_parallel: usize,
     actor: Actor,
+    /// Optional root for per-attempt scratch directories. When set, every
+    /// dispatched attempt gets its own isolated directory and the gateway
+    /// session carries that real path as its working directory; without it
+    /// the session carries the inert [`workspace_label`]. Scratch is not a
+    /// Git worktree and never a sealed candidate: sealing stays on the
+    /// workspace integration path.
+    attempt_scratch_root: Option<PathBuf>,
 }
 
 impl Dispatcher {
@@ -73,6 +81,7 @@ impl Dispatcher {
             retry_policy: RetryPolicy::default(),
             max_parallel: DEFAULT_MAX_PARALLEL,
             actor,
+            attempt_scratch_root: None,
         }
     }
 
@@ -92,6 +101,15 @@ impl Dispatcher {
     /// Concurrency bound for attempts queued by fallback handling.
     pub fn with_max_parallel(mut self, max_parallel: usize) -> Self {
         self.max_parallel = max_parallel;
+        self
+    }
+
+    /// Isolate every dispatched attempt in its own scratch directory under
+    /// `root`, and hand that real path to the gateway as the working
+    /// directory. `None` (the default) keeps the previous behavior: the
+    /// session carries only the inert [`workspace_label`].
+    pub fn with_attempt_scratch_root(mut self, root: Option<PathBuf>) -> Self {
+        self.attempt_scratch_root = root;
         self
     }
 
@@ -280,6 +298,18 @@ impl Dispatcher {
             .cloned()
             .unwrap_or_default();
 
+        // A live turn needs a real, owned working directory — before the
+        // claim, while the attempt is still safely Queued. An unusable
+        // root defers the dispatch: the directory is never invented and
+        // the turn never runs somewhere unowned.
+        let workspace = match &self.attempt_scratch_root {
+            Some(root) => match provision_attempt_scratch(root, run_id, attempt_id) {
+                Ok(dir) => dir.to_string_lossy().into_owned(),
+                Err(_) => return Ok(()),
+            },
+            None => workspace_label(run_id, attempt_id),
+        };
+
         // Claim the send under CAS. A racing dispatcher loses here and
         // never touches the gateway for this attempt.
         match self
@@ -306,7 +336,7 @@ impl Dispatcher {
             .open(OpenSession {
                 attempt_id,
                 profile,
-                workspace: workspace_label(run_id, attempt_id),
+                workspace,
                 resume_from: None,
             })
             .await
@@ -594,6 +624,95 @@ impl Dispatcher {
             }
         }
     }
+}
+
+/// Provision one isolated scratch directory for an attempt:
+/// `<root>/<run>/<attempt>`, created on demand. Components are UUIDs, so
+/// no separator can smuggle the path outside the root — and the canonical
+/// prefix is still verified before trusting it. Anything unusable defers
+/// the dispatch (the attempt stays `Queued`): a working directory is
+/// never invented, and a live turn never runs somewhere unowned.
+///
+/// This is explicitly NOT a Git worktree and never a sealed candidate:
+/// it isolates live harness filesystem effects. Sealing stays on the
+/// workspace integration path (P3/T5).
+pub fn provision_attempt_scratch(
+    root: &Path,
+    run: RunId,
+    attempt: AttemptId,
+) -> Result<PathBuf, AppError> {
+    // The root itself is explicit configuration: create it if needed so a
+    // fresh state dir works on first dispatch. Anything that cannot be a
+    // directory (a file, a dead symlink, no permission) fails here and
+    // defers the dispatch below.
+    std::fs::create_dir_all(root).map_err(|error| {
+        AppError::Storage(format!(
+            "attempt scratch root is unusable {}: {error}",
+            root.display()
+        ))
+    })?;
+    let canonical_root = root.canonicalize().map_err(|error| {
+        AppError::Storage(format!(
+            "attempt scratch root is unusable {}: {error}",
+            root.display()
+        ))
+    })?;
+    for component in [run.to_string(), attempt.to_string()] {
+        if component.contains('/') || component.contains('\\') || component.contains('\0') {
+            return Err(AppError::Storage(format!(
+                "attempt scratch component escapes the root: {component}"
+            )));
+        }
+    }
+    let dir = canonical_root
+        .join(run.to_string())
+        .join(attempt.to_string());
+    if !dir.starts_with(&canonical_root) {
+        return Err(AppError::Storage(
+            "attempt scratch escapes the root; refusing".to_string(),
+        ));
+    }
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        AppError::Storage(format!(
+            "cannot create attempt scratch {}: {error}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
+/// Explicit, ownership-checked removal of one provisioned scratch leaf.
+/// Removes nothing outside `root`; missing leaves report `false`.
+/// Dropping never cleans up implicitly — callers remove explicitly.
+pub fn cleanup_attempt_scratch(
+    root: &Path,
+    run: RunId,
+    attempt: AttemptId,
+) -> Result<bool, AppError> {
+    let canonical_root = root.canonicalize().map_err(|error| {
+        AppError::Storage(format!(
+            "attempt scratch root is unusable {}: {error}",
+            root.display()
+        ))
+    })?;
+    let dir = canonical_root
+        .join(run.to_string())
+        .join(attempt.to_string());
+    if !dir.starts_with(&canonical_root) {
+        return Err(AppError::Storage(
+            "attempt scratch escapes the root; refusing".to_string(),
+        ));
+    }
+    if !dir.exists() {
+        return Ok(false);
+    }
+    std::fs::remove_dir_all(&dir).map_err(|error| {
+        AppError::Storage(format!(
+            "cannot remove attempt scratch {}: {error}",
+            dir.display()
+        ))
+    })?;
+    Ok(true)
 }
 
 /// Logical workspace label for a dispatch. No directory is created here:
