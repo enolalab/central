@@ -526,6 +526,13 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
         )
         .map_err(BootstrapError::Storage)?,
     );
+    // Git workspaces live directly under the state dir so the manager's
+    // sync-queue is the same directory the sync intake writes to: the
+    // daemon never has two sources of truth for user-synced commits.
+    let workspace = Arc::new(
+        central_infrastructure::workspace::GitWorkspaceManager::open(&config.state_dir)
+            .map_err(BootstrapError::Storage)?,
+    );
     let state = AppState {
         store,
         actor,
@@ -546,6 +553,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
         fake_counts,
         shutdown: Arc::new(std::sync::Mutex::new(Some(shutdown_tx))),
         scan_notify: Arc::clone(&scan_notify),
+        workspace,
     };
     // Daemon scan loop (P3/T6 carries T1's scheduler into production):
     // periodic + on-event ticks via should_tick/tick. Parked runs stay
@@ -567,6 +575,10 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
             state.actor.clone(),
             scan_config,
             scan_notify,
+            Some(Arc::clone(&state.workspace)
+                as Arc<
+                    dyn central_application::ports::workspace::WorkspaceManager,
+                >),
         );
     }
     eprintln!("central-server: listening on {addr}");

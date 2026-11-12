@@ -33,6 +33,7 @@ use central_domain::{
 
 use crate::contracts::{AppError, DispatchError, DispatchSummary, OpenSession, SendTurn};
 use crate::fallback::{choose_fallback, select_fallback, FallbackOverrides};
+use crate::ports::workspace::{SnapshotRequest, WorkspaceManager, WorkspaceRequest};
 use crate::ports::{AgentGateway, Clock, IdSource, Store};
 use crate::retries::RetryAction;
 use crate::retries::{classify_open, classify_send, retries_used, retry_due, retry_not_before};
@@ -58,6 +59,11 @@ pub struct Dispatcher {
     /// Git worktree and never a sealed candidate: sealing stays on the
     /// workspace integration path.
     attempt_scratch_root: Option<PathBuf>,
+    /// Optional Git workspace manager. When set and the run targets an
+    /// existing repository with a synced commit, dispatch snapshots that
+    /// commit and creates one detached worktree per attempt instead of a
+    /// scratch directory.
+    workspace: Option<Arc<dyn WorkspaceManager>>,
 }
 
 impl Dispatcher {
@@ -82,6 +88,7 @@ impl Dispatcher {
             max_parallel: DEFAULT_MAX_PARALLEL,
             actor,
             attempt_scratch_root: None,
+            workspace: None,
         }
     }
 
@@ -110,6 +117,15 @@ impl Dispatcher {
     /// session carries only the inert [`workspace_label`].
     pub fn with_attempt_scratch_root(mut self, root: Option<PathBuf>) -> Self {
         self.attempt_scratch_root = root;
+        self
+    }
+
+    /// Give dispatched attempts real Git worktrees when the run targets a
+    /// synced repository: snapshot the synced commit and create one
+    /// detached worktree per attempt. Without a manager the dispatcher
+    /// falls back to scratch directories (or the inert label).
+    pub fn with_workspace_manager(mut self, manager: Option<Arc<dyn WorkspaceManager>>) -> Self {
+        self.workspace = manager;
         self
     }
 
@@ -302,12 +318,31 @@ impl Dispatcher {
         // claim, while the attempt is still safely Queued. An unusable
         // root defers the dispatch: the directory is never invented and
         // the turn never runs somewhere unowned.
-        let workspace = match &self.attempt_scratch_root {
-            Some(root) => match provision_attempt_scratch(root, run_id, attempt_id) {
-                Ok(dir) => dir.to_string_lossy().into_owned(),
-                Err(_) => return Ok(()),
+        // When a workspace manager is attached and the run targets an
+        // existing repository with a user-synced commit, the attempt gets
+        // a real detached worktree (snapshot + create) instead of
+        // scratch: only sealed worktrees can ever feed Git integration.
+        // A repository without a synced commit defers — Central never
+        // invents the base commit.
+        let workspace = match &self.workspace {
+            Some(manager) => match self.provision_worktree(manager, &state, attempt_id).await? {
+                WorktreeSite::Worktree(path) => path,
+                WorktreeSite::Defer => return Ok(()),
+                WorktreeSite::Scratch => match &self.attempt_scratch_root {
+                    Some(root) => match provision_attempt_scratch(root, run_id, attempt_id) {
+                        Ok(dir) => dir.to_string_lossy().into_owned(),
+                        Err(_) => return Ok(()),
+                    },
+                    None => workspace_label(run_id, attempt_id),
+                },
             },
-            None => workspace_label(run_id, attempt_id),
+            None => match &self.attempt_scratch_root {
+                Some(root) => match provision_attempt_scratch(root, run_id, attempt_id) {
+                    Ok(dir) => dir.to_string_lossy().into_owned(),
+                    Err(_) => return Ok(()),
+                },
+                None => workspace_label(run_id, attempt_id),
+            },
         };
 
         // Claim the send under CAS. A racing dispatcher loses here and
@@ -720,4 +755,61 @@ pub fn cleanup_attempt_scratch(
 /// label keeps every attempt addressable until then.
 fn workspace_label(run_id: RunId, attempt_id: AttemptId) -> String {
     format!("run/{run_id}/attempt/{attempt_id}")
+}
+
+/// Where the next turn runs: a detached Git worktree when the run
+/// targets a synced repository, else the configured scratch fallback.
+/// Anything unusable defers the dispatch instead of inventing a cwd.
+enum WorktreeSite {
+    Worktree(String),
+    Scratch,
+    Defer,
+}
+
+impl Dispatcher {
+    /// Resolve a real working directory for one dispatch. A repository
+    /// path that is not a directory is not a repo at all: fall back to
+    /// scratch (or the inert label). A real repository without a
+    /// user-synced commit, or any snapshot/create failure, defers the
+    /// dispatch — the attempt stays `Queued`, nothing is sent and no
+    /// base commit is ever invented.
+    async fn provision_worktree(
+        &self,
+        manager: &Arc<dyn WorkspaceManager>,
+        state: &central_domain::RunState,
+        attempt_id: AttemptId,
+    ) -> Result<WorktreeSite, AppError> {
+        use std::path::Path as StdPath;
+        if !StdPath::new(&state.repository).is_dir() {
+            return Ok(WorktreeSite::Scratch);
+        }
+        let commit = match manager
+            .latest_synced_commit(state.id, &state.repository)
+            .await
+        {
+            Ok(Some(commit)) => commit,
+            _ => return Ok(WorktreeSite::Defer),
+        };
+        let snapshot = match manager
+            .snapshot(SnapshotRequest {
+                repo_root: state.repository.clone(),
+                commit,
+                selected_dirty_paths: Vec::new(),
+            })
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(_) => return Ok(WorktreeSite::Defer),
+        };
+        match manager
+            .create(WorkspaceRequest {
+                attempt_id,
+                input: snapshot,
+            })
+            .await
+        {
+            Ok(workspace) => Ok(WorktreeSite::Worktree(workspace.worktree)),
+            Err(_) => Ok(WorktreeSite::Defer),
+        }
+    }
 }

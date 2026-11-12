@@ -153,6 +153,7 @@ fn resolver(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scheduler_for(
     store: &Arc<dyn Store>,
     clock: &Arc<dyn Clock>,
@@ -161,8 +162,9 @@ fn scheduler_for(
     actor: &Actor,
     config: &ScanConfig,
     profiles: &ProfileCache,
+    workspace: Option<Arc<dyn central_application::ports::workspace::WorkspaceManager>>,
 ) -> Result<Scheduler, central_application::contracts::AppError> {
-    Scheduler::new(
+    Ok(Scheduler::new(
         Arc::clone(store),
         Arc::clone(clock),
         Arc::clone(ids),
@@ -170,7 +172,8 @@ fn scheduler_for(
         config.scheduler.clone(),
         resolver(config.fake_agent, Arc::clone(profiles)),
         actor.clone(),
-    )
+    )?
+    .with_workspace(workspace))
 }
 
 /// One scan pass over every known run. Returns `(ticked, sent, unknown)`.
@@ -186,18 +189,20 @@ pub async fn tick_all(
     actor: &Actor,
     config: &ScanConfig,
     profiles: &ProfileCache,
+    workspace: Option<Arc<dyn central_application::ports::workspace::WorkspaceManager>>,
     last_tick: &mut HashMap<RunId, Timestamp>,
 ) -> (usize, usize, usize) {
     // The owner registry refreshes every pass; a failed refresh keeps
     // the previous cache, so dispatch waits rather than substituting.
     refresh_profiles(store, profiles).await;
-    let scheduler = match scheduler_for(store, clock, ids, agent, actor, config, profiles) {
-        Ok(scheduler) => scheduler,
-        Err(error) => {
-            eprintln!("central-server: scan scheduler unavailable: {error}");
-            return (0, 0, 0);
-        }
-    };
+    let scheduler =
+        match scheduler_for(store, clock, ids, agent, actor, config, profiles, workspace) {
+            Ok(scheduler) => scheduler,
+            Err(error) => {
+                eprintln!("central-server: scan scheduler unavailable: {error}");
+                return (0, 0, 0);
+            }
+        };
     let now = clock.now();
     let run_ids = match store.list_run_ids().await {
         Ok(ids) => ids,
@@ -243,6 +248,7 @@ pub async fn tick_all(
 /// Spawn the background scan loop. The loop wakes on the interval or on
 /// [`Notify`] (API writes), scans, then sleeps again. Scan errors are
 /// logged to stderr; the loop never takes the daemon down.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_scan_loop(
     store: Arc<dyn Store>,
     clock: Arc<dyn Clock>,
@@ -251,6 +257,7 @@ pub fn spawn_scan_loop(
     actor: Actor,
     config: ScanConfig,
     notify: Arc<Notify>,
+    workspace: Option<Arc<dyn central_application::ports::workspace::WorkspaceManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut last_tick: HashMap<RunId, Timestamp> = HashMap::new();
@@ -269,6 +276,7 @@ pub fn spawn_scan_loop(
                 &actor,
                 &config,
                 &profiles,
+                workspace.clone(),
                 &mut last_tick,
             )
             .await;

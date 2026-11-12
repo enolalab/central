@@ -2,6 +2,7 @@ pub mod attempts;
 pub mod auth;
 pub mod commands;
 pub mod inbox;
+pub mod integration;
 pub mod meta;
 pub mod origin;
 pub mod runs;
@@ -70,6 +71,10 @@ pub struct AppState {
     /// Wakes the daemon scan loop after an API write (periodic ticks still
     /// apply; see `crate::scan`). Never blocks request handling.
     pub scan_notify: Arc<tokio::sync::Notify>,
+    /// Git workspace manager owned by the daemon: per-attempt worktrees,
+    /// seals and integration live here. Shared with the scan loop so
+    /// dispatches for synced repos get real worktrees.
+    pub workspace: Arc<central_infrastructure::workspace::GitWorkspaceManager>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -125,6 +130,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/runs/{id}/logs", get(logs::get_logs))
         .route("/v1/runs/{id}/sync", post(sync::post_sync))
+        .route(
+            "/v1/runs/{id}/integration/run",
+            post(integration::post_integration_run),
+        )
         .route(
             "/v1/profiles",
             get(profiles::list_profiles).post(profiles::create_profile),

@@ -717,6 +717,10 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
         fake_counts: None,
         shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
         scan_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        workspace: std::sync::Arc::new(
+            central_infrastructure::workspace::GitWorkspaceManager::open(&dir)
+                .expect("test workspace manager"),
+        ),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -933,6 +937,10 @@ async fn history_reads_use_bounded_store_fetches() {
         fake_counts: None,
         shutdown: std::sync::Arc::new(std::sync::Mutex::new(None)),
         scan_notify: std::sync::Arc::new(tokio::sync::Notify::new()),
+        workspace: std::sync::Arc::new(
+            central_infrastructure::workspace::GitWorkspaceManager::open(&dir)
+                .expect("test workspace manager"),
+        ),
     };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await

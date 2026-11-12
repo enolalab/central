@@ -275,6 +275,19 @@ paths:
       responses:
         '200': { description: queued sync }
 
+  /v1/runs/{id}/integration/run:
+    post:
+      summary: >-
+        Owner-driven Git integration: seal the attempt worktree, prepare
+        the temporary branch, run the approved baseline/affected/
+        acceptance checks, and promote the good ref by compare-and-swap
+        on pass. Control scope or higher.
+      responses:
+        '200': { description: integration receipt and check evidence }
+        '400': { description: validation failed }
+        '403': { description: forbidden }
+        '409': { description: conflict (merge, stale parent or failed checks) }
+
   /v1/runs/{id}/dispatch:
     post:
       summary: >-

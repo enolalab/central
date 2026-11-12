@@ -176,6 +176,13 @@ pub trait WorkspaceManager: Send + Sync {
         run: RunId,
         ref_name: &str,
     ) -> Result<PromotionReceipt, AppError>;
+    /// Latest user-synced commit for `(run, repo)` from the manager's sync
+    /// queue, if any. `None` means nobody synced this repo for this run.
+    async fn latest_synced_commit(
+        &self,
+        run: RunId,
+        repo: &str,
+    ) -> Result<Option<String>, AppError>;
     /// Explicit, ownership-checked worktree removal. Unknown or foreign
     /// paths refuse; processes spawned for Git ops are reaped by the call.
     async fn remove_workspace(&self, workspace: &WorkspaceRef) -> Result<(), AppError>;

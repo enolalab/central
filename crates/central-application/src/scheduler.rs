@@ -114,6 +114,7 @@ pub struct Scheduler {
     resolver: Arc<ProfileResolver>,
     fallbacks: Arc<FallbackOverrides>,
     actor: Actor,
+    workspace: Option<Arc<dyn crate::ports::workspace::WorkspaceManager>>,
 }
 
 impl Scheduler {
@@ -136,7 +137,19 @@ impl Scheduler {
             resolver,
             fallbacks: Arc::new(FallbackOverrides::default()),
             actor,
+            workspace: None,
         })
+    }
+
+    /// Attach a Git workspace manager: dispatches for runs targeting a
+    /// synced repository get detached worktrees; everything else keeps
+    /// the configured scratch behaviour.
+    pub fn with_workspace(
+        mut self,
+        manager: Option<Arc<dyn crate::ports::workspace::WorkspaceManager>>,
+    ) -> Self {
+        self.workspace = manager;
+        self
     }
 
     /// Register the profile registry the fallback chain resolves
@@ -187,6 +200,7 @@ impl Scheduler {
         .with_retry_policy(self.config.retry_policy.clone())
         .with_max_parallel(self.config.max_parallel)
         .with_attempt_scratch_root(self.config.attempt_scratch_root.clone())
+        .with_workspace_manager(self.workspace.clone())
     }
 
     /// Whether the daemon's periodic scan is due.

@@ -64,6 +64,10 @@ impl Drop for Server {
 }
 
 fn spawn_cmd(dir: &std::path::Path, fake_agent: bool) -> Command {
+    spawn_cmd_scan(dir, fake_agent, "0")
+}
+
+fn spawn_cmd_scan(dir: &std::path::Path, fake_agent: bool, scan_ms: &str) -> Command {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_central-server"));
     cmd.args([
         "--state-dir",
@@ -75,14 +79,33 @@ fn spawn_cmd(dir: &std::path::Path, fake_agent: bool) -> Command {
         cmd.arg("--fake-agent");
     }
     cmd.stdout(Stdio::null()).stderr(Stdio::piped());
-    cmd.env("CENTRAL_SCAN_MS", "0");
+    cmd.env("CENTRAL_SCAN_MS", scan_ms);
     cmd
 }
 
 /// Start the daemon against `dir`, which may already hold a database
 /// and credentials from a previous boot (restart tests).
 pub fn start_server_in(dir: &std::path::Path, fake_agent: bool) -> Server {
-    let mut child = spawn_cmd(dir, fake_agent).spawn().expect("spawn server");
+    let child = spawn_cmd(dir, fake_agent).spawn().expect("spawn server");
+    wait_healthy(dir, child)
+}
+
+pub fn start_server(dir: &std::path::Path) -> Server {
+    start_server_in(dir, true)
+}
+
+/// Daemon with the background scan loop enabled: ticks queue ready work
+/// and dispatch it without manual `/dispatch` calls.
+pub fn start_server_with_scan(dir: &std::path::Path, scan_ms: &str) -> Server {
+    let child = spawn_cmd_scan(dir, true, scan_ms)
+        .spawn()
+        .expect("spawn server");
+    wait_healthy(dir, child)
+}
+
+/// Shared readiness wait: the daemon writes `server.json` once its
+/// listener is up and healthy.
+fn wait_healthy(dir: &std::path::Path, mut child: std::process::Child) -> Server {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
@@ -105,10 +128,6 @@ pub fn start_server_in(dir: &std::path::Path, fake_agent: bool) -> Server {
         assert!(Instant::now() < deadline, "server did not become healthy");
         std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-pub fn start_server(dir: &std::path::Path) -> Server {
-    start_server_in(dir, true)
 }
 
 /// Raw HTTP over one connection. Extra headers are `("name", "value")`

@@ -144,14 +144,17 @@ Các checkbox gốc giữ nguyên lịch sử; dưới đây là trạng thái m
 - [x] Allowlist đã mở `0.167.1` kèm subset live-verified (late 2026-11-11,
   cùng base, chưa commit); probe daemon xác nhận gateway `configured`,
   profile `gpt-6-luna` capability `supported`, dispatch 0, shutdown sạch.
-- [x] Worker → sealed → verifier → Succeeded LIVE qua daemon/API (late,
-  chưa commit): worker thật (`gpt-6-luna`) tạo file trong scratch được
-  provision, seal khớp hash byte thật + criteria server, verifier live
-  độc lập PASS/PASS (thread riêng), verdict qua `SubmitVerification`,
-  task Succeeded, repair 0. State dir giữ tại
-  `/tmp/central-livework-hw4maaks`. Chi tiết trong evidence, mục leg 1.
-- [ ] Git integration qua daemon (prepare/promote chưa có caller ngoài
-  tests): **UNVERIFIED**, là build item tiếp theo, không tuyên bố.
+- [x] Worker → sealed → verifier → Succeeded LIVE qua daemon/API: worker
+  thật trong worktree được provision, seal khớp hash, verifier độc lập
+  PASS/PASS, verdict qua `SubmitVerification`, repair 0 (leg 1, scratch).
+- [x] Git integration LIVE qua daemon (late, chưa commit):
+  `POST /v1/runs/{id}/integration/run` seal→prepare→checks→CAS-promote;
+  good ref `d5306e73` → `c87ecb66` đã xác minh trong repo, candidate đúng
+  byte worker. State dir giữ tại `/tmp/central-livechain-z4tiyfz2`.
+  Chi tiết trong evidence, mục leg 2.
+- [ ] Scheduler-auto integration (không cần owner gọi endpoint) và
+  Windows/release/reboot: chưa làm (thiếu `pwsh` cho phần Windows).
+  Không suy từ kết quả Linux.
 - [ ] Client độc lập, e2e gate (`test-mvp-e2e.ps1`), đóng gói/zip Windows,
   smoke zip không Rust/Node, reboot thủ công: chưa chạy lại (thiếu `pwsh`
   trên host này). Không suy từ kết quả Linux.

@@ -308,9 +308,47 @@ the wired gateway, cwd `/tmp`, scan 500ms, truthful `codex.json`
   the worker session (independence check passes), no same-session
   override, tracked source untouched. Revision 9 → task **Succeeded**,
   `repair_rounds_used: 0`.
-- NOT done: Git integration through the daemon (prepare/promote have no
-  daemon caller — port + contract tests only). Next build item, not a
-  claim. Windows/packaging/reboot gates unchanged (no `pwsh` on host).
+- NOT done at that time: Git integration through the daemon
+  (prepare/promote had no daemon caller). Resolved below (leg 2).
+  Windows/packaging/reboot gates unchanged (no `pwsh` on host).
+
+## Live leg 2: Git integration through the daemon (2026-11-11 late)
+
+New product surface built this session (all gated, all tested):
+`POST /v1/runs/{id}/integration/run` — owner-driven: seal the
+attempt's live worktree, prepare the temporary branch, run the approved
+baseline/affected/acceptance checks via `SupervisedCheckRunner`, CAS-promote
+the good ref on pass. Plus workspace-registry durability
+(`workspaces.json` atomic write + reload; corrupt registry fails closed),
+`latest_synced_commit` sync-queue reads, dispatcher worktree provisioning
+(repo + synced commit → worktree, else scratch/defer), and scan wiring.
+Tests added: `integration_api` (pass moves ref / fail keeps ref /
+unknown fails 404, all through HTTP with real git + real checks) and
+`workspace_registry_survives_reopen` (reopen → seal/prepare work;
+corrupt registry refuses).
+
+Live proof, single boot, fixture repo (no inference beyond the two
+model turns): state dir kept at `/tmp/central-livechain-z4tiyfz2`
+(run `43416a7a-85c4-4965-a3fa-b85f38150f63`).
+worker (pinned `gpt-6-luna`/low, provisioned worktree): edited
+`calc.py` (sha256 `2ce8d715…`, verified by owner re-run) + `test_calc.py`,
+no approvals requested; turn/completed observed in the durable event log
+(48 `ObservationRecorded`, incl. `thread/tokenUsage/updated`).
+Result import sealed `candidate_hash 2ce8d715…` == file bytes.
+Independent verifier (separate thread, read-only): PASS/PASS, usage
+in 21721/out 53; verdict via `SubmitVerification` → task Succeeded,
+repair 0.
+`POST integration/run` (approved plan `dd…dd`, baseline `exit 0`,
+acceptance `test -f calc.py` + `assert add(1,2)==3`): all exit 0 with
+evidence hashes; CAS `d5306e73` → `c87ecb66`; good ref verified in-repo
+and points at the sealed candidate tree (fast-forward, no invented
+merge).
+Usage accounting: live daemon turns report usage only as observation
+notes; nothing auto-enters the ledger (by design — audited resolve
+only). Exact worker-turn counts were not harvested (unknown, stated).
+No orphaned agent processes after either shutdown (verified via `ps`).
+Scheduler-auto integration (no operator call) stays the follow-up;
+manual Windows/release/reboot gates unchanged (no `pwsh`).
 
 ## Assessment
 
@@ -319,10 +357,13 @@ containment fix and `cfg(windows)` gating; transport wiring and
 dispatcher scratch provisioning are implemented with maintained tests
 (full suite green). Proven live: worker → sealed → verifier →
 Succeeded through the daemon/API (leg 1), plus the restart barrier.
-MVP acceptance is still **not** complete: Git integration through the
-daemon, usage ledgering of live turns, Windows/release gates and reboot
-acceptance remain unverified, so no plan or the MVP may be marked
-accepted on this evidence.
+MVP acceptance is still **not** complete: usage ledgering of live
+turns (unknown, by design), scheduler-auto integration, Windows/release
+gates and reboot acceptance remain unverified, so no plan or the MVP
+may be marked accepted on this evidence. What this evidence does prove:
+the full worker → sealed → verifier → Git-integrated chain runs live
+through the daemon and API with real model turns, real files, real git
+and a real CAS-promoted ref.
 
 Machine-local raw logs from the prior run remain under `/tmp` as listed
 in `2026-11-11-linux-rerun.md`; this rerun's full-suite output was

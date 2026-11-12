@@ -39,15 +39,16 @@ use serde::{Deserialize, Serialize};
 /// One live worktree tracked by the manager: the repo it was cut from and
 /// the path it lives at. Both stay under manager control until explicit,
 /// ownership-checked removal.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct LiveWorkspace {
     repo: PathBuf,
     worktree: PathBuf,
+    base_commit: String,
 }
 
 /// One sealed candidate: where its worktree lives so the seal can be
 /// re-derived, and the tree/parent it was sealed with.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct SealedEntry {
     attempt_id: AttemptId,
     repo: PathBuf,
@@ -65,6 +66,16 @@ struct ActiveIntegration {
     candidate: String,
     ref_name: String,
     base: String,
+}
+
+/// Durable registry: which live worktrees belong to which attempts, and
+/// which immutable sealed candidates exist. Written atomically after every
+/// mutation; reloaded on open so a daemon restart never orphans a worktree
+/// binding or a sealed candidate.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct WorkspaceRegistry {
+    live: HashMap<AttemptId, LiveWorkspace>,
+    sealed: HashMap<String, SealedEntry>,
 }
 
 /// Git-backed [`WorkspaceManager`]. All managed paths live under
@@ -94,7 +105,7 @@ impl GitWorkspaceManager {
             })?;
         }
         let git = Git::new(state_root.join("hooks"))?;
-        Ok(Self {
+        let manager = Self {
             state_root: state_root.to_path_buf(),
             git,
             worktrees_dir,
@@ -103,7 +114,72 @@ impl GitWorkspaceManager {
             sealed: Mutex::new(HashMap::new()),
             active: Mutex::new(HashMap::new()),
             counter: AtomicU64::new(0),
-        })
+        };
+        manager.load_registry()?;
+        Ok(manager)
+    }
+
+    /// Durable registry file: live worktree bindings plus sealed
+    /// candidates. The temporary integration branch/worktree is
+    /// deliberately NOT persisted — it is scratch rebuilt by the next
+    /// prepare, never durable state.
+    fn registry_path(&self) -> PathBuf {
+        self.state_root.join("workspaces.json")
+    }
+
+    /// Snapshot both maps and flush atomically (temp file + rename), so a
+    /// crash can never leave a half-written registry behind.
+    fn save_registry(&self) -> Result<(), AppError> {
+        let registry = WorkspaceRegistry {
+            live: Self::lock(&self.live)?.clone(),
+            sealed: Self::lock(&self.sealed)?.clone(),
+        };
+        let text = serde_json::to_string(&registry).map_err(|error| {
+            AppError::Storage(format!("cannot encode workspace registry: {error}"))
+        })?;
+        let path = self.registry_path();
+        let tmp = path.with_extension("json-part");
+        std::fs::write(&tmp, text).map_err(|error| {
+            AppError::Storage(format!("cannot stage workspace registry: {error}"))
+        })?;
+        std::fs::rename(&tmp, &path).map_err(|error| {
+            let _ = std::fs::remove_file(&tmp);
+            AppError::Storage(format!("cannot commit workspace registry: {error}"))
+        })?;
+        Ok(())
+    }
+
+    /// Reload live + sealed bindings. A corrupt registry fails closed:
+    /// running with amnesia would strand worktrees and allow duplicate
+    /// creates, so the operator must move the file aside first. Entries
+    /// whose worktree directory is gone are dropped: the binding is
+    /// provably dead, and keeping it would only block honest re-creation.
+    fn load_registry(&self) -> Result<(), AppError> {
+        let path = self.registry_path();
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AppError::Storage(format!(
+                    "cannot read workspace registry {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let registry: WorkspaceRegistry = serde_json::from_str(&text).map_err(|error| {
+            AppError::Storage(format!(
+                "workspace registry {} is corrupt (move it aside to recover): {error}",
+                path.display()
+            ))
+        })?;
+        let live: HashMap<AttemptId, LiveWorkspace> = registry
+            .live
+            .into_iter()
+            .filter(|(_, entry)| entry.worktree.is_dir())
+            .collect();
+        *Self::lock(&self.live)? = live;
+        *Self::lock(&self.sealed)? = registry.sealed;
+        Ok(())
     }
 
     fn lock<T>(slot: &Mutex<T>) -> Result<std::sync::MutexGuard<'_, T>, AppError> {
@@ -140,6 +216,73 @@ impl GitWorkspaceManager {
             )));
         }
         Ok(entry.clone())
+    }
+
+    /// Latest user-synced commit for `(run, repo)` from this manager's
+    /// sync queue, if any. The queue is append-only owner intent; the last
+    /// line naming this exact canonical repo wins. `None` means nobody
+    /// synced this repo for this run — dispatch must not invent a commit.
+    pub fn latest_synced_commit(
+        &self,
+        run: RunId,
+        repo: &Path,
+    ) -> Result<Option<String>, AppError> {
+        let canonical = repo.canonicalize().map_err(|error| {
+            AppError::Validation(format!(
+                "cannot resolve repository {}: {error}",
+                repo.display()
+            ))
+        })?;
+        let path = self
+            .state_root
+            .join("sync-queue")
+            .join(format!("{run}.jsonl"));
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(AppError::Storage(format!(
+                    "cannot read sync queue {}: {error}",
+                    path.display()
+                )));
+            }
+        };
+        let mut latest = None;
+        for line in text.lines() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let intent: SyncIntent = serde_json::from_str(trimmed).map_err(|error| {
+                AppError::Storage(format!("sync queue holds a malformed intent: {error}"))
+            })?;
+            if intent.run == run && Path::new(&intent.repository) == canonical.as_path() {
+                latest = Some(intent.commit.clone());
+            }
+        }
+        Ok(latest)
+    }
+
+    /// Seal the live worktree owned by `attempt`, if any. Same commit and
+    /// registry as [`seal`][WorkspaceManager::seal]; the lookup stays
+    /// ownership-checked through the live map, so a foreign attempt id
+    /// cannot seal someone else's worktree.
+    pub async fn seal_live(&self, attempt: AttemptId) -> Result<CandidateRef, AppError> {
+        let workspace = {
+            let live = Self::lock(&self.live)?;
+            live.get(&attempt)
+                .map(|entry| WorkspaceRef {
+                    attempt_id: attempt,
+                    worktree: entry.worktree.to_string_lossy().into_owned(),
+                    base_commit: entry.base_commit.clone(),
+                })
+                .ok_or_else(|| {
+                    AppError::NotFound(format!(
+                        "no live worktree for attempt {attempt}; scratch-backed attempts cannot Git-seal"
+                    ))
+                })?
+        };
+        self.seal(&workspace).await
     }
 
     fn intent_path(&self, run: RunId, ref_name: &str) -> PathBuf {
@@ -256,8 +399,10 @@ impl WorkspaceManager for GitWorkspaceManager {
             LiveWorkspace {
                 repo: repo.clone(),
                 worktree: worktree.clone(),
+                base_commit: request.input.commit.clone(),
             },
         );
+        self.save_registry()?;
         Ok(WorkspaceRef {
             attempt_id: request.attempt_id,
             worktree: worktree.to_string_lossy().into_owned(),
@@ -303,6 +448,7 @@ impl WorkspaceManager for GitWorkspaceManager {
                 parent: parent.clone(),
             },
         );
+        self.save_registry()?;
         Ok(CandidateRef {
             attempt_id: workspace.attempt_id,
             commit,
@@ -552,6 +698,14 @@ impl WorkspaceManager for GitWorkspaceManager {
         ))
     }
 
+    async fn latest_synced_commit(
+        &self,
+        run: RunId,
+        repo: &str,
+    ) -> Result<Option<String>, AppError> {
+        self.latest_synced_commit(run, Path::new(repo))
+    }
+
     async fn remove_workspace(&self, workspace: &WorkspaceRef) -> Result<(), AppError> {
         let live = self.live_workspace(workspace)?;
         let worktree = PathBuf::from(&workspace.worktree);
@@ -565,6 +719,7 @@ impl WorkspaceManager for GitWorkspaceManager {
             })?;
         }
         Self::lock(&self.live)?.remove(&workspace.attempt_id);
+        self.save_registry()?;
         Ok(())
     }
 }

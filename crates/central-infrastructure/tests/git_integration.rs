@@ -341,6 +341,69 @@ async fn promotion_receipt_recovered_from_actual_ref() {
     assert_eq!(recovered.new_head, read_ref(&repo, GOOD_REF));
 }
 
+/// Restart persistence: the live-worktree and sealed-candidate registry
+/// survives a manager reopen, so a daemon restart does not orphan a
+/// worktree binding or force a re-seal. A corrupt registry fails closed
+/// instead of running with amnesia.
+#[tokio::test]
+async fn workspace_registry_survives_reopen() {
+    let root = scratch_root("registry-reopen");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let base = repo_with_commit(&repo, &[("calc.py", "VALUE = 1\n")], "base");
+
+    let attempt = AttemptId::from_u128(9_001);
+    let sealed_tree = {
+        let manager = GitWorkspaceManager::open(&root.join("state")).expect("open manager");
+        let snapshot = manager
+            .snapshot(snapshot_request(&repo, &base))
+            .await
+            .expect("snapshot");
+        let workspace = manager
+            .create(WorkspaceRequest {
+                attempt_id: attempt,
+                input: snapshot,
+            })
+            .await
+            .expect("create");
+        std::fs::write(
+            PathBuf::from(&workspace.worktree).join("calc.py"),
+            "VALUE = 2\n",
+        )
+        .expect("worker edit");
+        let candidate = manager.seal(&workspace).await.expect("seal");
+        assert!(root.join("state").join("workspaces.json").is_file());
+        candidate.tree.clone()
+    };
+    // Same state dir, fresh manager: the binding is back without a
+    // re-create, and the sealed candidate verifies + prepares. Sealing
+    // always mints a fresh commit object by design, so identity is the
+    // tree (same bytes), not the commit id.
+    let reopened = GitWorkspaceManager::open(&root.join("state")).expect("reopen manager");
+    let resealed = reopened
+        .seal_live(attempt)
+        .await
+        .expect("seal after reopen");
+    assert_eq!(resealed.tree, sealed_tree);
+    let run = RunId::from_u128(9_002);
+    let prepared = reopened
+        .prepare_integration(IntegrationRequest {
+            run,
+            base: base.clone(),
+            candidates: vec![resealed],
+            approved_plan: plan_hash("rr"),
+            ref_name: GOOD_REF.to_string(),
+        })
+        .await
+        .expect("prepare after reopen");
+    assert_eq!(prepared.base, base);
+
+    // A corrupt registry refuses to open with amnesia instead of silently
+    // dropping every binding.
+    std::fs::write(root.join("state").join("workspaces.json"), "{oops").expect("corrupt");
+    assert!(GitWorkspaceManager::open(&root.join("state")).is_err());
+}
+
 #[tokio::test]
 async fn integration_checks_run_baseline_affected_acceptance() {
     let root = scratch_root("integration-checks");

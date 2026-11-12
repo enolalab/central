@@ -1061,6 +1061,7 @@ async fn scan_tick_all_leaves_parked_run_untouched() {
         &system(),
         &ScanConfig::disabled(true),
         &profiles,
+        None,
         &mut last_tick,
     )
     .await;
