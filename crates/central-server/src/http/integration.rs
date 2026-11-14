@@ -18,8 +18,7 @@
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
-use central_application::integration::IntegrationPlan;
-use central_application::ports::workspace::{IntegrationRequest, PromoteRequest, WorkspaceManager};
+use central_application::ports::workspace::WorkspaceManager;
 use central_domain::{AttemptId, PlanHash, RunId};
 use serde::{Deserialize, Serialize};
 
@@ -137,74 +136,54 @@ pub async fn post_integration_run(
     }
     let approved_plan = hex_hash(&body.approved_plan)?;
 
-    // 1. Seal the attempt's live worktree: the exact bytes the worker left
-    // behind become the immutable candidate. Scratch-backed attempts (or
-    // unknown ids) are refused here, never silently promoted.
-    let candidate = state
-        .workspace
-        .seal_live(attempt)
-        .await
-        .map_err(app_error_response)?;
-
-    // 2. Prepare the temporary integration branch (merge conflicts abort
-    // with Conflict and never touch the good ref).
-    let prepared = state
-        .workspace
-        .prepare_integration(IntegrationRequest {
-            run: run_id,
-            base: body.base.clone(),
-            candidates: vec![candidate],
-            approved_plan: approved_plan.clone(),
-            ref_name: body.ref_name.clone(),
-        })
-        .await
-        .map_err(app_error_response)?;
-
-    // 3. Run the approved checks over the candidate worktree. The runner
-    // is bound to the approved plan hash and the exact program+argv
-    // pairs below: anything else refuses without spawning.
-    let to_planned = |checks: Vec<PlannedCheckBody>| {
-        checks
-            .into_iter()
-            .map(|c| central_application::integration::PlannedCheck {
-                program: c.program,
-                args: c.args,
-            })
-            .collect::<Vec<_>>()
-    };
-    let plan = IntegrationPlan {
-        baseline: to_planned(body.checks.baseline),
-        affected: to_planned(body.checks.affected),
-        acceptance: to_planned(body.checks.acceptance),
-    };
-    if plan.required().is_empty() {
+    // One mechanical round through the shared driver: seal the attempt's
+    // live worktree, prepare the temporary branch, run the approved
+    // checks and CAS-promote the good ref on pass. Every validation the
+    // handler performs (run exists, non-empty ref, at least one check)
+    // happens here; everything else fails closed inside the manager.
+    if body.checks.baseline.is_empty()
+        && body.checks.affected.is_empty()
+        && body.checks.acceptance.is_empty()
+    {
         return Err(error_response(
             StatusCode::BAD_REQUEST,
             "validation_failed",
             "at least one approved check is required; refusing an unchecked promotion",
         ));
     }
-    let runner = central_infrastructure::checks::SupervisedCheckRunner::new(
-        approved_plan.clone(),
-        plan.required()
-            .iter()
-            .map(|c| central_infrastructure::checks::ApprovedCommand {
-                program: c.program.clone(),
-                args: c.args.clone(),
+    let to_approved = |checks: Vec<PlannedCheckBody>| {
+        checks
+            .into_iter()
+            .map(|c| central_application::ports::workspace::ApprovedCheck {
+                program: c.program,
+                args: c.args,
             })
-            .collect(),
-        state.workspace.state_root().to_path_buf(),
-    )
-    .map_err(app_error_response)?;
-    let (evidence, summary) = central_infrastructure::workspace::run_integration_checks(
-        &runner,
-        &approved_plan,
-        &prepared.worktree,
-        &plan,
-    )
-    .await
-    .map_err(app_error_response)?;
-    let checks: Vec<CheckReport> = evidence
+            .collect::<Vec<_>>()
+    };
+    let report = state
+        .workspace
+        .auto_integrate(
+            central_application::ports::workspace::AutoIntegrationRequest {
+                run: run_id,
+                candidates: vec![state
+                    .workspace
+                    .seal_live(attempt)
+                    .await
+                    .map_err(app_error_response)?],
+                base: body.base.clone(),
+                ref_name: body.ref_name.clone(),
+                expected_parent: Some(body.expected_parent.clone()),
+                approved_plan,
+                baseline: to_approved(body.checks.baseline),
+                affected: to_approved(body.checks.affected),
+                acceptance: to_approved(body.checks.acceptance),
+            },
+        )
+        .await
+        .map_err(app_error_response)?;
+
+    let checks: Vec<CheckReport> = report
+        .evidence
         .iter()
         .map(|got| CheckReport {
             program: got.program.clone(),
@@ -215,34 +194,20 @@ pub async fn post_integration_run(
             stderr_hash: got.stderr_hash.to_string(),
         })
         .collect();
-
-    // 4. Promote by compare-and-swap on pass; on failed checks (or a stale
-    // parent) the good ref never moves and the temporary branch is
-    // cleaned up by the manager.
-    let receipt = state
-        .workspace
-        .promote(PromoteRequest {
-            candidate: prepared.clone(),
-            expected_parent: body.expected_parent.clone(),
-            verification: summary.clone(),
-        })
-        .await
-        .map_err(app_error_response)?;
-
     Ok(Json(serde_json::json!({
         "run_id": run_id.to_string(),
-        "candidate": prepared.candidate,
-        "worktree": prepared.worktree,
+        "candidate": report.candidate,
+        "worktree": report.worktree,
         "checks": checks,
         "summary": {
-            "passed": summary.passed,
-            "baseline_ok": summary.baseline_ok,
-            "affected_ok": summary.affected_ok,
-            "acceptance_ok": summary.acceptance_ok,
+            "passed": report.summary.passed,
+            "baseline_ok": report.summary.baseline_ok,
+            "affected_ok": report.summary.affected_ok,
+            "acceptance_ok": report.summary.acceptance_ok,
         },
         "receipt": {
-            "previous_head": receipt.previous_head,
-            "new_head": receipt.new_head,
+            "previous_head": report.receipt.previous_head,
+            "new_head": report.receipt.new_head,
         },
     })))
 }

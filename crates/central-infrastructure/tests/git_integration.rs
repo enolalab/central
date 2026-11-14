@@ -13,8 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use central_application::contracts::AppError;
 use central_application::integration::{IntegrationPlan, PlannedCheck};
 use central_application::ports::workspace::{
-    CandidateRef, IntegrationRequest, PromoteRequest, SnapshotRequest, VerificationSummary,
-    WorkspaceManager, WorkspaceRequest,
+    ApprovedCheck, AutoIntegrationRequest, CandidateRef, IntegrationRequest, PromoteRequest,
+    SnapshotRequest, VerificationSummary, WorkspaceManager, WorkspaceRequest,
 };
 use central_domain::{AttemptId, PlanHash, RunId};
 use central_infrastructure::checks::{ApprovedCommand, SupervisedCheckRunner};
@@ -402,6 +402,136 @@ async fn workspace_registry_survives_reopen() {
     // dropping every binding.
     std::fs::write(root.join("state").join("workspaces.json"), "{oops").expect("corrupt");
     assert!(GitWorkspaceManager::open(&root.join("state")).is_err());
+}
+
+/// A fresh repo has no good ref yet: the first passing round must create
+/// it (creation CAS), not fail on `rev-parse --verify`. Regression: the
+/// scheduler path resolves `expected_parent: None` by reading the current
+/// head, which errored on a missing ref and failed the round.
+#[tokio::test]
+async fn first_promotion_creates_missing_good_ref() {
+    let root = scratch_root("first-promotion");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let base = repo_with_commit(&repo, &[("calc.py", "VALUE = 1\n")], "base");
+    assert!(
+        !std::process::Command::new("git")
+            .args(["rev-parse", "--verify", GOOD_REF])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("probe ref")
+            .status
+            .success(),
+        "fixture must start without the good ref"
+    );
+
+    let manager = GitWorkspaceManager::open(&root.join("state")).expect("open manager");
+    let run = RunId::from_u128(6_500);
+    let (_ws, candidate) = sealed_candidate(
+        &manager,
+        &repo,
+        &base,
+        6_501,
+        Some(("calc.py", "VALUE = 2\n")),
+    )
+    .await;
+    let check = ApprovedCheck {
+        program: "git".to_string(),
+        args: vec!["rev-parse".to_string(), "HEAD".to_string()],
+    };
+    let report = manager
+        .auto_integrate(AutoIntegrationRequest {
+            run,
+            candidates: vec![candidate],
+            base: base.clone(),
+            ref_name: GOOD_REF.to_string(),
+            expected_parent: None,
+            approved_plan: plan_hash("ee"),
+            baseline: vec![check.clone()],
+            affected: Vec::new(),
+            acceptance: Vec::new(),
+        })
+        .await
+        .expect("first promotion to a missing ref must create it");
+    assert_eq!(read_ref(&repo, GOOD_REF), report.receipt.new_head);
+    assert_eq!(report.receipt.previous_head, String::new());
+}
+
+/// A round that errors after prepare must release the run slot and drop
+/// the temporary branch/worktree: the next round starts clean instead of
+/// hitting `already has an in-flight integration`. Regression: runner
+/// errors propagated with `?` past `finish_integration`, leaking the slot
+/// (HTTP 409 on retry) and the `central-integration/*` branch.
+#[tokio::test]
+async fn failed_round_releases_slot_and_cleans_branch() {
+    let root = scratch_root("failed-round-cleanup");
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let base = repo_with_commit(&repo, &[("calc.py", "VALUE = 1\n")], "base");
+    git(&repo, &["update-ref", GOOD_REF, &base]);
+
+    let manager = GitWorkspaceManager::open(&root.join("state")).expect("open manager");
+    let run = RunId::from_u128(6_600);
+    let (_ws, candidate) = sealed_candidate(
+        &manager,
+        &repo,
+        &base,
+        6_601,
+        Some(("calc.py", "VALUE = 2\n")),
+    )
+    .await;
+    let failing = manager
+        .auto_integrate(AutoIntegrationRequest {
+            run,
+            candidates: vec![candidate.clone()],
+            base: base.clone(),
+            ref_name: GOOD_REF.to_string(),
+            expected_parent: None,
+            approved_plan: plan_hash("ff"),
+            baseline: vec![ApprovedCheck {
+                program: "definitely-not-a-binary".to_string(),
+                args: Vec::new(),
+            }],
+            affected: Vec::new(),
+            acceptance: Vec::new(),
+        })
+        .await;
+    assert!(
+        failing.is_err(),
+        "unspawnable check program must fail the round: {failing:?}"
+    );
+    let branches = std::process::Command::new("git")
+        .args(["branch", "--list", "central-integration/*"])
+        .current_dir(&repo)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .expect("list branches");
+    assert!(
+        String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+        "failed round must not leak its temporary branch"
+    );
+
+    // The retry must not see the previous round: no 409, and it promotes.
+    let check = ApprovedCheck {
+        program: "git".to_string(),
+        args: vec!["rev-parse".to_string(), "HEAD".to_string()],
+    };
+    let report = manager
+        .auto_integrate(AutoIntegrationRequest {
+            run,
+            candidates: vec![candidate],
+            base: base.clone(),
+            ref_name: GOOD_REF.to_string(),
+            expected_parent: None,
+            approved_plan: plan_hash("ff"),
+            baseline: vec![check],
+            affected: Vec::new(),
+            acceptance: Vec::new(),
+        })
+        .await
+        .expect("retry after a failed round must start clean, not 409");
+    assert_eq!(read_ref(&repo, GOOD_REF), report.receipt.new_head);
 }
 
 #[tokio::test]

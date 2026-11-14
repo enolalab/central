@@ -80,6 +80,7 @@ fn task(
         max_repair_rounds: 2,
         requires_approval: Vec::new(),
         handover: "report changed files and test results".to_string(),
+        integration: None,
     }
 }
 

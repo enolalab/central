@@ -80,6 +80,7 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/", get(ui_not_built))
         .route("/v1/meta", get(meta::get_meta))
         .route("/v1/openapi.json", get(meta::get_openapi))
         .route(
@@ -117,6 +118,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs/{id}/handover", post(results::post_handover))
         .route("/v1/runs/{id}/usage", get(usage::get_usage))
         .route("/v1/runs/{id}/usage/resolve", post(usage::post_resolve))
+        .route(
+            "/v1/runs/{id}/usage/reconcile",
+            post(usage::post_reconcile_usage),
+        )
         .route("/v1/runs/{id}/recovery", get(usage::get_recovery))
         .route("/v1/recovery", get(recovery::get_recovery_overview))
         .route("/v1/runs/{id}/artifacts", get(artifacts::list_artifacts))
@@ -189,11 +194,22 @@ async fn fake_sends(
 }
 
 /// Outside the public API there is nothing: no UI, no static assets.
-/// Every non-API path is a stable 404, never a 503 and never a crash.
+/// Every non-API path except `/` is a stable 404, never a crash.
 async fn outside_api() -> ApiError {
     error_response(
         StatusCode::NOT_FOUND,
         "not_found",
         "no such API path; Central serves no UI — see /v1/openapi.json",
+    )
+}
+
+/// The UI entry point browsers and naive probes hit: Central ships no
+/// UI, so `/` answers an explicit 503 (P1 acceptance: UI not built is a
+/// clear signal, never an ambiguous 404), while the daemon stays up.
+async fn ui_not_built() -> ApiError {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "capability_unavailable",
+        "no UI is built into this daemon; use the API — see /v1/openapi.json",
     )
 }

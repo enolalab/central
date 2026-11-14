@@ -183,6 +183,96 @@ fn usage_ledger_and_gap_resolution() {
 }
 
 #[test]
+fn usage_reconcile_folds_audited_observation() {
+    let dir = state_dir("flow-usage-fold");
+    let server = start_server(&dir);
+    let token = server.token();
+    let run = create_run(&server, 221);
+    // Missing identity fields are a 400, never a silent ledger entry.
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/usage/reconcile"),
+        Some(&token),
+        Some(&serde_json::json!({"provider": "", "epoch": "e", "turn": "t"}).to_string()),
+        &[],
+    );
+    assert_eq!(status, 400, "missing identity: {body}");
+    // An audited fold lands in the ledger as observed tokens.
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/usage/reconcile"),
+        Some(&token),
+        Some(
+            &serde_json::json!({
+                "provider": "codex",
+                "epoch": "epoch-1",
+                "turn": "turn-7",
+                "sequence": 1,
+                "tokens": 21601,
+                "metric": "tokens",
+                "source": "live",
+                "finality": "observed",
+            })
+            .to_string(),
+        ),
+        &[],
+    );
+    assert_eq!(status, 200, "reconcile: {body}");
+    let (status, body) = http(
+        "GET",
+        &server.addr,
+        &format!("/v1/runs/{run}/usage"),
+        Some(&token),
+        None,
+        &[],
+    );
+    assert_eq!(status, 200, "usage: {body}");
+    let usage: serde_json::Value = serde_json::from_str(&body).expect("usage");
+    assert_eq!(
+        usage["ledger"]["observed_tokens"], 21601,
+        "observed total: {usage}"
+    );
+    // Replaying the same provider/epoch/turn/sequence is a no-op: the
+    // ledger counts each turn exactly once.
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/usage/reconcile"),
+        Some(&token),
+        Some(
+            &serde_json::json!({
+                "provider": "codex",
+                "epoch": "epoch-1",
+                "turn": "turn-7",
+                "sequence": 1,
+                "tokens": 99999,
+                "metric": "tokens",
+                "source": "live",
+                "finality": "observed",
+            })
+            .to_string(),
+        ),
+        &[],
+    );
+    assert_eq!(status, 200, "reconcile replay: {body}");
+    let (_status, body) = http(
+        "GET",
+        &server.addr,
+        &format!("/v1/runs/{run}/usage"),
+        Some(&token),
+        None,
+        &[],
+    );
+    let usage: serde_json::Value = serde_json::from_str(&body).expect("usage");
+    assert_eq!(
+        usage["ledger"]["observed_tokens"], 21601,
+        "no double count: {usage}"
+    );
+}
+
+#[test]
 fn plans_tasks_attempts_read_models() {
     let dir = state_dir("flow-reads");
     let server = start_server(&dir);

@@ -324,6 +324,7 @@ fn plan_task_with(
         max_repair_rounds: 1,
         requires_approval: Vec::new(),
         handover: String::new(),
+        integration: None,
     }
 }
 

@@ -103,9 +103,17 @@ try {
     function Fake-Sends($addr, $token) {
         return (Invoke-RestMethod -Uri "http://$addr/v1/test/fake-sends" -Headers @{ Authorization = "Bearer $token" }).sends
     }
+    # The snapshot API carries attempts as a list of attempt views
+    # (task_id/status fields); older drafts assumed a map. Normalize to a
+    # list so every counter below reads the same shape the server sends.
+    function Attempt-List($view) {
+        $a = $view.state.attempts
+        if ($null -eq $a) { return @() }
+        if ($a -is [System.Array]) { return @($a) }
+        return @($a.PSObject.Properties | ForEach-Object { $_.Value })
+    }
     function Attempt-Count($view, $taskId) {
-        if ($null -eq $view.state.attempts) { return 0 }
-        return @($view.state.attempts.PSObject.Properties | Where-Object { $_.Value.task_id -eq $taskId }).Count
+        return @(Attempt-List $view | Where-Object { $_.task_id -eq $taskId }).Count
     }
     # Pre-flight for every daemon start: if a previous run left a daemon
     # recorded in server.json that is alive but answers nothing on
@@ -143,17 +151,14 @@ try {
         do {
             Start-Sleep -Milliseconds 500
             $view = Run-View $run
-            if ($null -ne $view.state.attempts) {
-                $running = @($view.state.attempts.PSObject.Properties | Where-Object { $_.Value.status -eq "Running" })
-            }
+            $running = @(Attempt-List $view | Where-Object { $_.status -eq "Running" })
             if ($running.Count -ge $minRunning) { return $view }
             if ((Get-Date) -gt $deadline) { break }
         } while ($true)
         throw "ASSERT FAILED: only $($running.Count) attempts Running after ${timeoutSec}s (wanted $minRunning); dispatch never converged"
     }
     function Total-Attempts($view) {
-        if ($null -eq $view.state.attempts) { return 0 }
-        return @($view.state.attempts.PSObject.Properties).Count
+        return @(Attempt-List $view).Count
     }
     $taskA = "00000000-0000-0000-0000-000000000001"
     $taskB = "00000000-0000-0000-0000-000000000002"
@@ -211,8 +216,10 @@ try {
     } while ($sends -lt 2)
     Assert-True ($sends -ge 2) "scan dispatched both independent tasks (sends=$sends)"
     # Refresh: the loop's last view can predate the Running commits.
-    $view = Wait-AttemptsRunning $run 2 45
-    $running = @($view.state.attempts.PSObject.Properties | Where-Object { $_.Value.status -eq "Running" })
+    # 180s budget: debug builds + Defender on a first-run VM converge
+    # slowly; the assertion is eventual convergence, not speed.
+    $view = Wait-AttemptsRunning $run 2 180
+    $running = @(Attempt-List $view | Where-Object { $_.status -eq "Running" })
     Assert-True ($running.Count -ge 2) "both attempts Running after scan dispatch"
     Assert-Equal (Attempt-Count $view $taskA) 1 "task A has exactly one attempt (no duplicates)"
     Assert-Equal (Attempt-Count $view $taskB) 1 "task B has exactly one attempt (no duplicates)"
@@ -238,10 +245,10 @@ try {
     # stability: no duplicate sends, downstream still held. Refresh the
     # view first: a pre-sleep view can predate the Running commits.
     Start-Sleep -Seconds 12
-    $steady = Wait-AttemptsRunning $run 2 45
+    $steady = Wait-AttemptsRunning $run 2 180
     Assert-Equal $steady.state.control "Running" "run stays resumed after the second crash"
     Assert-Equal (Fake-Sends $info.addr $token) 0 "second resume dispatches nothing new"
-    $stillRunning = @($steady.state.attempts.PSObject.Properties | Where-Object { $_.Value.status -eq "Running" })
+    $stillRunning = @(Attempt-List $steady | Where-Object { $_.status -eq "Running" })
     Assert-True ($stillRunning.Count -ge 2) "both implementation attempts still Running"
     Assert-Equal (Attempt-Count $steady $taskA) 1 "task A still exactly one attempt after two crashes"
     Assert-Equal (Attempt-Count $steady $taskB) 1 "task B still exactly one attempt after two crashes"
@@ -249,7 +256,7 @@ try {
     Assert-Equal (Attempt-Count $steady $taskI) 0 "integration still held after the second crash"
 
     Write-Output "== passive reconcile: evidence stored, nothing resent =="
-    $attemptId = $running[0].Name
+    $attemptId = $running[0].attempt_id
     $reconciled = Invoke-RestMethod -Method Post `
         -Uri "http://$($info.addr)/v1/runs/$run/attempts/$attemptId/reconcile" `
         -Headers @{ Authorization = "Bearer $token" } `
@@ -257,7 +264,8 @@ try {
     Assert-Equal $reconciled.evidence.attempt_id $attemptId "reconcile returns evidence for the attempt"
     Assert-Equal (Fake-Sends $info.addr $token) 0 "reconcile resends nothing"
     $afterReconcile = Run-View $run
-    Assert-Equal $afterReconcile.state.attempts.$attemptId.status "Running" "reconcile never rewrites the attempt status"
+    $reconciledAttempt = @((Attempt-List $afterReconcile) | Where-Object { $_.attempt_id -eq $attemptId })
+    Assert-Equal $reconciledAttempt[0].status "Running" "reconcile never rewrites the attempt status"
 
     Write-Output "== opt-in live-model smoke: off by default =="
     if ($env:CENTRAL_LIVE_SMOKE -eq "1") {

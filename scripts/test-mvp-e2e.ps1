@@ -115,6 +115,13 @@ try {
     $run = $init.run_id
     Write-Host "run=$run"
 
+    # Sync the fixture repo's base commit first: dispatching into a
+    # real repository without a synced base is a deliberate deferral
+    # (Central never invents the base commit), so the gate must
+    # register the base before it can expect any dispatch.
+    & $cli sync --run $run --commit $commit --repository $repo | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'sync failed' }
+
     $plan = @{
         version = 1; goal = 'E2E: two workers then integration'
         tasks = @(
@@ -131,7 +138,11 @@ try {
                dependsOn = @('00000000-0000-0000-0000-0000000000a1', '00000000-0000-0000-0000-0000000000a2');
                dataDependsOn = @('00000000-0000-0000-0000-0000000000a1'); outputs = @();
                verify = @{ method = 'check'; criteria = @('integrated') }; evidence = @(); profileId = $null;
-               permissions = @(); maxRepairRounds = 2; requiresApproval = @(); handover = '' }
+               permissions = @(); maxRepairRounds = 2; requiresApproval = @(); handover = '';
+               integration = @{ goodRef = 'refs/heads/central-good';
+                   baseline = @(@{ program = 'git'; args = @('cat-file', '-e', 'HEAD:file.txt') });
+                   affected = @();
+                   acceptance = @(@{ program = 'git'; args = @('cat-file', '-e', 'HEAD:file.txt') }) } }
         )
     }
     $planFile = Join-Path $work 'plan.json'
@@ -251,27 +262,26 @@ try {
     if (-not ($outputs | Where-Object { $_.candidate_hash -eq 'candidate-b' })) { Fail 'provenance for B missing' }
     Write-Host 'worker -> verifier provenance confirmed for A and B'
 
-    # ---------- integration task completes through the same surface ----------
-    $attemptC = Wait-For 'integration attempt dispatched' 60 {
-        $snapshot = Invoke-Api $base $token GET "/v1/runs/$run"
-        $match = @($snapshot.state.attempts | Where-Object {
-            $_.task_id -eq '00000000-0000-0000-0000-0000000000a3' -and $_.status -in @('Running', 'Dispatching') })
-        if ($match.Count -ge 1) { $match[0].attempt_id } else { $null }
-    }
-    Import-Result $attemptC 'candidate-c' | Out-Null
-    Submit-Pass '00000000-0000-0000-0000-0000000000a3' $attemptC 'candidate-c'
-    Wait-For 'integration task succeeded' 30 {
+    # ---------- integration completes through the mechanical path ----------
+    # The integration task carries an approved IntegrationSpec, so the
+    # scheduler auto-dispatches it and the workspace manager seals,
+    # checks and CAS-promotes the good ref with no gateway turn and no
+    # verdict: completion is the Succeeded task plus the moved ref.
+    Wait-For 'integration task succeeded' 180 {
         $snapshot = Invoke-Api $base $token GET "/v1/runs/$run"
         $task = @($snapshot.state.tasks | Where-Object { $_.task_id -eq '00000000-0000-0000-0000-0000000000a3' })[0]
         if ($task.status -eq 'Succeeded') { $true } else { $null }
     } | Out-Null
-    Write-Host 'integration task verified through the daemon surface'
+    Write-Host 'integration task reached Succeeded through the mechanical path'
 
-    # No duplicate sends: this boot dispatched only the integration
-    # attempt (the 2 pre-restart worker sends belonged to the previous
-    # boot's counter; A/B were never resent after resume).
+    # No gateway sends for integration (mechanical path sends nothing);
+    # the proof is the moved good ref in the fixture repo.
     $totalSends = (Invoke-Api $base $token GET '/v1/test/fake-sends').sends
-    if ($totalSends -ne 1) { Fail "expected exactly 1 post-restart send (integration), got $totalSends" }
+    if ($totalSends -ne 0) { Fail "expected 0 post-restart sends (mechanical integration), got $totalSends" }
+    $goodRef = (git -C $repo rev-parse 'refs/heads/central-good').Trim()
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrEmpty($goodRef)) { Fail 'good ref was not created' }
+    if ($goodRef -eq $commit) { Fail 'good ref did not move past the base' }
+    Write-Host "good ref promoted: $goodRef"
 
     # Independent HTTP client replays the cursor from the snapshot: no gap.
     $final = Invoke-Api $base $token GET "/v1/runs/$run"

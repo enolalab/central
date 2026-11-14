@@ -12,10 +12,19 @@ fn release_has_no_ui_or_fake_runtime() {
     let dir = state_dir("sec-release");
     let server = start_server_in(&dir, false);
     let token = server.token();
-    for path in ["/", "/ui", "/ui/index.html", "/static/app.js"] {
+    for path in ["/ui", "/ui/index.html", "/static/app.js"] {
         let (status, body) = http("GET", &server.addr, path, Some(&token), None, &[]);
         assert_eq!(status, 404, "no UI at {path}: {body}");
     }
+    // P1 acceptance: `/` is the UI entry point, an explicit 503 — it is
+    // not an unknown path (mirrors api_contract unknown_paths_are_404_json).
+    let (status, body) = http("GET", &server.addr, "/", Some(&token), None, &[]);
+    assert_eq!(status, 503, "root {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("503 json");
+    assert_eq!(
+        value["error"]["code"], "capability_unavailable",
+        "code: {value}"
+    );
     // Without --fake-agent the fake counters are a plain 404: a
     // release build can never serve fake agent output.
     let (status, body) = http(

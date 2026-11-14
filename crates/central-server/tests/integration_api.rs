@@ -70,11 +70,22 @@ fn plan_hash() -> String {
 }
 
 fn approved_checks() -> Value {
-    json!({
-        "baseline": [{"program": "sh", "args": ["-c", "exit 0"]}],
-        "affected": [],
-        "acceptance": [{"program": "sh", "args": ["-c", "test -f calc.py"]}],
-    })
+    #[cfg(windows)]
+    {
+        json!({
+            "baseline": [{"program": "cmd", "args": ["/C", "exit 0"]}],
+            "affected": [],
+            "acceptance": [{"program": "cmd", "args": ["/C", "if not exist calc.py exit 1"]}],
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        json!({
+            "baseline": [{"program": "sh", "args": ["-c", "exit 0"]}],
+            "affected": [],
+            "acceptance": [{"program": "sh", "args": ["-c", "test -f calc.py"]}],
+        })
+    }
 }
 
 /// Full pass: fixture repo → sync → approve → dispatch (fake agent) →
@@ -230,7 +241,14 @@ fn integration_run_refuses_on_failed_checks() {
     std::fs::write(worktrees[0].join("calc.py"), "VALUE = 2\n").expect("worker edit");
 
     let mut checks = approved_checks();
-    checks["acceptance"] = json!([{"program": "sh", "args": ["-c", "exit 1"]}]);
+    #[cfg(windows)]
+    {
+        checks["acceptance"] = json!([{"program": "cmd", "args": ["/C", "exit 1"]}]);
+    }
+    #[cfg(not(windows))]
+    {
+        checks["acceptance"] = json!([{"program": "sh", "args": ["-c", "exit 1"]}]);
+    }
     let (status, body) = http(
         "POST",
         &server.addr,

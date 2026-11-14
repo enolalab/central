@@ -9,7 +9,8 @@ use crate::{
     Command, CommandEnvelope, ContentHash, DomainError, Effect, Event, HoldReason, InboxEntry,
     InboxKey, InboxKind, InboxOutcome, InboxStatus, PlanDocumentV1, PlanHash, PlanRevision,
     PlanStatus, QualityDecision, ReuseBindings, ReuseDecision, RunControl, RunState,
-    StaleCandidate, Task, TaskId, TaskStatus, Timestamp, UsageAuditEntry, WorkRequest, WorkRole,
+    StaleCandidate, Task, TaskId, TaskKind, TaskStatus, Timestamp, UsageAuditEntry, VerifySpec,
+    WorkRequest, WorkRole,
 };
 
 #[derive(Clone, Debug, PartialEq)]
@@ -192,10 +193,7 @@ pub fn decide(
             next.pending_plan = None;
             next.active_plan = Some(plan_hash.clone());
             for plan_task in &document.tasks {
-                let verify = plan_task
-                    .verify
-                    .clone()
-                    .expect("approved plans passed validation");
+                let verify = task_verify(plan_task);
                 // Pending tasks have no attempt/output to assess, so their
                 // definition is refreshed from the newly approved plan
                 // (status and repair_rounds_used are preserved). Non-Pending
@@ -932,6 +930,24 @@ pub fn decide(
             criteria_hash,
             now,
         ),
+        Command::RecordIntegration {
+            task,
+            attempt,
+            candidate_commit,
+            previous_head,
+            new_head,
+            check_evidence,
+        } => record_integration(
+            state,
+            actor,
+            *task,
+            *attempt,
+            candidate_commit,
+            previous_head,
+            new_head,
+            check_evidence,
+            now,
+        ),
     }
 }
 
@@ -1022,6 +1038,119 @@ fn record_worker_result(
             input_hash: input_hash.clone(),
             candidate_hash: candidate_hash.clone(),
             criteria_hash: criteria_hash.clone(),
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+/// Materialize a task's verify spec. Declared specs win; integration
+/// tasks without one get a synthesized contract derived from their
+/// approved checks, since their gate is the mechanical check run rather
+/// than an agent verdict. Validation guarantees the spec exists and is
+/// non-empty, so the synthesis below cannot invent criteria.
+fn task_verify(plan_task: &crate::PlanTaskV1) -> VerifySpec {
+    if let Some(verify) = plan_task.verify.clone() {
+        return verify;
+    }
+    let (good_ref, check_count) = plan_task
+        .integration
+        .as_ref()
+        .map(|spec| (spec.good_ref.clone(), spec.check_count()))
+        .unwrap_or_default();
+    VerifySpec {
+        method: "integration".to_string(),
+        criteria: vec![format!(
+            "promote {good_ref} after {check_count} approved check(s)"
+        )],
+    }
+}
+
+/// Durably record one mechanical Git integration (P3 Task 5).
+///
+/// User or system only: the daemon driver and the owner endpoint are the
+/// only writers; workers and verifiers never move the good ref. The
+/// attempt must be Dispatching (claimed for this integration, never sent
+/// to a harness) and bound to the active plan; the task must be an
+/// integration task. Anything else is a contract violation, not a
+/// retryable failure. Recording marks the attempt `Completed` and the
+/// task `Succeeded`, files the merge commit as this task's verified
+/// output (so dependents build on exactly what promoted), and emits the
+/// full CAS receipt as evidence.
+#[allow(clippy::too_many_arguments)]
+fn record_integration(
+    state: &RunState,
+    actor: &Actor,
+    task: TaskId,
+    attempt: AttemptId,
+    candidate_commit: &str,
+    previous_head: &str,
+    new_head: &str,
+    check_evidence: &[String],
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_created(state)?;
+    if !matches!(actor.kind, ActorKind::User | ActorKind::System) {
+        return Err(DomainError::Forbidden);
+    }
+    if candidate_commit.trim().is_empty() || new_head.trim().is_empty() {
+        return Err(DomainError::InvalidCommand(
+            "integration receipt needs a candidate commit and a new head".to_string(),
+        ));
+    }
+    let record = state
+        .attempts
+        .get(&attempt)
+        .ok_or(DomainError::UnknownAttempt(attempt))?;
+    if record.task_id != task {
+        return Err(DomainError::QueueConflict(format!(
+            "attempt {attempt} does not belong to task {task}"
+        )));
+    }
+    if record.status != AttemptStatus::Dispatching {
+        return Err(DomainError::QueueConflict(format!(
+            "attempt {attempt} is {:?}, not claimed for integration",
+            record.status
+        )));
+    }
+    if let Some(active) = state.active_plan.as_ref() {
+        if &record.plan_hash != active {
+            return Err(DomainError::QueueConflict(format!(
+                "attempt {attempt} is bound to a stale plan; re-queue under the active plan"
+            )));
+        }
+    }
+    let task_state = state
+        .tasks
+        .get(&task)
+        .ok_or(DomainError::UnknownTask(task))?;
+    if task_state.kind != TaskKind::Integration {
+        return Err(DomainError::InvalidCommand(format!(
+            "task {task} is {:?}, not an integration task; mechanical promotion is refused",
+            task_state.kind
+        )));
+    }
+    let mut next = state.clone();
+    if let Some(record) = next.attempts.get_mut(&attempt) {
+        record.status = AttemptStatus::Completed;
+    }
+    if let Some(task_record) = next.tasks.get_mut(&task) {
+        task_record.status = TaskStatus::Succeeded;
+    }
+    next.verified_outputs
+        .insert(task, ContentHash::from_hex(new_head));
+    release_settled_claims(&mut next);
+    Ok(finish(
+        next.clone(),
+        vec![Event::IntegrationPromoted {
+            run_id: next.id,
+            task_id: task,
+            attempt_id: attempt,
+            candidate_commit: candidate_commit.to_string(),
+            previous_head: previous_head.to_string(),
+            new_head: new_head.to_string(),
+            check_evidence: check_evidence.to_vec(),
             by: actor.id,
             at: now,
         }],
@@ -1259,10 +1388,7 @@ fn rebase_tasks_for_revision(
         .unwrap_or_default();
     let mut invalidated = Vec::new();
     for plan_task in &document.tasks {
-        let verify = plan_task
-            .verify
-            .clone()
-            .expect("approved revisions passed validation");
+        let verify = task_verify(plan_task);
         match next.tasks.entry(plan_task.id) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(Task {

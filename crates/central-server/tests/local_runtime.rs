@@ -1001,12 +1001,20 @@ async fn history_reads_use_bounded_store_fetches() {
 }
 
 #[test]
-fn outside_api_is_404_not_ui() {
-    // P4 serves no UI: every non-API path is a stable 404 carrying the
-    // error code contract, never a 503 and never static assets.
+fn ui_entry_is_503_others_404() {
+    // P1 acceptance: the UI entry point `/` is an explicit 503 (the UI
+    // is not built; the daemon stays up), while every other non-API
+    // path is a stable 404 carrying the error code contract.
     let dir = state_dir("ui");
     let server = start_server(&dir);
     let (status, body) = http("GET", &server.addr, "/", None, None);
+    assert_eq!(status, 503);
+    let value: serde_json::Value = serde_json::from_str(&body).expect("503 json");
+    assert_eq!(
+        value["error"]["code"], "capability_unavailable",
+        "code: {value}"
+    );
+    let (status, body) = http("GET", &server.addr, "/ui", None, None);
     assert_eq!(status, 404);
     let value: serde_json::Value = serde_json::from_str(&body).expect("404 json");
     assert_eq!(value["error"]["code"], "not_found", "code: {value}");

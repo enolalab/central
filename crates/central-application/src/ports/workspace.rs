@@ -105,6 +105,46 @@ pub struct VerificationSummary {
     pub evidence: Vec<String>,
 }
 
+/// One approved program+argv pair for a mechanical integration check.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApprovedCheck {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// One mechanical integration round, end to end: prepare the temporary
+/// branch from pre-sealed candidates, run the approved checks, and
+/// promote the good ref by compare-and-swap on pass. Callers seal first
+/// (`seal_live`): the registry proves each candidate is an immutable
+/// sealed object, and `prepare` re-verifies the tree before merging.
+/// `expected_parent: None` reads the current ref first (the CAS still
+/// guards the read-then-move window); a caller-supplied parent turns a
+/// concurrent move into a hard conflict instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoIntegrationRequest {
+    pub run: RunId,
+    pub candidates: Vec<CandidateRef>,
+    pub base: String,
+    pub ref_name: String,
+    pub expected_parent: Option<String>,
+    pub approved_plan: PlanHash,
+    pub baseline: Vec<ApprovedCheck>,
+    pub affected: Vec<ApprovedCheck>,
+    pub acceptance: Vec<ApprovedCheck>,
+}
+
+/// The durable outcome of one mechanical integration round: the sealed
+/// candidate, the evidence the checks produced, and the CAS receipt.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutoIntegrationReport {
+    pub candidate: String,
+    pub worktree: String,
+    pub evidence: Vec<crate::ports::checks::CheckEvidence>,
+    pub summary: VerificationSummary,
+    pub receipt: PromotionReceipt,
+}
+
 /// Move the good ref to the integration candidate: only when the checks
 /// passed, and only when the ref still points at `expected_parent`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -186,4 +226,18 @@ pub trait WorkspaceManager: Send + Sync {
     /// Explicit, ownership-checked worktree removal. Unknown or foreign
     /// paths refuse; processes spawned for Git ops are reaped by the call.
     async fn remove_workspace(&self, workspace: &WorkspaceRef) -> Result<(), AppError>;
+    /// Seal the attempt's live worktree as the immutable source
+    /// candidate. The worktree must belong to the attempt (tracked live
+    /// by the manager); scratch-backed or unknown attempts refuse instead
+    /// of inventing a candidate.
+    async fn seal_live(&self, attempt: AttemptId) -> Result<CandidateRef, AppError>;
+    /// Run one fully mechanical integration round: seal the attempt's live
+    /// worktree, prepare the temporary branch, run the approved checks, and
+    /// promote the good ref by compare-and-swap on pass. Fails closed on
+    /// every step: an unsealed worktree, a merge conflict, a failed check
+    /// or a stale parent never moves the good ref.
+    async fn auto_integrate(
+        &self,
+        request: AutoIntegrationRequest,
+    ) -> Result<AutoIntegrationReport, AppError>;
 }

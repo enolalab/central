@@ -219,6 +219,10 @@ impl Git {
         new: &str,
         old: &str,
     ) -> Result<String, AppError> {
+        // An empty old-value is a creation CAS: the all-zero id means
+        // "must not exist", so a first promotion creates the ref while a
+        // concurrent creation still refuses instead of force-moving.
+        let old = if old.is_empty() { Self::ZERO_OID } else { old };
         self.run(repo, &["update-ref", ref_name, new, old]).await?;
         self.read_ref(repo, ref_name).await
     }
@@ -226,6 +230,30 @@ impl Git {
     /// The commit a ref points at right now.
     pub async fn read_ref(&self, repo: &Path, ref_name: &str) -> Result<String, AppError> {
         self.run(repo, &["rev-parse", "--verify", ref_name]).await
+    }
+
+    /// The all-zero object id: the CAS old-value that means "must not
+    /// exist" (`git update-ref <ref> <new> <zero>` creates only when the
+    /// ref is absent, and refuses when anything appeared concurrently).
+    pub const ZERO_OID: &'static str = "0000000000000000000000000000000000000000";
+
+    /// The commit a ref points at, or `None` when the ref is absent. Only
+    /// the missing-ref diagnostic maps to `None` (git has emitted
+    /// `fatal: Needed a single revision` for `rev-parse --verify` on a
+    /// missing ref for over a decade); every other failure propagates so
+    /// a broken repo never looks like a fresh ref.
+    pub async fn try_read_ref(
+        &self,
+        repo: &Path,
+        ref_name: &str,
+    ) -> Result<Option<String>, AppError> {
+        match self.run(repo, &["rev-parse", "--verify", ref_name]).await {
+            Ok(head) => Ok(Some(head)),
+            Err(AppError::Storage(message)) if message.contains("Needed a single revision") => {
+                Ok(None)
+            }
+            Err(other) => Err(other),
+        }
     }
 
     /// True when `rev` names an existing object (read-only probe for sync).

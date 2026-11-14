@@ -1053,3 +1053,49 @@ async fn conflicting_reuse_counts_as_conflict_not_duplicate() {
         approval.preview
     );
 }
+
+/// Token-usage notifications surface as auditable evidence in the
+/// reconcile summary (never auto-ledgered): the gateway's human-readable
+/// note plus its dedup key, verbatim, for an explicit user fold later.
+#[tokio::test]
+async fn reconcile_surfaces_token_usage_evidence() {
+    let (store, gateway, _secrets, runtime) = created_runtime().await;
+    gateway.scripted_observations.lock().expect("lock").push(Observation {
+        attempt_id: AttemptId::from_u128(42),
+        provider_epoch: "epoch-1".to_string(),
+        dedup_key: "thread/tokenUsage/updated:thread-1:7".to_string(),
+        outcome: None,
+        detail: "usage total=21609 in=21601 cached_in=0 out=8 reasoning=0 context=258400 (observed, not ledgered)".to_string(),
+    });
+    gateway
+        .scripted_observations
+        .lock()
+        .expect("lock")
+        .push(Observation {
+            attempt_id: AttemptId::from_u128(42),
+            provider_epoch: "epoch-1".to_string(),
+            dedup_key: "turn/completed:thread-1:9".to_string(),
+            outcome: None,
+            detail: String::new(),
+        });
+    let session = SessionRef {
+        provider: "codex".to_string(),
+        instance_epoch: "epoch-1".to_string(),
+        thread_id: "any-thread".to_string(),
+    };
+    let summary: InboxReconcileSummary = runtime
+        .reconcile_inbox(&system(), &session)
+        .await
+        .expect("reconcile");
+    assert_eq!(summary.observations, 2, "both observations persisted");
+    assert_eq!(summary.usage.len(), 1, "only the usage note is surfaced");
+    assert_eq!(
+        summary.usage[0].dedup_key,
+        "thread/tokenUsage/updated:thread-1:7"
+    );
+    assert!(summary.usage[0].detail.contains("in=21601"));
+    // The ledger itself is untouched: surfacing is not folding.
+    let state = store.load(run_id()).await.expect("load").expect("run");
+    assert_eq!(state.usage.observed_tokens, 0);
+    assert_eq!(state.usage.estimated_tokens, 0);
+}

@@ -142,8 +142,9 @@ impl Scheduler {
     }
 
     /// Attach a Git workspace manager: dispatches for runs targeting a
-    /// synced repository get detached worktrees; everything else keeps
-    /// the configured scratch behaviour.
+    /// synced repository get detached worktrees, and integration tasks
+    /// run the mechanical seal→prepare→checks→promote path instead of a
+    /// harness send. `None` keeps scratch/label dispatch only.
     pub fn with_workspace(
         mut self,
         manager: Option<Arc<dyn crate::ports::workspace::WorkspaceManager>>,

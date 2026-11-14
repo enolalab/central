@@ -27,11 +27,11 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use central_application::artifacts::content_hash;
 use central_application::contracts::AppError;
-use central_application::integration::gate_promotion;
+use central_application::integration::{gate_promotion, IntegrationPlan, PlannedCheck};
 use central_application::ports::workspace::{
-    CandidateRef, InputSnapshot, IntegrationCandidate, IntegrationRequest, PromoteRequest,
-    PromotionIntent, PromotionReceipt, SelectedFile, SnapshotRequest, WorkspaceManager,
-    WorkspaceRef, WorkspaceRequest,
+    ApprovedCheck, AutoIntegrationReport, AutoIntegrationRequest, CandidateRef, InputSnapshot,
+    IntegrationCandidate, IntegrationRequest, PromoteRequest, PromotionIntent, PromotionReceipt,
+    SelectedFile, SnapshotRequest, WorkspaceManager, WorkspaceRef, WorkspaceRequest,
 };
 use central_domain::{AttemptId, RunId};
 use serde::{Deserialize, Serialize};
@@ -615,10 +615,16 @@ impl WorkspaceManager for GitWorkspaceManager {
                 request.candidate.run,
             )));
         }
+        // A missing good ref reads as empty: the first passing round
+        // creates it (the CAS old-value below is the zero id, so a
+        // concurrent creation still refuses), while a pinned parent
+        // against nothing conflicts. The gate compares plain strings, so
+        // every existing case behaves exactly as before.
         let actual_parent = self
             .git
-            .read_ref(&active.repo, &request.candidate.ref_name)
-            .await?;
+            .try_read_ref(&active.repo, &request.candidate.ref_name)
+            .await?
+            .unwrap_or_default();
         if let Err(error) = gate_promotion(
             &request.expected_parent,
             &actual_parent,
@@ -706,6 +712,110 @@ impl WorkspaceManager for GitWorkspaceManager {
         self.latest_synced_commit(run, Path::new(repo))
     }
 
+    async fn auto_integrate(
+        &self,
+        request: AutoIntegrationRequest,
+    ) -> Result<AutoIntegrationReport, AppError> {
+        use crate::checks::{ApprovedCommand, SupervisedCheckRunner};
+
+        if request.candidates.is_empty() {
+            return Err(AppError::Validation(
+                "no sealed candidates: nothing honest to integrate".to_string(),
+            ));
+        }
+        // 1. Prepare the temporary branch from the pre-sealed candidates
+        // (merge conflicts abort before anything moves) and keep the
+        // prepared candidate for the report.
+        let approved_plan = request.approved_plan.clone();
+        let prepared = self
+            .prepare_integration(IntegrationRequest {
+                run: request.run,
+                base: request.base.clone(),
+                candidates: request.candidates.clone(),
+                approved_plan: approved_plan.clone(),
+                ref_name: request.ref_name.clone(),
+            })
+            .await?;
+        // 3. Run the approved checks over the prepared worktree. The
+        // runner is allowlisted to exactly these program+argv pairs for
+        // exactly this plan: nothing else spawns.
+        let to_planned = |checks: Vec<ApprovedCheck>| {
+            checks
+                .into_iter()
+                .map(|c| PlannedCheck {
+                    program: c.program,
+                    args: c.args,
+                })
+                .collect::<Vec<_>>()
+        };
+        let plan = IntegrationPlan {
+            baseline: to_planned(request.baseline),
+            affected: to_planned(request.affected),
+            acceptance: to_planned(request.acceptance),
+        };
+        // Everything after prepare runs as one round: any error releases
+        // the run slot and drops the temporary branch/worktree. A plain
+        // `?` here used to leak both, 409ing every retry of the run.
+        let round = async {
+            if plan.required().is_empty() {
+                return Err(AppError::Validation(
+                    "at least one approved check is required; refusing an unchecked promotion"
+                        .to_string(),
+                ));
+            }
+            let runner = SupervisedCheckRunner::new(
+                approved_plan.clone(),
+                plan.required()
+                    .iter()
+                    .map(|c| ApprovedCommand {
+                        program: c.program.clone(),
+                        args: c.args.clone(),
+                    })
+                    .collect(),
+                self.state_root.to_path_buf(),
+            )?;
+            let (evidence, summary) =
+                run_integration_checks(&runner, &approved_plan, &prepared.worktree, &plan).await?;
+            // 4. Promote by compare-and-swap on pass. Without a
+            // caller-supplied parent, read the current head first (a
+            // missing ref reads as empty: the first passing round
+            // creates it): the CAS still guards the read-then-move
+            // window, and a concurrent move fails loudly.
+            let expected_parent = match request.expected_parent {
+                Some(parent) => parent,
+                None => {
+                    let worktree = PathBuf::from(&prepared.worktree);
+                    self.git
+                        .try_read_ref(&worktree, &request.ref_name)
+                        .await?
+                        .unwrap_or_default()
+                }
+            };
+            let receipt = self
+                .promote(PromoteRequest {
+                    candidate: prepared.clone(),
+                    expected_parent,
+                    verification: summary.clone(),
+                })
+                .await?;
+            Ok((evidence, summary, receipt))
+        }
+        .await;
+        match round {
+            Ok((evidence, summary, receipt)) => Ok(AutoIntegrationReport {
+                candidate: prepared.candidate,
+                worktree: prepared.worktree,
+                evidence,
+                summary,
+                receipt,
+            }),
+            Err(error) => {
+                self.abort_active(request.run).await;
+                Err(error)
+            }
+        }
+    }
+
     async fn remove_workspace(&self, workspace: &WorkspaceRef) -> Result<(), AppError> {
         let live = self.live_workspace(workspace)?;
         let worktree = PathBuf::from(&workspace.worktree);
@@ -721,6 +831,10 @@ impl WorkspaceManager for GitWorkspaceManager {
         Self::lock(&self.live)?.remove(&workspace.attempt_id);
         self.save_registry()?;
         Ok(())
+    }
+
+    async fn seal_live(&self, attempt: AttemptId) -> Result<CandidateRef, AppError> {
+        GitWorkspaceManager::seal_live(self, attempt).await
     }
 }
 
@@ -754,6 +868,18 @@ impl GitWorkspaceManager {
         })?;
         serde_json::from_str(&text)
             .map_err(|error| AppError::Storage(format!("promotion intent is corrupt: {error}")))
+    }
+
+    /// Release the run's slot and drop its temporary branch/worktree
+    /// after a failed round. Safe when nothing is in flight (a finished
+    /// round already released everything): every step tolerates absence.
+    async fn abort_active(&self, run: RunId) {
+        let active = Self::lock(&self.active)
+            .ok()
+            .and_then(|slot| slot.get(&run).cloned());
+        if let Some(active) = active {
+            self.finish_integration(run, &active).await;
+        }
     }
 
     /// Release the run's slot and delete the temporary branch and worktree.

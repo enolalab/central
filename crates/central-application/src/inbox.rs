@@ -110,6 +110,23 @@ pub struct InboxReconcileSummary {
     pub observations: usize,
     /// Answered entries confirmed by those observations.
     pub resolved: usize,
+    /// Token-usage evidence drained this pass. Each entry carries the
+    /// observation's dedup key and its human-readable detail verbatim
+    /// (the gateway formats counts as `usage total=N in=X ...`; machines
+    /// never parse it). Folding these numbers into the ledger is an
+    /// explicit audited user decision through the usage reconcile
+    /// endpoint — never automatic.
+    #[serde(default)]
+    pub usage: Vec<ReconciledUsage>,
+}
+
+/// One drained token-usage notification, as evidence for an audited
+/// ledger fold. Matches observations whose dedup key opens with the
+/// gateway's `thread/tokenUsage/updated` notification name.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReconciledUsage {
+    pub dedup_key: String,
+    pub detail: String,
 }
 
 impl From<&ExternalRequestKey> for InboxKey {
@@ -252,7 +269,21 @@ impl Runtime {
         }
 
         // (3) Persist observations; answered entries resolve passively.
+        // Token-usage notifications are additionally surfaced as
+        // machine-readable evidence (dedup key plus the gateway's
+        // human-readable note, verbatim) so an audited ledger fold can
+        // cite exactly what was observed. Nothing here writes the
+        // ledger: folding stays an explicit user decision.
         for observation in self.agent().observe(session).await? {
+            if observation
+                .dedup_key
+                .starts_with("thread/tokenUsage/updated:")
+            {
+                summary.usage.push(ReconciledUsage {
+                    dedup_key: observation.dedup_key.clone(),
+                    detail: observation.detail.clone(),
+                });
+            }
             let envelope = self
                 .next_envelope(Command::RecordObservation {
                     observation: observation.clone(),

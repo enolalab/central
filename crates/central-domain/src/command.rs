@@ -260,6 +260,26 @@ pub enum Command {
         candidate_hash: ContentHash,
         criteria_hash: ContentHash,
     },
+    /// Durably record one mechanical Git integration (P3/T5): the good
+    /// ref moved to `new_head` by compare-and-swap from `previous_head`
+    /// after every approved check passed on `candidate_commit`. The
+    /// application pre-verifies everything (sealed candidate, checks,
+    /// CAS) through the workspace manager; the domain enforces the state
+    /// transition, the actor gate and the integration-kind binding.
+    /// User or system (daemon driver) only: workers and verifiers never
+    /// move the good ref. The attempt must be Dispatching (claimed, never
+    /// sent anywhere) and the task must be an integration task — anything
+    /// else is refused. Recording marks the task `Succeeded` and the
+    /// attempt `Completed`: the checks are the verdict here, and the
+    /// CAS receipt is the evidence.
+    RecordIntegration {
+        task: TaskId,
+        attempt: AttemptId,
+        candidate_commit: String,
+        previous_head: String,
+        new_head: String,
+        check_evidence: Vec<String>,
+    },
 }
 
 fn default_defer_max_retries() -> u32 {

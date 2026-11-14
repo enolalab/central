@@ -220,6 +220,7 @@ struct Inner {
     states: HashMap<RunId, RunState>,
     receipts: HashMap<(ActorId, CommandId), Receipt>,
     intents: HashMap<RunId, Vec<OutboxIntent>>,
+    events: HashMap<RunId, Vec<central_domain::Event>>,
 }
 
 #[derive(Default)]
@@ -236,6 +237,16 @@ impl MemoryStore {
             .get(&run)
             .cloned()
             .expect("run seeded")
+    }
+
+    fn events(&self, run: RunId) -> Vec<central_domain::Event> {
+        self.inner
+            .lock()
+            .expect("lock")
+            .events
+            .get(&run)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn mutate_state(&self, run: RunId, f: impl FnOnce(&mut RunState)) {
@@ -280,6 +291,7 @@ impl Store for MemoryStore {
         let run = batch.next_state.id;
         inner.states.insert(run, batch.next_state);
         inner.intents.entry(run).or_default().extend(batch.intents);
+        inner.events.entry(run).or_default().extend(batch.events);
         inner
             .receipts
             .insert((batch.actor, batch.command_id), batch.receipt.clone());
@@ -405,6 +417,7 @@ fn plan_task(id: TaskId, order: Vec<TaskId>, data: Vec<TaskId>) -> PlanTaskV1 {
         max_repair_rounds: 1,
         requires_approval: Vec::new(),
         handover: String::new(),
+        integration: None,
     }
 }
 
@@ -428,6 +441,7 @@ struct Harness {
     clock: Arc<FakeClock>,
     ids: Arc<FakeIds>,
     run_id: RunId,
+    workspace: Option<Arc<dyn central_application::ports::workspace::WorkspaceManager>>,
 }
 
 impl Harness {
@@ -443,7 +457,16 @@ impl Harness {
             clock,
             ids,
             run_id: RunId::from_u128(10),
+            workspace: None,
         }
+    }
+
+    fn with_workspace(
+        mut self,
+        workspace: Arc<dyn central_application::ports::workspace::WorkspaceManager>,
+    ) -> Self {
+        self.workspace = Some(workspace);
+        self
     }
 
     fn runtime(&self) -> Runtime {
@@ -467,6 +490,7 @@ impl Harness {
             system(),
         )
         .expect("valid scheduler config")
+        .with_workspace(self.workspace.clone())
     }
 
     async fn execute(&self, actor: Actor, command: Command) {
@@ -664,8 +688,13 @@ async fn dispatch_provisions_isolated_scratch_per_attempt() {
         assert!(dir.is_dir(), "scratch provisioned: {}", dir.display());
     }
     let seen = harness.gateway.workspaces();
+    // Canonicalize before comparing: on Windows the recorded paths carry
+    // the `\\?\` verbatim prefix while `root` does not. This mirrors the
+    // product's own canonical containment comparison.
+    let root_canon = std::fs::canonicalize(&root).expect("canonical scratch root");
+    let root_canon = root_canon.to_str().expect("scratch root is UTF-8");
     assert!(
-        seen.iter().all(|w| w.starts_with(root.to_str().unwrap())),
+        seen.iter().all(|w| w.starts_with(root_canon)),
         "gateway sessions carry real scratch paths: {seen:?}"
     );
 
@@ -1074,4 +1103,303 @@ async fn shuffled_completion_keeps_invariants() {
         scheduler.tick(harness.run_id).await.expect("tick c again");
         assert_eq!(harness.attempts_of(c).len(), 1);
     }
+}
+
+// ---------- mechanical integration (P3 Task 5 scheduler half) ----------
+
+use central_application::ports::workspace::{
+    AutoIntegrationReport, AutoIntegrationRequest, CandidateRef, InputSnapshot,
+    IntegrationCandidate, IntegrationRequest, PromoteRequest, PromotionReceipt, SnapshotRequest,
+    VerificationSummary, WorkspaceManager, WorkspaceRef, WorkspaceRequest,
+};
+use central_domain::{IntegrationCheck, IntegrationSpec};
+
+struct FakeWorkspace {
+    auto_calls: AtomicUsize,
+}
+
+impl FakeWorkspace {
+    fn new() -> Self {
+        Self {
+            auto_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn unsupported<T>(what: &str) -> Result<T, AppError> {
+        Err(AppError::Transport(format!(
+            "fake workspace does not implement {what}"
+        )))
+    }
+}
+
+#[async_trait]
+impl WorkspaceManager for FakeWorkspace {
+    async fn snapshot(&self, request: SnapshotRequest) -> Result<InputSnapshot, AppError> {
+        Ok(InputSnapshot {
+            repo_root: request.repo_root,
+            commit: request.commit,
+            tree: "tree0".to_string(),
+            selected: Vec::new(),
+            snapshot_hash: central_domain::ContentHash::from_hex("aa"),
+        })
+    }
+    async fn create(&self, request: WorkspaceRequest) -> Result<WorkspaceRef, AppError> {
+        Ok(WorkspaceRef {
+            attempt_id: request.attempt_id,
+            worktree: format!("/tmp/central-fake-worktree-{}", request.attempt_id),
+            base_commit: request.input.commit,
+        })
+    }
+    async fn seal(&self, _workspace: &WorkspaceRef) -> Result<CandidateRef, AppError> {
+        Self::unsupported("seal")
+    }
+    async fn verify_seal(&self, _candidate: &CandidateRef) -> Result<(), AppError> {
+        Ok(())
+    }
+    async fn prepare_integration(
+        &self,
+        _request: IntegrationRequest,
+    ) -> Result<IntegrationCandidate, AppError> {
+        Self::unsupported("prepare_integration")
+    }
+    async fn promote(&self, _request: PromoteRequest) -> Result<PromotionReceipt, AppError> {
+        Self::unsupported("promote")
+    }
+    async fn recover_promotion(
+        &self,
+        _run: RunId,
+        _ref_name: &str,
+    ) -> Result<PromotionReceipt, AppError> {
+        Self::unsupported("recover_promotion")
+    }
+    async fn latest_synced_commit(
+        &self,
+        _run: RunId,
+        _repo: &str,
+    ) -> Result<Option<String>, AppError> {
+        Ok(Some("base0".to_string()))
+    }
+    async fn remove_workspace(&self, _workspace: &WorkspaceRef) -> Result<(), AppError> {
+        Ok(())
+    }
+    async fn seal_live(&self, attempt: AttemptId) -> Result<CandidateRef, AppError> {
+        Ok(CandidateRef {
+            attempt_id: attempt,
+            commit: "c0ffee".to_string(),
+            tree: "tree0".to_string(),
+            parent: "base0".to_string(),
+        })
+    }
+    async fn auto_integrate(
+        &self,
+        request: AutoIntegrationRequest,
+    ) -> Result<AutoIntegrationReport, AppError> {
+        self.auto_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(AutoIntegrationReport {
+            candidate: request
+                .candidates
+                .first()
+                .map(|c| c.commit.clone())
+                .unwrap_or_default(),
+            worktree: "/tmp/central-fake-worktree".to_string(),
+            evidence: Vec::new(),
+            summary: VerificationSummary {
+                passed: true,
+                baseline_ok: true,
+                affected_ok: true,
+                acceptance_ok: true,
+                evidence: Vec::new(),
+            },
+            receipt: PromotionReceipt {
+                ref_name: request.ref_name,
+                previous_head: "base0".to_string(),
+                new_head: "deadbeef".to_string(),
+                candidate: "c0ffee".to_string(),
+                intent_id: "intent-1".to_string(),
+            },
+        })
+    }
+}
+
+fn integration_task(worker: TaskId, gate: TaskId, with_spec: bool) -> PlanTaskV1 {
+    PlanTaskV1 {
+        id: gate,
+        kind: TaskKind::Integration,
+        objective: "integrate the verified output".to_string(),
+        inputs: Vec::new(),
+        scope: Vec::new(),
+        out_of_scope: Vec::new(),
+        depends_on: vec![worker],
+        data_depends_on: vec![worker],
+        outputs: Vec::new(),
+        // A verify block alone never authorizes integration: only the
+        // machine-readable spec below does.
+        verify: Some(verify_spec()),
+        evidence: Vec::new(),
+        profile_id: None,
+        permissions: Vec::new(),
+        max_repair_rounds: 0,
+        requires_approval: Vec::new(),
+        handover: String::new(),
+        integration: with_spec.then(|| IntegrationSpec {
+            good_ref: "refs/heads/central-good".to_string(),
+            base_ref: None,
+            baseline: vec![IntegrationCheck {
+                program: "sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+            }],
+            affected: Vec::new(),
+            acceptance: Vec::new(),
+        }),
+    }
+}
+
+fn integration_plan(worker: TaskId, gate: TaskId, with_spec: bool) -> PlanDocumentV1 {
+    PlanDocumentV1 {
+        version: 1,
+        goal: "integrate the verified worker output".to_string(),
+        tasks: vec![
+            plan_task(worker, vec![], vec![]),
+            integration_task(worker, gate, with_spec),
+        ],
+    }
+}
+
+async fn approved_run_with_repo(harness: &Harness, repo: &str, plan: PlanDocumentV1) {
+    harness
+        .execute(
+            user(),
+            Command::CreateRun {
+                goal: "integrate".to_string(),
+                repository: repo.to_string(),
+            },
+        )
+        .await;
+    harness.execute(user(), Command::ProposePlan { plan }).await;
+    let hash = harness.load().pending_plan.clone().expect("pending plan");
+    harness
+        .execute(user(), Command::ApprovePlan { plan_hash: hash })
+        .await;
+}
+
+/// Scheduler-auto integration: once the worker is verified, the
+/// integration task dispatches mechanically — no harness send, no model
+/// turn — and the daemon records the CAS promotion as its Succeeded
+/// verdict with the new head filed as the verified output.
+#[tokio::test]
+async fn scheduler_auto_integrates_verified_work() {
+    let root =
+        std::env::temp_dir().join(format!("central-auto-integration-{}", std::process::id()));
+    std::fs::create_dir_all(&root).expect("scratch repo dir");
+    let fake = Arc::new(FakeWorkspace::new());
+    let harness = Harness::new().with_workspace(fake.clone());
+    let worker = TaskId::from_u128(71);
+    let gate = TaskId::from_u128(72);
+    approved_run_with_repo(
+        &harness,
+        &root.to_string_lossy(),
+        integration_plan(worker, gate, true),
+    )
+    .await;
+
+    // Worker leg through the fake gateway, then verify it.
+    let scheduler = harness.scheduler(default_config());
+    scheduler.tick(harness.run_id).await.expect("tick worker");
+    assert_eq!(harness.gateway.send_count(), 1);
+    let work = harness.attempts_of(worker);
+    assert_eq!(work.len(), 1);
+    let input_hash = ContentHash::from_hex("aa");
+    let candidate = ContentHash::from_hex("bb");
+    let criteria = central_domain::quality::criteria_hash_for(&verify_spec());
+    harness
+        .execute(
+            user(),
+            Command::RecordWorkerResult {
+                attempt: work[0].id,
+                input_hash: input_hash.clone(),
+                candidate_hash: candidate.clone(),
+                criteria_hash: criteria.clone(),
+            },
+        )
+        .await;
+    harness
+        .execute(
+            user(),
+            Command::SubmitVerification {
+                task: worker,
+                attempt: work[0].id,
+                report: central_domain::quality::VerificationReport {
+                    subject_hash: candidate,
+                    criteria_hash: criteria,
+                    outcome: central_domain::VerificationOutcome::Pass,
+                    evidence_ids: vec![input_hash.to_string()],
+                    failed_criteria: Vec::new(),
+                    environment: "test".to_string(),
+                    check_refs: Vec::new(),
+                    verifier_thread: "other-thread".to_string(),
+                    verifier_wrote_tracked_source: false,
+                    same_session_override: false,
+                    findings: "fake verifier passes".to_string(),
+                },
+            },
+        )
+        .await;
+
+    // The integration task now dispatches without any harness send.
+    scheduler
+        .tick(harness.run_id)
+        .await
+        .expect("tick integration");
+    assert_eq!(
+        harness.gateway.send_count(),
+        1,
+        "no model turn for integration"
+    );
+    let state = harness.load();
+    assert_eq!(
+        state.tasks[&gate].status,
+        central_domain::TaskStatus::Succeeded
+    );
+    assert_eq!(
+        state.verified_outputs[&gate].as_str(),
+        "deadbeef",
+        "new head filed as the verified output"
+    );
+    assert!(harness
+        .store
+        .events(harness.run_id)
+        .iter()
+        .any(|e| matches!(
+            e,
+            central_domain::Event::IntegrationPromoted { new_head, .. } if new_head == "deadbeef"
+        )));
+    assert_eq!(fake.auto_calls.load(Ordering::SeqCst), 1);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// An integration task without approved checks never dispatches: it
+/// waits for a revision instead of running unapproved commands.
+#[tokio::test]
+async fn integration_without_spec_never_dispatches() {
+    let root = std::env::temp_dir().join(format!(
+        "central-auto-integration-nospec-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("scratch repo dir");
+    let fake = Arc::new(FakeWorkspace::new());
+    let harness = Harness::new().with_workspace(fake);
+    let worker = TaskId::from_u128(73);
+    let gate = TaskId::from_u128(74);
+    approved_run_with_repo(
+        &harness,
+        &root.to_string_lossy(),
+        integration_plan(worker, gate, false),
+    )
+    .await;
+
+    let scheduler = harness.scheduler(default_config());
+    let report = scheduler.tick(harness.run_id).await.expect("tick");
+    assert_eq!(report.sent, 1, "only the worker dispatches");
+    assert!(harness.attempts_of(gate).is_empty());
+    let _ = std::fs::remove_dir_all(&root);
 }

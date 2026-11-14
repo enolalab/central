@@ -36,7 +36,10 @@ pub use inbox::{
     InboxKey, InboxKind, InboxOutcome, InboxRequest, InboxStatus, VolatileAnswerRef,
     MAX_PREVIEW_CHARS,
 };
-pub use plan::{plan_hash, validate_plan, PlanDocumentV1, PlanTaskV1, TaskKind, VerifySpec};
+pub use plan::{
+    plan_hash, validate_plan, IntegrationCheck, IntegrationSpec, PlanDocumentV1, PlanTaskV1,
+    TaskKind, VerifySpec,
+};
 pub use profile::{
     apply_layers, compute_profile_hash, CapabilitySupport, Enforcement, ProfileError,
     ProfileLayers, ProfilePatch, ResolvedProfile,

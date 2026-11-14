@@ -43,6 +43,42 @@ pub struct VerifySpec {
     pub criteria: Vec<String>,
 }
 
+/// One approved program+argv pair for an integration check phase.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IntegrationCheck {
+    pub program: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+/// Machine-readable integration contract for an `integration` task.
+/// Baseline, affected and acceptance checks run in that order against
+/// the temporary candidate worktree; the good ref moves only on pass.
+/// `base_ref` pins the base commit (default: the latest synced commit);
+/// `good_ref` names the ref to move and has no default — Central never
+/// invents which ref an integration may move.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct IntegrationSpec {
+    pub good_ref: String,
+    #[serde(default)]
+    pub base_ref: Option<String>,
+    #[serde(default)]
+    pub baseline: Vec<IntegrationCheck>,
+    #[serde(default)]
+    pub affected: Vec<IntegrationCheck>,
+    #[serde(default)]
+    pub acceptance: Vec<IntegrationCheck>,
+}
+
+impl IntegrationSpec {
+    /// Total approved checks across all three phases.
+    pub fn check_count(&self) -> usize {
+        self.baseline.len() + self.affected.len() + self.acceptance.len()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PlanTaskV1 {
@@ -62,6 +98,13 @@ pub struct PlanTaskV1 {
     pub max_repair_rounds: u8,
     pub requires_approval: Vec<String>,
     pub handover: String,
+    /// Machine-readable integration contract. Only meaningful for
+    /// `integration` tasks; ignored for every other kind. `None` means
+    /// the task has no approved checks, so it can never dispatch — it
+    /// waits for an approved revision instead of running unapproved
+    /// commands.
+    #[serde(default)]
+    pub integration: Option<IntegrationSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +156,23 @@ pub fn validate_plan(plan: &PlanDocumentV1) -> Result<PlanHash, DomainError> {
                         .criteria
                         .iter()
                         .all(|criterion| !criterion.trim().is_empty()) => {}
+            _ if task.kind == TaskKind::Integration => {
+                // An integration task is verified by its approved checks,
+                // not by a verifier: the integration spec carries the
+                // contract instead of a verify block.
+                match &task.integration {
+                    Some(spec)
+                        if !spec.good_ref.trim().is_empty()
+                            && spec.check_count() > 0
+                            && spec
+                                .baseline
+                                .iter()
+                                .chain(spec.affected.iter())
+                                .chain(spec.acceptance.iter())
+                                .all(|check| !check.program.trim().is_empty()) => {}
+                    _ => return Err(DomainError::MissingVerification(task.id)),
+                }
+            }
             _ => return Err(DomainError::MissingVerification(task.id)),
         }
         if task.max_repair_rounds > MAX_REPAIR_ROUNDS {

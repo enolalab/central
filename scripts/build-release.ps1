@@ -26,6 +26,10 @@ New-Item -ItemType Directory -Path $stage, "$stage/contracts", "$stage/docs" | O
 
 Copy-Item target/release/central.exe (Join-Path $stage 'central.exe')
 Copy-Item target/release/central-server.exe (Join-Path $stage 'central-server.exe')
+# GNU runtime: the release binaries dynamically need libstdc++ (DuckDB C++),
+# libgcc unwinding and winpthread. Stage them beside the exes so the zip
+# runs with no toolchain, Rust or Node installed (verified by zip smoke).
+Copy-Item .toolchain/mingw64/bin/libstdc++-6.dll,.toolchain/mingw64/bin/libgcc_s_seh-1.dll,.toolchain/mingw64/bin/libwinpthread-1.dll $stage
 Copy-Item contracts/openapi-v1.yaml, contracts/openapi-v1.json, contracts/events-v1.schema.json `
     (Join-Path $stage 'contracts/')
 Copy-Item contracts/examples (Join-Path $stage 'contracts/examples') -Recurse

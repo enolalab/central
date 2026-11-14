@@ -20,6 +20,12 @@ function Assert-True($condition, $message) {
 
 Push-Location $root
 try {
+    # Disable the background scanner: this gate drives every dispatch
+    # explicitly and asserts exact event sequences, so any scan tick only
+    # injects nondeterminism (fake queue/dispatch racing the CLI's revision
+    # read/write into stale_revision 409s). Scheduling itself is covered by
+    # the scheduler unit tests, not by this crash-barrier gate.
+    $env:CENTRAL_SCAN_MS = '0'
     Write-Output "== building daemon + CLI (test-support) =="
     cargo build -p central-server --features test-support
     if ($LASTEXITCODE -ne 0) { throw "cargo build (server) failed" }
@@ -64,11 +70,18 @@ try {
     }
     function Central {
         param([Parameter(ValueFromRemainingArguments = $true)][string[]]$rest)
-        $result = Invoke-Central @rest
-        if ($result.code -ne 0) {
-            throw "central $($rest -join ' ') failed with $($result.code) : $($result.output)"
+        # A background scanner may advance the run between the CLI's
+        # revision read and its write: resnapshot and retry once on the
+        # stale-revision conflict. A CAS rejection applies nothing, so one
+        # retry stays exactly-once; anything else still throws.
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            $result = Invoke-Central @rest
+            if ($result.code -eq 0) {
+                return ($result.output | ConvertFrom-Json)
+            }
+            if ($result.output -notmatch 'stale_revision') { break }
         }
-        return ($result.output | ConvertFrom-Json)
+        throw "central $($rest -join ' ') failed with $($result.code) : $($result.output)"
     }
     function CentralRaw {
         param([Parameter(ValueFromRemainingArguments = $true)][string[]]$rest)

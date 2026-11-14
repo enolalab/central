@@ -273,6 +273,7 @@ fn fixture_plan() -> PlanDocumentV1 {
             max_repair_rounds: 2,
             requires_approval: Vec::new(),
             handover: "none".to_string(),
+            integration: None,
         }],
     }
 }

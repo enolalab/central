@@ -226,6 +226,20 @@ paths:
       responses:
         '200': { description: ReceiptV1 }
 
+  /v1/runs/{id}/usage/reconcile:
+    post:
+      summary: >-
+        Fold one caller-audited usage observation into the shared
+        ledger. The daemon never auto-fills these numbers from gateway
+        traffic; the caller cites what it observed (for example the
+        tokenUsage evidence a reconcile response surfaced) and takes
+        responsibility for the figures. Owner or control only.
+      responses:
+        '200': { description: ReceiptV1 }
+        '400': { description: validation failed }
+        '403': { description: forbidden }
+        '404': { description: run not found }
+
   /v1/runs/{id}/recovery:
     get:
       summary: Passive findings plus required user actions for one run. Never dispatches or resumes.

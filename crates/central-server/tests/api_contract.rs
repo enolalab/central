@@ -68,7 +68,6 @@ fn unknown_paths_are_404_json() {
     let server = start_server(&dir);
     let token = server.token();
     for path in [
-        "/",
         "/ui",
         "/v1/nope",
         "/v1/runs/00000000-0000-0000-0000-000000000000/nope",
@@ -78,6 +77,15 @@ fn unknown_paths_are_404_json() {
         let value: serde_json::Value = serde_json::from_str(&body).expect("404 json");
         assert_eq!(value["error"]["code"], "not_found", "code: {value}");
     }
+    // P1 acceptance: `/` is the UI entry point, an explicit 503 — it is
+    // not an unknown path.
+    let (status, body) = http("GET", &server.addr, "/", Some(&token), None, &[]);
+    assert_eq!(status, 503, "root {body}");
+    let value: serde_json::Value = serde_json::from_str(&body).expect("503 json");
+    assert_eq!(
+        value["error"]["code"], "capability_unavailable",
+        "code: {value}"
+    );
 }
 
 #[test]

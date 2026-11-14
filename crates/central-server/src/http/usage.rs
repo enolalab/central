@@ -81,6 +81,136 @@ pub struct ResolveGapBody {
     pub note: String,
 }
 
+/// One audited usage observation to fold into the shared ledger. Every
+/// figure is caller-supplied: the daemon never auto-fills these from
+/// gateway traffic. The caller cites what it observed (for example the
+/// tokenUsage evidence a reconcile response surfaced) and takes
+/// responsibility for the numbers — the ledger records the reporting
+/// actor alongside them.
+#[derive(Deserialize)]
+#[serde(default)]
+pub struct FoldUsageBody {
+    pub provider: String,
+    pub epoch: String,
+    pub turn: String,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub metric: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub finality: String,
+    pub cumulative_tokens: Option<u64>,
+    pub cumulative_cost_minor: Option<u64>,
+    pub cost_minor: Option<u64>,
+}
+
+impl Default for FoldUsageBody {
+    fn default() -> Self {
+        Self {
+            provider: String::new(),
+            epoch: String::new(),
+            turn: String::new(),
+            sequence: 0,
+            tokens: 0,
+            metric: "tokens".to_string(),
+            source: "live".to_string(),
+            finality: "observed".to_string(),
+            cumulative_tokens: None,
+            cumulative_cost_minor: None,
+            cost_minor: None,
+        }
+    }
+}
+
+fn parse_finality(raw: &str) -> Result<central_domain::UsageFinality, ApiError> {
+    use central_domain::UsageFinality;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "observed" => Ok(UsageFinality::Observed),
+        "estimated" => Ok(UsageFinality::Estimated),
+        "in-flight" | "inflight" => Ok(UsageFinality::InFlight),
+        "missing-final" | "missing_final" => Ok(UsageFinality::MissingFinal),
+        other => Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!(
+                "unknown finality: {other} (want observed, estimated, in-flight or missing-final)"
+            ),
+        )),
+    }
+}
+
+pub async fn post_reconcile_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+    Json(body): Json<FoldUsageBody>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
+    let run_id = parse_run(&raw_id)?;
+    if body.provider.trim().is_empty()
+        || body.epoch.trim().is_empty()
+        || body.turn.trim().is_empty()
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "provider, epoch and turn are required: the ledger keys every report by provider turn sequence",
+        ));
+    }
+    if body.metric.trim().is_empty() || body.source.trim().is_empty() {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "metric and source are required: the ledger must know what was counted and where it was reported from",
+        ));
+    }
+    let envelope = central_domain::CommandEnvelope {
+        id: state.ids.next_command_id(),
+        expected_revision: None,
+        command: central_domain::Command::ReconcileUsage {
+            observation: central_domain::UsageObservation {
+                provider: body.provider.trim().to_string(),
+                epoch: body.epoch.trim().to_string(),
+                turn: body.turn.trim().to_string(),
+                sequence: body.sequence,
+                tokens: body.tokens,
+                cost_minor: body.cost_minor,
+                cumulative_tokens: body.cumulative_tokens,
+                cumulative_cost_minor: body.cumulative_cost_minor,
+                finality: parse_finality(&body.finality)?,
+                metric: body.metric.trim().to_string(),
+                source: body.source.trim().to_string(),
+            },
+        },
+    };
+    let runtime = central_application::Runtime::new(
+        std::sync::Arc::clone(&state.store),
+        std::sync::Arc::clone(&state.clock),
+        std::sync::Arc::clone(&state.ids),
+        std::sync::Arc::clone(&state.agent),
+        run_id,
+    )
+    .with_secrets(std::sync::Arc::clone(&state.secrets));
+    let receipt = runtime
+        .execute(auth.actor, envelope)
+        .await
+        .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
+    let receipt = serde_json::to_value(&receipt).map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("cannot encode receipt: {error}"),
+        )
+    })?;
+    Ok(Json(receipt))
+}
+
 pub async fn post_resolve(
     State(state): State<AppState>,
     headers: HeaderMap,

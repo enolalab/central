@@ -27,13 +27,15 @@ use std::sync::Arc;
 
 use central_domain::{
     admission, classify_rejection, failure_for_rejection, Actor, Admission, AttemptId,
-    AttemptSession, Command, CommandEnvelope, RetryPolicy, RunId, Task, TaskId, TaskStatus,
-    WorkRequest, WorkRole,
+    AttemptSession, AttemptStatus, Command, CommandEnvelope, IntegrationCheck, RetryPolicy, RunId,
+    Task, TaskId, TaskKind, TaskStatus, Timestamp, WorkRequest, WorkRole,
 };
 
 use crate::contracts::{AppError, DispatchError, DispatchSummary, OpenSession, SendTurn};
 use crate::fallback::{choose_fallback, select_fallback, FallbackOverrides};
-use crate::ports::workspace::{SnapshotRequest, WorkspaceManager, WorkspaceRequest};
+use crate::ports::workspace::{
+    AutoIntegrationRequest, SnapshotRequest, WorkspaceManager, WorkspaceRequest,
+};
 use crate::ports::{AgentGateway, Clock, IdSource, Store};
 use crate::retries::RetryAction;
 use crate::retries::{classify_open, classify_send, retries_used, retry_due, retry_not_before};
@@ -291,6 +293,14 @@ impl Dispatcher {
         {
             return Ok(());
         }
+        // Integration tasks never reach a harness: the mechanical path
+        // below seals, checks and promotes through the workspace manager
+        // instead of opening a gateway session.
+        if task.kind == TaskKind::Integration {
+            return self
+                .dispatch_integration(run_id, &state, &task, attempt_id)
+                .await;
+        }
         if !self.capabilities_hold(&task).await {
             return Ok(());
         }
@@ -393,6 +403,171 @@ impl Dispatcher {
             .await;
         self.on_send_outcome(run_id, attempt_id, session, turn, summary)
             .await
+    }
+
+    /// One mechanical integration round, no harness involved. The attempt
+    /// must already be queued; the CAS claim below admits exactly one
+    /// driver, then the workspace manager seals the predecessor
+    /// worktrees, prepares the temporary branch, runs the approved
+    /// checks and CAS-promotes the good ref. Anything that is not a
+    /// passing round defers with backoff (or parks as failed when
+    /// retries are exhausted), exactly like the gateway path — and a
+    /// pass records the promotion through `RecordIntegration`.
+    /// Predecessors come from the task's data dependencies when set,
+    /// else its plain dependencies; each must have a completed attempt
+    /// with a live worktree, or the dispatch waits for real work.
+    async fn dispatch_integration(
+        &self,
+        run_id: RunId,
+        state: &central_domain::RunState,
+        task: &Task,
+        attempt_id: AttemptId,
+    ) -> Result<(), AppError> {
+        let Some(manager) = &self.workspace else {
+            // No workspace manager configured: without sealed worktrees
+            // there is nothing honest to integrate.
+            return Ok(());
+        };
+        let Some(active) = state.active_plan.as_ref() else {
+            return Ok(());
+        };
+        let spec = state
+            .plans
+            .get(active)
+            .and_then(|revision| revision.document.tasks.iter().find(|t| t.id == task.id))
+            .and_then(|plan_task| plan_task.integration.clone());
+        let Some(spec) = spec else {
+            // No approved checks: wait for a revision instead of running
+            // unapproved commands.
+            return Ok(());
+        };
+        if spec.good_ref.trim().is_empty() || spec.check_count() == 0 {
+            return Ok(());
+        }
+        if !std::path::Path::new(&state.repository).is_dir() {
+            return Ok(());
+        }
+        let base = match spec.base_ref.clone() {
+            Some(base) => base,
+            None => match manager
+                .latest_synced_commit(state.id, &state.repository)
+                .await
+            {
+                Ok(Some(commit)) => commit,
+                // No synced commit (or an unreadable queue): never invent
+                // the base — wait for `central sync`.
+                _ => return Ok(()),
+            },
+        };
+        // Seal every predecessor's latest completed attempt. Only
+        // completed work integrates, and only from a live worktree the
+        // manager still owns: anything else waits for real work.
+        let predecessors = if task.data_depends_on.is_empty() {
+            &task.depends_on
+        } else {
+            &task.data_depends_on
+        };
+        if predecessors.is_empty() {
+            return Ok(());
+        }
+        let mut latest: std::collections::BTreeMap<TaskId, AttemptId> =
+            std::collections::BTreeMap::new();
+        for predecessor in predecessors {
+            let mut best: Option<(Timestamp, AttemptId)> = None;
+            for record in state.attempts.values() {
+                if &record.task_id == predecessor
+                    && record.status == AttemptStatus::Completed
+                    && best.as_ref().is_none_or(|(at, _)| record.created_at > *at)
+                {
+                    best = Some((record.created_at, record.id));
+                }
+            }
+            match best {
+                Some((_, attempt)) => {
+                    latest.insert(*predecessor, attempt);
+                }
+                None => return Ok(()),
+            }
+        }
+        let mut sealed = Vec::with_capacity(latest.len());
+        for attempt in latest.values() {
+            match manager.seal_live(*attempt).await {
+                Ok(candidate) => sealed.push(candidate),
+                Err(_) => return Ok(()),
+            }
+        }
+        if sealed.is_empty() {
+            return Ok(());
+        }
+        // Claim exactly once: a racing dispatcher loses here and never
+        // runs the mechanical round twice.
+        match self
+            .execute_on(
+                run_id,
+                Command::StartDispatch {
+                    attempt: attempt_id,
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(AppError::Conflict(_)) => return Ok(()),
+            Err(other) => return Err(other),
+        }
+        let to_port = |checks: Vec<IntegrationCheck>| {
+            checks
+                .into_iter()
+                .map(|c| crate::ports::workspace::ApprovedCheck {
+                    program: c.program,
+                    args: c.args,
+                })
+                .collect::<Vec<_>>()
+        };
+        let report = match manager
+            .auto_integrate(AutoIntegrationRequest {
+                run: run_id,
+                candidates: sealed,
+                base,
+                ref_name: spec.good_ref.clone(),
+                expected_parent: None,
+                approved_plan: active.clone(),
+                baseline: to_port(spec.baseline.clone()),
+                affected: to_port(spec.affected.clone()),
+                acceptance: to_port(spec.acceptance.clone()),
+            })
+            .await
+        {
+            Ok(report) => report,
+            Err(_) => return self.defer_or_fail(run_id, attempt_id).await,
+        };
+        let evidence = report
+            .evidence
+            .iter()
+            .map(|got| {
+                format!(
+                    "{} {} exit={} timeout={} out={} err={}",
+                    got.program,
+                    got.args.join(" "),
+                    got.exit_code,
+                    got.timed_out,
+                    got.stdout_hash,
+                    got.stderr_hash
+                )
+            })
+            .collect::<Vec<_>>();
+        self.execute_on(
+            run_id,
+            Command::RecordIntegration {
+                task: task.id,
+                attempt: attempt_id,
+                candidate_commit: report.candidate,
+                previous_head: report.receipt.previous_head,
+                new_head: report.receipt.new_head,
+                check_evidence: evidence,
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     /// An `open` failure happens before any turn exists: quota/auth

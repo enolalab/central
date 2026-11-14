@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use central_domain::{ContentHash, PlanHash};
+use serde::{Deserialize, Serialize};
 
 use crate::contracts::AppError;
 
@@ -22,7 +23,7 @@ pub struct CheckRequest {
 /// Captured evidence of one check run. Evidence is never a verdict: an exit
 /// code of zero does not mark a task succeeded, only an independent verifier
 /// acceptance does.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckEvidence {
     pub program: String,
     pub args: Vec<String>,

@@ -126,6 +126,21 @@ pub enum Event {
         by: ActorId,
         at: Timestamp,
     },
+    /// A mechanical Git integration moved the good ref by
+    /// compare-and-swap after every approved check passed. The event
+    /// carries the full receipt: candidate, previous and new head, and
+    /// the check-evidence hashes the promotion rests on.
+    IntegrationPromoted {
+        run_id: RunId,
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        candidate_commit: String,
+        previous_head: String,
+        new_head: String,
+        check_evidence: Vec<String>,
+        by: ActorId,
+        at: Timestamp,
+    },
     /// A failed task reopened for recovery after a refused or
     /// retry-exhausted send.
     TaskReopened {
@@ -310,7 +325,8 @@ impl Event {
             | Self::PlanRevisionApproved { run_id, .. }
             | Self::StaleCandidateRecorded { run_id, .. }
             | Self::ReuseAssessed { run_id, .. }
-            | Self::WorkerResultRecorded { run_id, .. } => *run_id,
+            | Self::WorkerResultRecorded { run_id, .. }
+            | Self::IntegrationPromoted { run_id, .. } => *run_id,
         }
     }
 
@@ -346,7 +362,8 @@ impl Event {
             | Self::PlanRevisionApproved { at, .. }
             | Self::StaleCandidateRecorded { at, .. }
             | Self::ReuseAssessed { at, .. }
-            | Self::WorkerResultRecorded { at, .. } => *at,
+            | Self::WorkerResultRecorded { at, .. }
+            | Self::IntegrationPromoted { at, .. } => *at,
         }
     }
 }
