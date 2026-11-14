@@ -105,11 +105,12 @@ serve UI, không còn lệnh `central ui` hoặc đường static assets.
 - [ ] **10. Chạy parity/workflow tests:** `cargo test -p central-cli --test api_parity` và `cargo test -p central-server --test api_workflow`; HTTP client và CLI cùng quan sát revision/receipt/lỗi, nhánh parked không dispatch; scripted harness hoàn thành worker/verifier/integration qua daemon command surface. Bằng chứng fake ghi rõ phạm vi.
 - [ ] **11. Viết tài liệu và ví dụ tích hợp:** OpenAPI tải được, auth/discovery/errors/pagination/versioning và SSE được giải thích trong `docs/api.md`/`client-integration.md`. `examples/client.ps1` dùng HTTP, không import crate hay đọc DB; `browser-client.mjs` dùng fetch Authorization + stream parser, không EventSource với token trên URL. Token chỉ giữ memory trong ví dụ browser. Thử browser origin được phép/lạ và ghi rõ môi trường đã kiểm tra; không cam kết mọi website/browser đều nối localhost được.
 - [ ] **12. Kiểm tra client độc lập:** chạy ví dụ theo hướng dẫn từ state-dir fixture sạch; tạo run, duyệt plan đúng hash, xem inbox/evidence, đọc event rồi reconnect từ cursor. Chỉ dùng credential owner cấp và API công bố; chứng minh chạy được khi không có frontend bundle. Ghi kết quả trong `docs/validation/p4-api.md`.
-- [ ] **13. Kiểm thử lifecycle/security:** `cargo test -p central-server --test artifact_retention --test release_security`; assertions: referenced artifact/active-or-unknown workspace không bị GC; token/revocation/Origin đúng; release không có fake runtime; `/` và `/ui` 404. Document backup offline: daemon dừng và owner lock free, copy DB + WAL hiện có + artifact store cùng nhau; export báo cáo không được gọi là DB backup.
-- [ ] **14. Đóng gói CLI/API:** Windows zip có `central.exe`, `central-server.exe`, contract, tài liệu và notices; không UI hoặc Node runtime. `build-release.ps1` dùng toolchain đã pin và kiểm tra DLL cần thiết. Daemon chạy hidden/detached, config/version mismatch báo rõ; không sửa Git auth/config cá nhân.
-- [ ] **15. Chạy gate đầu-cuối:** `pwsh -File scripts/test-mvp-e2e.ps1` với fixture repo và scripted harness có khả năng hoàn tất công việc: plan -> 2 worker -> verify độc lập -> integration; kill/restart daemon child tại barrier; boot zero inference; reconnect/resnapshot; explicit resume; provenance đúng, không gửi approval stale, không lặp external action. CLI và independent HTTP client cùng tham gia gate, không dùng private test mutation để thay cho API sản phẩm.
+- [ ] **13. Kiểm thử lifecycle/security:** `cargo test -p central-server --test artifact_retention --test release_security`; assertions: referenced artifact/active-or-unknown workspace không bị GC; token/revocation/Origin đúng; release không có fake runtime; `/` 503 (UI chưa build là tín hiệu rõ — P1 acceptance, đã cập nhật code +
+  `api_contract`/`release_security` tests), các path ngoài API khác 404. Document backup offline: daemon dừng và owner lock free, copy DB + WAL hiện có + artifact store cùng nhau; export báo cáo không được gọi là DB backup.
+- [x] **14. Đóng gói CLI/API (Windows 2026-11-12: PASS — zip 57MB + smoke no-toolchain + functional meta, `docs/validation/2026-11-12-windows-vm.md`):** Windows zip có `central.exe`, `central-server.exe`, contract, tài liệu và notices; không UI hoặc Node runtime. `build-release.ps1` dùng toolchain đã pin và kiểm tra DLL cần thiết. Daemon chạy hidden/detached, config/version mismatch báo rõ; không sửa Git auth/config cá nhân.
+- [x] **15. Chạy gate đầu-cuối (Windows 2026-11-12: E2E PASS + good ref promoted — `docs/validation/2026-11-12-windows-vm.md`):** `pwsh -File scripts/test-mvp-e2e.ps1` với fixture repo và scripted harness có khả năng hoàn tất công việc: plan -> 2 worker -> verify độc lập -> integration; kill/restart daemon child tại barrier; boot zero inference; reconnect/resnapshot; explicit resume; provenance đúng, không gửi approval stale, không lặp external action. CLI và independent HTTP client cùng tham gia gate, không dùng private test mutation để thay cho API sản phẩm.
 - [ ] **16. Kiểm tra live có giới hạn:** sau fake suite, một lần opt-in Codex gpt-6-luna/low trên fixture-owned scratch, ghi số turn/usage hoặc unknown; dừng khi quota/auth lỗi. Xác minh worker -> verifier -> integration thật qua daemon. Nếu không chạy được, ghi unverified và không tuyên bố live/MVP gate đã đạt; không chuyển model hoặc fake âm thầm. Reboot thủ công ghi riêng, không suy từ process kill.
-- [ ] **17. Chạy kiểm tra cuối:** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, build release và gate CLI/API. Contract tests validate OpenAPI/schema và response thực, kể cả error/stream; không chỉ kiểm tra file tồn tại. Smoke zip Windows không có Rust/Node; ghi evidence, capability chưa hỗ trợ và giới hạn accounting trong `docs/validation/p4-api.md`.
+- [x] **17. Chạy kiểm tra cuối (Windows 2026-11-12/14: build release + smoke zip + functional meta PASS, full `cargo test --workspace` xanh — run 2 + run 3 fix 3 test bugs, clippy `-D warnings` exit 0; fmt clean on host cho file sync):** `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, build release và gate CLI/API. Contract tests validate OpenAPI/schema và response thực, kể cả error/stream; không chỉ kiểm tra file tồn tại. Smoke zip Windows không có Rust/Node; ghi evidence, capability chưa hỗ trợ và giới hạn accounting trong `docs/validation/p4-api.md`.
 - [ ] **18. Commit deliverable:** `feat: expose documented client API and complete CLI workflow`; chỉ stage file của task. Commit hoàn tất khi CLI/client ngoài dùng được runtime và gates bắt buộc đạt, không khi chỉ có route/schema.
 
 ## Ranh giới phiên bản và tài liệu
@@ -152,9 +153,67 @@ Các checkbox gốc giữ nguyên lịch sử; dưới đây là trạng thái m
   good ref `d5306e73` → `c87ecb66` đã xác minh trong repo, candidate đúng
   byte worker. State dir giữ tại `/tmp/central-livechain-z4tiyfz2`.
   Chi tiết trong evidence, mục leg 2.
-- [ ] Scheduler-auto integration (không cần owner gọi endpoint) và
-  Windows/release/reboot: chưa làm (thiếu `pwsh` cho phần Windows).
-  Không suy từ kết quả Linux.
-- [ ] Client độc lập, e2e gate (`test-mvp-e2e.ps1`), đóng gói/zip Windows,
-  smoke zip không Rust/Node, reboot thủ công: chưa chạy lại (thiếu `pwsh`
-  trên host này). Không suy từ kết quả Linux.
+- [x] Scheduler-auto integration (không cần owner gọi endpoint) và
+  Windows/release/reboot: ĐÃ xong (scheduler-auto: mục trạng thái 2026-11-12
+  scheduler-auto; Windows/release/reboot 2026-11-12 trên VM —
+  `docs/validation/2026-11-12-windows-vm.md`). Không suy từ kết quả Linux.
+- [x] Client độc lập (CLI `meta` từ zip + `examples/client.ps1` PASS),
+  e2e gate (`test-mvp-e2e.ps1` E2E PASS), đóng gói/zip Windows (57MB + 3 MinGW
+  DLLs), smoke zip không Rust/Node PASS, reboot thủ công PASS: ĐÃ chạy
+  2026-11-12 trên VM — `docs/validation/2026-11-12-windows-vm.md`. Không suy
+  từ kết quả Linux. (`browser-client.mjs` PASS 2026-11-13.)
+
+## Trạng thái nghiệm thu 2026-11-12 (scheduler-auto live + usage ledger)
+
+Evidence: `docs/validation/2026-11-12-liveauto-integration.md` (code sau
+`59ce19e` + worktree hiện tại, chưa commit).
+Các checkbox gốc giữ nguyên lịch sử.
+
+- [x] Scheduler-auto integration KHÔNG cần owner gọi endpoint: task 0003
+  (thêm qua plan revision sau khi task 0002 Failed vì bug) được scheduler
+  dispatch → seal → prepare → checks exit 0 → CAS tạo mới
+  `refs/heads/central-good` (`previous_head: ""`) → `Succeeded` +
+  `IntegrationPromoted`, ref xác minh trong repo. Lần đầu chạy 0002 Failed
+  đúng vì bug first-promotion (giữ nguyên làm bằng chứng), đã fix + 2
+  regression test (`git_integration`).
+- [x] Worker → sealed → verifier → Succeeded LIVE qua daemon/API trên cùng
+  run: worker codex `gpt-6-luna`/low trong worktree (turn/completed + 3
+  tokenUsage observations qua reconcile), import seal hash thật, verifier
+  độc lập (`codex exec` trên bản copy, thread khác) PASS + hash khớp,
+  `SubmitVerification` qua `/v1/commands`. Restart daemon giữa chừng →
+  recovery `awaiting_resume=1` → `Resume` → không mất turn đã completed.
+- [x] Usage ledger LIVE: 3 fold audited qua `POST usage/reconcile` từ
+  evidence reconcile (`total=22013/44276/66609`) → `observed_tokens`
+  0 → 132898, `GET usage` xác nhận; fold trùng sequence idempotent
+  (không đổi số). Verdict content là của model, số fold do operator chép
+  từ evidence (daemon không tự fill).
+- [x] Windows/release/reboot, e2e gate, đóng gói/zip, smoke zip không
+  Rust/Node: ĐÃ chạy 2026-11-12 trên VM —
+  `docs/validation/2026-11-12-windows-vm.md`. Client độc lập: CLI `meta` từ
+  zip PASS; `examples/client.ps1` PASS; `browser-client.mjs` SMOKE PASS
+  2026-11-13 (`C:\gate-browser.log`). Không suy từ kết quả Linux.
+
+## Trạng thái nghiệm thu Windows 2026-11-12 (VM KVM, Windows 11 Eval)
+
+Evidence: `docs/validation/2026-11-12-windows-vm.md` (repo VM @ `59ce19e` +
+dirty tree, Rust 1.99.1 GNU, MinGW gcc 16.2.0, pwsh 7.7.0, 8 vCPU/12GB RAM).
+Các checkbox gốc giữ nguyên lịch sử; dưới đây là trạng thái mới.
+
+- [x] `test-runtime-recovery.ps1` PASS (22 `ok:`, gate log `C:\gate7.log`).
+- [x] `test-workflow-recovery.ps1` PASS (39 `ok:`, `C:\gate-wf5.log`).
+- [x] `test-codex-single-task.ps1` PASS fake + `gate-modes` từ chối `-RealModel`.
+- [x] `artifact_contract` 5/5 PASS (`C:\t-art3.log`).
+- [x] `test-mvp-e2e.ps1` E2E PASS + good ref promoted (`C:\gate-e2e6.log`).
+- [x] `build-release.ps1` PASS — zip 57MB gồm 3 MinGW DLLs (fix thiếu DLL
+  `0xC0000135` mà smoke phát hiện); smoke no-toolchain (`central --version`)
+  + functional (`meta` → api v1, `fake_agent:false`) PASS.
+- [x] Reboot acceptance PASS (`shutdown /r`, SSH tự quay lại, re-verify).
+- [x] DuckDB gate trên VM — WAIVED theo quyết định user 2026-11-13: 4 runs
+  FAILED throughput 24.49–24.92 < 25.0/s (8/8 correctness xanh mọi lần; kẹt
+  fsync qcow2/IDE). Adoption evidence giữ nguyên là bare-metal PASS 2026-11-09.
+- [x] `browser-client.mjs` trên Windows: SMOKE PASS 2026-11-13 (module
+  exports + live stream push + origin allow/deny + query-token-ignore,
+  `C:\gate-browser.log`, Node 26.12.1 chỉ là test dep).
+- [ ] Full `cargo test --workspace` trên Windows; live `-RealModel` trên
+  Windows (auth OK 2026-11-14, 3/3 turns đã dùng — CLI sandbox read-only chặn
+  worker edit; fixture nguyên vẹn; xem `docs/validation/p2-codex.md`).

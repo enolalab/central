@@ -67,7 +67,7 @@
 - [ ] **1. Write failing tests:** `daemon_is_single_owner`, `recover_requires_explicit_resume`, `auth_cannot_be_claimed_in_body`, `storage_failure_is_not_success`: `assert_eq!(second_start.code,AlreadyRunning); assert_eq!(restored.control,AwaitingResume); assert_eq!(fake.sends,0); assert_eq!(bad_auth.status,401); assert_ne!(db_failure.status,200);`.
 - [ ] **2. Run red:** `cargo test -p central-server --test local_runtime`. Child fixture create/import/approve/pause/restart qua API, không trực tiếp đổi DB để giả runtime.
 - [ ] **3. Implement:** owner file lock trước mở DB; OS-owner-only token/server-info; loopback auth; command body max 1 MiB. CLI spawn daemon detached/hidden bằng Windows adapter, không shell string; đóng CLI không giết daemon. Startup nonterminal -> AwaitingResume; Dispatching thiếu receipt -> UnknownOutcome. Fake agent chỉ test-support feature, release không trả output giả.
-- [ ] **4. Run green:** `pwsh -File scripts/test-runtime-recovery.ps1`: create -> approve -> crash -> reopen -> zero dispatch -> explicit resume -> fake workflow tiếp tục; event không lặp, independent run không mất. UI chưa build -> clear 503, không crash server. No live-model calls.
+- [x] **4. Run green (Windows 2026-11-12: RUNTIME RECOVERY GATE: PASS, 22 asserts — `docs/validation/2026-11-12-windows-vm.md`):** `pwsh -File scripts/test-runtime-recovery.ps1`: create -> approve -> crash -> reopen -> zero dispatch -> explicit resume -> fake workflow tiếp tục; event không lặp, independent run không mất. UI chưa build -> clear 503, không crash server. No live-model calls.
 - [ ] **5. Commit:** `feat: expose durable local runtime through daemon and CLI`; lưu `docs/validation/p1-runtime.md`. Gate không được tuyên bố đã hoàn thành MVP hay tích hợp model thật.
 
 ## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
@@ -81,4 +81,9 @@ trạng thái mới, chỉ tick những gì phiên này chứng minh trực ti�
   `local_runtime` 10; `cargo fmt --check` và clippy `-D warnings` đạt.
 - [ ] DuckDB suitability gate không chạy lại trên host này (gate PowerShell
   Windows); evidence lịch sử trong `docs/validation/duckdb-gate.md` giữ nguyên.
+  (2026-11-12: đã chạy 4 lần trên Windows 11 VM/KVM — 8/8 correctness checks
+  xanh mọi lần, nhưng throughput 24.92/24.88/24.52/24.49 < 25.0/s, kẹt ở
+  fsync qcow2/IDE; KHÔNG đổi tiêu chí, KHÔNG sửa product. Bare-metal PASS
+  2026-11-09 giữ nguyên. WAIVED theo quyết định user 2026-11-13. Chi tiết
+  `docs/validation/2026-11-12-windows-vm.md`.)
 - P1 không có nội dung live-model theo thiết kế; không tuyên bố gì thêm.

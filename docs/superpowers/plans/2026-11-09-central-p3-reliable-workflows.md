@@ -92,7 +92,7 @@
 - [ ] **1. Tests:** `send_succeeded_receipt_missing_never_resends`, `pending_approval_epoch_changed_stays_stale`, `candidate_published_without_metadata_is_orphan`, `promote_done_receipt_missing_converges`, `boot_requires_resume_even_when_evidence_complete`. Assertions: `assert_eq!(duplicate_external_actions,0); assert_eq!(inference_calls_during_boot,0); assert_eq!(hold_after_resume,UsageUnknown); assert_eq!(git_commit_count,expected_count);` no forced claim unknown became failed.
 - [ ] **2. Run red:** `cargo test -p central-server --test workflow_recovery`; fixtures can kill only own child at named crash barriers; no real model used.
 - [ ] **3. Implement:** passive inspect ownership/session/history/artifacts, store reconciliation evidence, resume same session only when profile/input match and safe. Else new attempt with handover after old outcome known. Unknown branch holds its descendants/resources; independent work can run after explicit run resume unless global budget hold. Cancel requests not terminal until evidence; zero blind replay approvals/outbox sends.
-- [ ] **4. Run green:** `pwsh -File scripts/test-workflow-recovery.ps1`: 2 independent implementation tasks -> verifier -> integration; inject each barrier and restart. `cargo test --workspace`; fake models default. One opt-in Luna/low workflow smoke only after deterministic gate, configurable max calls, stop on quota/auth/unknown accounting. Reboot/manual Windows acceptance recorded separately, not inferred from process kill.
+- [x] **4. Run green (Windows 2026-11-12: WORKFLOW RECOVERY GATE: PASS, 39 asserts — `docs/validation/2026-11-12-windows-vm.md`):** `pwsh -File scripts/test-workflow-recovery.ps1`: 2 independent implementation tasks -> verifier -> integration; inject each barrier and restart. `cargo test --workspace`; fake models default. One opt-in Luna/low workflow smoke only after deterministic gate, configurable max calls, stop on quota/auth/unknown accounting. Reboot/manual Windows acceptance recorded separately, not inferred from process kill.
 - [ ] **5. Commit:** `test: prove workflow recovery and side-effect reconciliation`; record remaining external-effect limits. P3 gate: trace input/plan/attempt/profile/verification for every fixture output.
 
 ## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
@@ -106,9 +106,11 @@ Các checkbox gốc giữ nguyên lịch sử.
   `git_integration` 4 (gồm bài baseline/affected/acceptance từng lỗi,
   đã sửa containment trong `checks/runner.rs` + 4 unit test regression),
   `workflow_recovery` 7.
-- [ ] Reboot/manual Windows acceptance chưa thực hiện; không suy từ
-  process kill/restart. Gate PowerShell (`test-workflow-recovery.ps1`)
-  không chạy lại trên host này (thiếu `pwsh`).
+- [x] Reboot/manual Windows acceptance ĐÃ thực hiện 2026-11-12
+  (OS-initiated `shutdown /r`, SSH rớt ~20 phút, login screen qua screendump,
+  SSH tự quay lại, binaries + repo + logs nguyên vẹn —
+  `docs/validation/2026-11-12-windows-vm.md`); không suy từ process kill.
+  Gate PowerShell (`test-workflow-recovery.ps1`) đã chạy PASS trên Windows VM.
 - [x] Dispatcher provision scratch thật cho attempt (late, chưa commit):
   `attempt_scratch_root` + 2 test mới (`provision + cleanup +
   defer-khi-root-hỏng`); daemon bật root này để live turn có cwd owned.

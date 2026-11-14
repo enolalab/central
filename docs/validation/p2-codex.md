@@ -78,3 +78,36 @@ Status: live smoke **unverified** — no `codex` CLI on `PATH` in this
 environment, so no live turn was attempted, no quota was consumed, and no
 personal auth/config was touched. The deterministic evidence above does not
 stand in for it.
+
+## Live attempt 2026-11-13 (Windows 11 VM — auth stop, 0 turns)
+- CLI installed as test dep: `codex-cli 0.166.0` via npm (Node 26.12.1),
+  same version as the Linux host runs. No auth exists on the VM
+  (no `~/.codex/auth.json`, no config); none was created, retried, or borrowed.
+- Fixture `tests/fixtures/tiny-repo` canonical files materialized to
+  `C:\live-smoke` (input `calc.py` sha256 `BA1A531F…F18BC772`); real repo
+  never sent. Worker invocation (single attempt, `--json -m gpt-6-luna
+  -c model_reasoning_effort=low -s workspace-write --skip-git-repo-check`,
+  stdin prompt file): `turn.failed` —
+  `401 Unauthorized: Missing bearer or basic authentication`
+  (api.openai.com, websocket + https, 5 reconnects each, then stop).
+- Observed usage: model `gpt-6-luna`, effort `low` (requested),
+  turns completed `0`, tokens `unknown` — hold reason: no auth on VM,
+  stopped per rule, no quota consumed, no credentials retried.
+- Zero inference effect proven: `calc.py` hash after the stop identical to
+  input (`BA1A531F…F18BC772`); scratch holds only the placed files.
+  Log: `C:\live-smoke.log` on the VM.
+
+## Live worker turns 2026-11-13/14 (Windows VM — auth OK, sandbox blocked, budget spent 3/3)
+- User completed `codex login` on the VM; `codex exec -m gpt-6-luna` READY
+  check passed (`turn.completed`, usage input 13661/cached 11776/output 5).
+- Turn 1 (worker edit, `-s workspace-write --skip-git-repo-check`, cwd fixture):
+  refused — "read-only workspace", no read attempted. Usage 13703/11776/30.
+- Turn 2 (added `--approve-for-me -C C:\live-smoke`, read-first prompt):
+  refused — "filesystem access is read-only", no approval attempted.
+  Usage 13778/11776/29.
+- Turn 3 (diagnostic, no edits): cwd IS `C:\live-smoke`, sandbox read-only,
+  no approval attempted, file never read. Usage 13758/11776/82.
+- Conclusion: the CLI enforces a read-only sandbox in this VM session
+  despite `workspace-write` + approval routing. No edit happened, fixture
+  hash unchanged (`BA1A531F…`). Live worker→verifier on Windows stays
+  **unverified** — environment/toolchain block, not auth, not the product.

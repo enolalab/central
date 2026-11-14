@@ -78,7 +78,10 @@
 - [ ] **1. Tests:** `artifact_root_and_hash_checked`, `orphan_is_not_committed_artifact`, `exit_zero_is_not_task_success`, `verifier_uses_sealed_candidate`: `assert_ne!(worker_done.task_status,Succeeded); assert_eq!(accepted.candidate_hash,sealed); assert!(path_escape.is_err()); assert_eq!(after_pass,Succeeded);` mismatched input -> stale/reverify.
 - [ ] **2. Run red:** `cargo test -p central-infrastructure --test artifact_contract`; `cargo test -p central-application verification`.
 - [ ] **3. Implement:** temp-write/hash/flush/rename blob rồi commit metadata; orphan dọn tường minh, không xóa referenced blob. CheckRunner chỉ program+argv đã duyệt, capture stdout/stderr/exit/hash, cwd/root/timeout qua supervisor; không eval model prose. Verifier phiên/scratch riêng, không sửa candidate/criteria; không recursive verifier.
-- [ ] **4. Run green:** `pwsh -File scripts/test-codex-single-task.ps1 -RealModel`: fixture one function/test, worker sửa, verifier độc lập, evidence; restart Central -> zero inference trước resume. Initial smoke tối đa 3 agent turns; stop khi quota/auth; tests thường fake. Ghi usage/unknown, không gửi repo thật.
+- [ ] **4. Run green:** `pwsh -File scripts/test-codex-single-task.ps1 -RealModel`: fixture one function/test, worker sửa, verifier độc lập, evidence; restart Central -> zero inference trước resume. Initial smoke tối đa 3 agent turns; stop khi quota/auth; tests thường fake. Ghi usage/unknown, không gửi repo thật. (Windows: fake `gate-codex2.log` GATE PASS + `gate-modes2.log` từ chối `-RealModel`. Live `-RealModel` 2026-11-13: codex-cli 0.166.0, fixture scratch, 1 worker attempt → `401` no-auth STOP, 0 turns, usage unknown, fixture nguyên vẹn — chi tiết `docs/validation/p2-codex.md`. Sau login 2026-11-14: 3/3 turns đã dùng — worker bị sandbox read-only chặn
+  cả 2 lần (dù `workspace-write` + `--approve-for-me`), turn 3 chẩn đoán xác
+  nhận. Vẫn **unverified** (kẹt sandbox CLI trên VM, không phải auth/product),
+  không fallback.)
 - [ ] **5. Commit:** `feat: verify one Codex task with immutable provenance`; P2 evidence không chỉ lời agent nói xong.
 
 ## Trạng thái nghiệm thu 2026-11-11 (Linux fix rerun)
