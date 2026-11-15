@@ -13,7 +13,7 @@
     "frameCapBytes": 8388608,
     "id": "client request ids are numbers; server request ids observed as numbers",
     "request": { "id": "number|string", "method": "string", "params": "object" },
-    "response": { "id": "number|string", "result": "any, error absent": null },
+    "response": { "id": "number|string", "result": "any", "error": "absent" },
     "errorResponse": { "id": "number|string|null", "error": { "code": "integer", "message": "string" } },
     "serverRequest": { "id": "number", "method": "string", "params": "object" },
     "notification": { "method": "string", "params": "object", "id": "absent" }
@@ -50,13 +50,14 @@
       },
       "result": {
         "thread": { "id": "string (UUID)", "model": "string (OBSERVED model)", "modelProvider": "string" },
+        "sandbox": { "type": "workspaceWrite|readOnly|dangerFullAccess" },
         "model": "string (OBSERVE: requested/observed mismatch is a capability error)"
       },
       "source": "live probe 2026-11-11: observed model gpt-6-luna, reasoningEffort low, sandbox workspaceWrite honored"
     },
     "thread/resume": {
       "params": { "threadId": "string (UUID)", "excludeTurns": "boolean" },
-      "result": { "thread": { "id": "string (UUID)" }, "model": "string" },
+      "result": { "thread": { "id": "string (UUID)" }, "model": "string", "sandbox": { "type": "workspaceWrite|readOnly|dangerFullAccess" } },
       "source": "schema v2 ThreadResumeParams/Response (not live-exercised; resume stays best-effort)"
     },
     "thread/read": {

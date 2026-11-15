@@ -66,6 +66,189 @@ fn session_for(gateway: &CodexGateway) -> SessionRef {
     }
 }
 
+#[test]
+fn recorded_protocol_subset_is_valid_json_and_documents_effective_policy() {
+    let document: Value = serde_json::from_str(include_str!(
+        "../../../contracts/codex/0.167.1/protocol-subset.json"
+    ))
+    .expect("versioned protocol subset must be valid JSON");
+    for method in ["thread/start", "thread/resume"] {
+        assert!(
+            document["clientMethods"][method]["result"]["sandbox"]["type"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("workspaceWrite")
+        );
+    }
+}
+
+/// A Windows app-server may accept workspace-write but report readOnly.
+/// Refuse before sending turn/start, including when policy is absent.
+#[tokio::test]
+async fn downgraded_or_missing_sandbox_never_starts_a_turn() {
+    use central_application::contracts::{DispatchError, ExecutionRef, OpenSession, SendTurn};
+    use central_domain::{AttemptId, CommandId, Timestamp};
+    use central_infrastructure::process::{PipedSpawner, PipedStdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    struct PolicyPeer(Mutex<Option<(tokio::io::DuplexStream, tokio::io::DuplexStream)>>);
+    struct PolicySupervisor {
+        calls: AtomicUsize,
+        fail_termination: bool,
+    }
+    #[async_trait]
+    impl ProcessSupervisor for PolicySupervisor {
+        async fn spawn(&self, _: &ProcessSpec) -> Result<ProcessIdentity, AppError> {
+            unreachable!("the piped spawner owns startup")
+        }
+        async fn inspect(&self, _: &ProcessIdentity) -> Result<ProcessState, AppError> {
+            Ok(ProcessState::Running)
+        }
+        async fn terminate(&self, _: &ProcessIdentity) -> Result<(), AppError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_termination {
+                Err(AppError::Transport("termination failed".into()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+    #[async_trait]
+    impl PipedSpawner for PolicyPeer {
+        async fn spawn_piped(
+            &self,
+            _: &ProcessSpec,
+        ) -> Result<(ProcessIdentity, PipedStdio), AppError> {
+            let (write, read_peer) = duplex(8192);
+            let (write_peer, read) = duplex(8192);
+            *self.0.lock().unwrap() = Some((read_peer, write_peer));
+            Ok((
+                ProcessIdentity {
+                    pid: 42,
+                    created_at: Timestamp::from_millis(1),
+                    ownership_id: "policy-test".into(),
+                },
+                PipedStdio {
+                    stdin: Box::new(write),
+                    stdout: Box::new(read),
+                },
+            ))
+        }
+    }
+    for (sandbox, resume, fail_termination) in [
+        (Some(json!({"type":"readOnly"})), false, false),
+        (Some(json!({"type":"dangerFullAccess"})), false, false),
+        (None, false, false),
+        (Some(json!({"type":"readOnly"})), true, false),
+        (None, true, false),
+        (Some(json!({"type":"readOnly"})), false, true),
+    ] {
+        let peer = Arc::new(PolicyPeer(Mutex::new(None)));
+        let process = Arc::new(PolicySupervisor {
+            calls: AtomicUsize::new(0),
+            fail_termination,
+        });
+        let gateway = CodexGateway::new(
+            process.clone(),
+            CodexConfig {
+                cli_version: "0.167.1".into(),
+                request_timeout_ms: 5000,
+                ..CodexConfig::default()
+            },
+        )
+        .with_piped(peer.clone());
+        let session = gateway
+            .open(OpenSession {
+                attempt_id: AttemptId::from_u128(77),
+                profile: profile(),
+                workspace: "/tmp/fixture".into(),
+                resume_from: resume.then(|| SessionRef {
+                    provider: "codex".into(),
+                    instance_epoch: "old-epoch".into(),
+                    thread_id: "old-thread".into(),
+                }),
+            })
+            .await
+            .unwrap();
+        let (read, mut write) = peer.0.lock().unwrap().take().unwrap();
+        let peer_task = tokio::spawn(async move {
+            let mut lines = BufReader::new(read).lines();
+            let init: Value =
+                serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+            write
+                .write_all(format!("{}\n", json!({"id":init["id"],"result":{}})).as_bytes())
+                .await
+                .unwrap();
+            let request = loop {
+                let line = lines.next_line().await.unwrap().unwrap();
+                let value: Value = serde_json::from_str(&line).unwrap();
+                if value["method"]
+                    == if resume {
+                        "thread/resume"
+                    } else {
+                        "thread/start"
+                    }
+                {
+                    break value;
+                }
+            };
+            let mut result = json!({"model":"gpt-6-luna","thread":{"id":"server-thread","cliVersion":"0.167.1"}});
+            if let Some(policy) = sandbox {
+                result["sandbox"] = policy;
+            }
+            write
+                .write_all(format!("{}\n", json!({"id":request["id"],"result":result})).as_bytes())
+                .await
+                .unwrap();
+            // No turn/start may be sent after an unverified/downgraded policy.
+            let next = tokio::time::timeout(Duration::from_millis(300), lines.next_line()).await;
+            assert!(
+                next.is_err() || matches!(&next, Ok(Ok(None))),
+                "unexpected RPC after unsafe policy: {next:?}"
+            );
+        });
+        let error = gateway
+            .send(SendTurn {
+                session: session.clone(),
+                attempt_id: AttemptId::from_u128(77),
+                input: "do work".into(),
+                output_schema: None,
+                command_id: CommandId::from_u128(78),
+            })
+            .await
+            .unwrap_err();
+        if fail_termination {
+            assert!(
+                matches!(error, DispatchError::OutcomeUnknown(message) if message.contains("termination"))
+            );
+            let evidence = gateway
+                .reconcile(&ExecutionRef {
+                    attempt_id: AttemptId::from_u128(77),
+                    session,
+                    turn: None,
+                })
+                .await
+                .unwrap();
+            assert!(
+                evidence.detail.contains("rpc attached"),
+                "owned process remains available for reconciliation"
+            );
+        } else {
+            assert!(
+                matches!(error, DispatchError::Rejected(message) if message.contains("sandbox"))
+            );
+        }
+        peer_task.await.unwrap();
+        assert_eq!(
+            process.calls.load(Ordering::SeqCst),
+            1,
+            "unstarted app-server is terminated once"
+        );
+    }
+}
+
 /// Trace-style fixture line: {"dir": "sent"|"received", "message": {...}}.
 /// Fixtures live in the workspace `tests/fixtures/codex/` directory.
 fn fixture_messages(name: &str) -> Vec<(String, Value)> {
@@ -807,7 +990,7 @@ async fn attached_transport_speaks_verified_protocol() {
                     srv_write
                         .write_all(
                             format!(
-                                "{{\"id\":{id},\"result\":{{\"model\":\"gpt-6-luna\",\"thread\":{{\"id\":\"srv-thread-1\",\"cliVersion\":\"0.167.1\",\"model\":\"gpt-6-luna\",\"modelProvider\":\"openai\"}}}}}}\n"
+                                "{{\"id\":{id},\"result\":{{\"model\":\"gpt-6-luna\",\"sandbox\":{{\"type\":\"workspaceWrite\"}},\"thread\":{{\"id\":\"srv-thread-1\",\"cliVersion\":\"0.167.1\",\"model\":\"gpt-6-luna\",\"modelProvider\":\"openai\"}}}}}}\n"
                             )
                             .as_bytes(),
                         )
@@ -820,6 +1003,9 @@ async fn attached_transport_speaks_verified_protocol() {
                     assert_eq!(req["method"], "turn/start");
                     assert_eq!(req["params"]["threadId"], "srv-thread-1");
                     let id = req["id"].clone();
+                    // Real 0.167.1 app-servers also send process-wide
+                    // notifications without a top-level threadId.
+                    srv_write.write_all(b"{\"method\":\"account/updated\",\"params\":{\"authMode\":\"chatgpt\"}}\n{\"method\":\"thread/started\",\"params\":{\"thread\":{\"id\":\"srv-thread-1\"}}}\n").await.expect("process notifications");
                     srv_write
                         .write_all(
                             format!(
@@ -899,6 +1085,11 @@ async fn attached_transport_speaks_verified_protocol() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(saw_approval, "server approval request observed");
+    assert!(gateway
+        .observe(&session)
+        .await
+        .expect("process notifications do not block reconciliation")
+        .is_empty());
 
     let drained = gateway
         .drain_requests(&session)

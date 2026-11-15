@@ -31,7 +31,7 @@ pub struct DaemonConfig {
 /// Owner-configured Codex harness (`codex.json` in the state directory,
 /// written by the owner — never fetched from the network):
 /// `{ "binary": "codex", "cli_version": "0.167.0-alpha.3.2",
-///    "surveyed_models": ["gpt-6-luna"] }`.
+///    "surveyed_models": ["gpt-6-luna"], "windows_sandbox": "elevated" }`.
 /// Every field is validated before the gateway is built: the binary
 /// must resolve on `PATH`, the CLI version must pass the allowlist,
 /// and provider model fallback stays off. Anything missing or invalid
@@ -85,10 +85,20 @@ fn select_gateway(state_dir: &Path) -> (Arc<dyn AgentGateway>, &'static str) {
                 .collect()
         })
         .unwrap_or_default();
+    let app_server_args = match codex_server_args(value.get("windows_sandbox")) {
+        Ok(args) => args,
+        Err(()) => {
+            return (
+                Arc::new(UnavailableGateway),
+                "invalid windows_sandbox in codex.json: ignoring harness config",
+            )
+        }
+    };
     let config = central_infrastructure::codex::CodexConfig {
         binary: binary.to_string(),
         cli_version: cli_version.to_string(),
         surveyed_models: surveyed,
+        app_server_args,
         ..central_infrastructure::codex::CodexConfig::default()
     };
     // One owned supervisor plays both roles: process ownership/kill and
@@ -101,6 +111,49 @@ fn select_gateway(state_dir: &Path) -> (Arc<dyn AgentGateway>, &'static str) {
     )
     .with_piped(supervisor as Arc<dyn central_infrastructure::process::PipedSpawner>);
     (Arc::new(gateway), "codex gateway configured")
+}
+
+/// An optional, explicit per-daemon override; never substitute a weaker
+/// Windows sandbox automatically or accept arbitrary CLI/config arguments.
+fn codex_server_args(value: Option<&serde_json::Value>) -> Result<Vec<String>, ()> {
+    match value {
+        None => Ok(vec!["app-server".into()]),
+        Some(serde_json::Value::String(mode)) if mode == "elevated" || mode == "unelevated" => {
+            Ok(vec![
+                "-c".into(),
+                format!("windows.sandbox=\"{mode}\""),
+                "app-server".into(),
+            ])
+        }
+        _ => Err(()),
+    }
+}
+
+#[cfg(test)]
+mod codex_sandbox_config_tests {
+    use super::codex_server_args;
+    use serde_json::json;
+
+    #[test]
+    fn sandbox_selection_is_explicit_and_allowlisted() {
+        assert_eq!(codex_server_args(None).unwrap(), ["app-server"]);
+        assert_eq!(
+            codex_server_args(Some(&json!("elevated"))).unwrap(),
+            ["-c", "windows.sandbox=\"elevated\"", "app-server"]
+        );
+        assert_eq!(
+            codex_server_args(Some(&json!("unelevated"))).unwrap(),
+            ["-c", "windows.sandbox=\"unelevated\"", "app-server"]
+        );
+        for invalid in [
+            json!("danger-full-access"),
+            json!("elevated\" -c x=1"),
+            json!(null),
+            json!(true),
+        ] {
+            assert!(codex_server_args(Some(&invalid)).is_err());
+        }
+    }
 }
 
 fn find_on_path(binary: &str) -> Option<PathBuf> {

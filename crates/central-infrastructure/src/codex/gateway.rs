@@ -339,6 +339,7 @@ impl CodexGateway {
             profile: managed.profile.clone(),
             workspace: managed.workspace.clone(),
             resume_from: managed.resume_from.clone(),
+            sandbox_refused: false,
             attached,
         })
     }
@@ -449,6 +450,7 @@ impl CodexGateway {
                 profile: managed.profile.clone(),
                 workspace: managed.workspace.clone(),
                 resume_from: managed.resume_from.clone(),
+                sandbox_refused: false,
                 attached,
             })
         })();
@@ -523,6 +525,10 @@ impl CodexGateway {
                 )
                 .await
                 .map_err(Self::into_dispatch)?;
+            if let Err(error) = ensure_workspace_write(&result) {
+                taken.sandbox_refused = true;
+                return Err(error);
+            }
             let id = result["thread"]["id"].as_str().ok_or_else(|| {
                 DispatchError::Rejected("thread/resume did not return a thread id".to_string())
             })?;
@@ -548,6 +554,10 @@ impl CodexGateway {
                 )
                 .await
                 .map_err(Self::into_dispatch)?;
+            if let Err(error) = ensure_workspace_write(&result) {
+                taken.sandbox_refused = true;
+                return Err(error);
+            }
             let observed = result["model"].as_str().ok_or_else(|| {
                 DispatchError::Rejected(
                     "thread/start did not report the resolved model; refusing to run blind"
@@ -629,6 +639,43 @@ impl CodexGateway {
     }
 }
 
+/// Process-wide notifications that never carry a top-level `threadId` by
+/// design. They are global to the app-server process (`account/*`,
+/// `remoteControl/*`, `mcpServer/*`) or announce a thread with a nested
+/// `thread.id` (`thread/started`). Dropping them in `observe` is not a
+/// silent loss: they never become domain Observations, per the versioned
+/// protocol subset. Any other thread-less notification (for example a
+/// `thread/status/changed` without its documented `threadId`) stays
+/// reconcile-required so a truly unattributed event still 503s.
+fn is_benign_process_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "account/updated"
+            | "account/rateLimits/updated"
+            | "remoteControl/status/changed"
+            | "mcpServer/startupStatus/updated"
+            | "thread/started"
+    )
+}
+
+/// The app-server can silently downgrade the requested sandbox on Windows
+/// when its sandbox is not configured. Do not start a turn unless the
+/// effective policy is explicitly reported and matches the request.
+fn ensure_workspace_write(result: &serde_json::Value) -> Result<(), DispatchError> {
+    match result.pointer("/sandbox/type").and_then(serde_json::Value::as_str) {
+        Some("workspaceWrite") => Ok(()),
+        Some("readOnly") => Err(DispatchError::Rejected(
+            "app-server returned a readOnly sandbox instead of workspaceWrite; check sandbox configuration and retry".to_string(),
+        )),
+        Some(_) => Err(DispatchError::Rejected(
+            "app-server returned an unsupported sandbox instead of workspaceWrite; check sandbox configuration and retry".to_string(),
+        )),
+        None => Err(DispatchError::Rejected(
+            "app-server did not report its effective sandbox policy; refusing to start the turn".to_string(),
+        )),
+    }
+}
+
 /// Session plus frozen dispatch inputs carried across a blocking gateway
 /// call. The transport inside is owned by the caller for the duration —
 /// never shared, never held across a lock.
@@ -638,6 +685,7 @@ struct TakenSession {
     profile: ResolvedProfile,
     workspace: String,
     resume_from: Option<SessionRef>,
+    sandbox_refused: bool,
     attached: AttachedTransport,
 }
 
@@ -773,10 +821,34 @@ impl AgentGateway for CodexGateway {
         let mut taken = self.take_transport(&request.session, request.attempt_id)?;
         let timeout = Duration::from_millis(self.config.request_timeout_ms.max(1));
         let outcome = self.send_via(&mut taken, &request, timeout).await;
+        let sandbox_refused = taken.sandbox_refused;
         // The transport goes back unless cancel won the race and removed
         // the session underneath us — then it is dropped with the dead
         // process instead of being resurrected.
         self.restore_transport(taken);
+        if sandbox_refused {
+            if let Err(DispatchError::Rejected(message)) = &outcome {
+                // These messages are fixed strings from ensure_workspace_write;
+                // do not log arbitrary app-server payloads or credentials.
+                eprintln!("central: attempt {}: {message}", request.attempt_id);
+            }
+            let target = ExecutionRef {
+                attempt_id: request.attempt_id,
+                session: request.session,
+                turn: None,
+            };
+            if !matches!(
+                self.cancel(&target).await,
+                Ok(CancelObservation {
+                    cancelled: true,
+                    ..
+                })
+            ) {
+                return Err(DispatchError::OutcomeUnknown(
+                    "sandbox policy refused before turn/start, but termination of the owned app-server was not confirmed; reconcile process ownership".to_string(),
+                ));
+            }
+        }
         outcome
     }
 
@@ -827,10 +899,46 @@ impl AgentGateway for CodexGateway {
                 (*attempt_id, want)
             });
         let Some((attempt_id, want)) = found else {
-            let pending = state.buffer.len();
+            // Drop documented process-wide noise before counting: global
+            // notifications without a thread must not 503 a poll for a gone
+            // session. Anything else thread-less stays reconcile-required.
+            let mut rest = Vec::new();
+            for event in state.buffer.drain() {
+                let thread = event
+                    .params
+                    .get("threadId")
+                    .or_else(|| event.params.get("thread_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("");
+                if thread.is_empty()
+                    && !event.is_request
+                    && is_benign_process_notification(&event.method)
+                {
+                    continue;
+                }
+                rest.push(event);
+            }
+            if rest.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for event in &rest {
+                seen.insert(event.method.clone());
+            }
+            let mut method_list: Vec<String> = seen.into_iter().collect();
+            method_list.sort();
+            method_list.truncate(8);
+            let pending = rest.len();
+            for event in rest {
+                state.buffer.push(event);
+                if state.buffer.overflowed() {
+                    break;
+                }
+            }
             return Err(AppError::Transport(format!(
-                "reconcile-required: {pending} unattributed notification(s) for an unknown \
-                 session; Central never fabricates Observations"
+                "reconcile-required: {pending} unattributed notification(s) [{}] for an unknown \
+                 session; Central never fabricates Observations",
+                method_list.join(", ")
             )));
         };
         let epoch = self.epoch.clone();
@@ -854,11 +962,35 @@ impl AgentGateway for CodexGateway {
                     observation.detail = usage_note(&event.params);
                 }
                 matched.push(observation);
+            } else if thread.is_empty()
+                && !event.is_request
+                && is_benign_process_notification(&event.method)
+            {
+                // Documented process-wide notifications never bind to one
+                // attempt, so drop them here instead of failing the whole
+                // poll with 503. Any other thread-less event still goes to
+                // `rest` and stays reconcile-required.
+                continue;
             } else {
                 rest.push(event);
             }
         }
         if matched.is_empty() {
+            // Benign process-wide noise alone is an empty poll, not a 503:
+            // it was already dropped above, so only truly unattributed
+            // (thread-bearing but unmatched) events fail here. Their method
+            // names are fixed protocol strings, safe to keep in the body.
+            if rest.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for event in &rest {
+                seen.insert(event.method.clone());
+            }
+            let mut method_list: Vec<String> = seen.into_iter().collect();
+            method_list.sort();
+            method_list.truncate(8);
+            let pending = rest.len();
             for event in rest {
                 state.buffer.push(event);
                 if state.buffer.overflowed() {
@@ -872,10 +1004,10 @@ impl AgentGateway for CodexGateway {
                         .to_string(),
                 ));
             }
-            let pending = state.buffer.len();
             return Err(AppError::Transport(format!(
-                "reconcile-required: {pending} unattributed notification(s) for an unknown \
-                 session; Central never fabricates Observations"
+                "reconcile-required: {pending} unattributed notification(s) [{}] for an unknown \
+                 session; Central never fabricates Observations",
+                method_list.join(", ")
             )));
         }
         for event in rest {
@@ -1029,6 +1161,7 @@ impl AgentGateway for CodexGateway {
                         profile: managed.profile.clone(),
                         workspace: managed.workspace.clone(),
                         resume_from: managed.resume_from.clone(),
+                        sandbox_refused: false,
                         attached,
                     }
                 }
@@ -1093,7 +1226,7 @@ impl AgentGateway for CodexGateway {
 
     async fn cancel(&self, target: &ExecutionRef) -> Result<CancelObservation, AppError> {
         self.ensure_compatible()?;
-        let identity = {
+        let managed = {
             let mut state = self.state.lock().expect("gateway state");
             match state.sessions.remove(&target.attempt_id) {
                 Some(managed) => {
@@ -1106,7 +1239,7 @@ impl AgentGateway for CodexGateway {
                             "stale cancel: epoch '{epoch}' does not match the live session"
                         )));
                     }
-                    managed.identity
+                    managed
                 }
                 None => {
                     return Ok(CancelObservation {
@@ -1121,12 +1254,22 @@ impl AgentGateway for CodexGateway {
         };
         // Identity-checked: a recycled PID is never killed (the supervisor
         // refuses stale identities instead of guessing).
-        self.supervisor.terminate(&identity).await?;
+        if let Err(error) = self.supervisor.terminate(&managed.identity).await {
+            // A failed termination is not evidence that the owned process
+            // exited. Keep its identity available for reconciliation.
+            self.state
+                .lock()
+                .expect("gateway state")
+                .sessions
+                .entry(target.attempt_id)
+                .or_insert(managed);
+            return Err(error);
+        }
         Ok(CancelObservation {
             cancelled: true,
             detail: format!(
                 "terminated owned app-server process {} for attempt {}",
-                identity.pid, target.attempt_id
+                managed.identity.pid, target.attempt_id
             ),
         })
     }

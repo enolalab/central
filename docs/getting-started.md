@@ -20,6 +20,28 @@ central meta
 fast when the CLI and daemon disagree — run it first whenever
 something looks odd.
 
+## Codex on Windows
+
+Configure the owner-controlled `codex.json` in the Central state directory
+with an allowlisted Codex binary, CLI version, and surveyed models. When
+Windows sandbox setup is required, `windows_sandbox` can be set explicitly
+to `elevated` or `unelevated`; omitting it keeps the CLI's own configuration.
+For example, using a verified elevated setup:
+
+```json
+{"binary":"C:\\path\\to\\codex.exe","cli_version":"0.167.1","surveyed_models":["gpt-6-luna"],"windows_sandbox":"elevated"}
+```
+
+Central checks the effective thread sandbox and refuses to start a turn if
+the server reports a policy other than `workspaceWrite`, or does not report
+it. The owned app-server is terminated and the refusal is written to
+`daemon.log`. If termination cannot be confirmed, the attempt is parked
+as an unknown outcome for reconciliation. `unelevated` is an explicit legacy fallback with weaker network isolation
+than `elevated`; Central does not select it automatically. Validate the
+selected mode with `scripts/test-windows-codex-preflight.ps1` and
+`scripts/test-codex-sandbox-policy.mjs` before enabling live work. See
+[Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox).
+
 ## First run (five minutes)
 
 ```powershell
