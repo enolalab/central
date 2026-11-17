@@ -49,6 +49,11 @@ pub struct AppState {
     pub clock: Arc<dyn Clock>,
     pub ids: Arc<dyn IdSource>,
     pub agent: Arc<dyn AgentGateway>,
+    /// Harness providers configured at boot, sorted (empty means none —
+    /// the daemon defers dispatch with a capability error). Published on
+    /// `GET /v1/meta`; never a capability the harness was not verified to
+    /// support.
+    pub providers: Vec<String>,
     /// Daemon-side sync intake (the CLI never writes queue files).
     pub sync_intake: Arc<dyn SyncIntake>,
     /// Content-addressed artifact blobs under the state directory.

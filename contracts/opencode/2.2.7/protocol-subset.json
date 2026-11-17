@@ -1,0 +1,70 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Central opencode REST subset (2.2.7, live-probed)",
+  "description": "HTTP surface Central uses for OpencodeGateway, read from the live 2.2.7 OpenAPI (139 paths) and exercised on 2026-11-17: session.create -> prompt -> assistant message with tokens; permission list (empty under default auto-approve rules). The permission reply cycle is schema-captured but NOT live-denied. Central polls message + permission lists per observe(); the SSE stream (/api/event) is intentionally unused.",
+  "provenance": {
+    "cliVersion": "2.2.7",
+    "schemaSource": "opencode serve 2.2.7 /openapi.json (captured 2026-11-17)",
+    "generatedFromLiveCli": true,
+    "liveHandshakeVerified": "Basic auth, session.create/prompt/message/permission list on 2.2.7; permission reply + interrupt schema-only",
+    "observedUserAgent": "opencode/latest/2.2.7/cli"
+  },
+  "transport": {
+    "spawn": "per-session `opencode serve --hostname 127.0.0.1 --port 0 --stdio` with OPENCODE_PASSWORD=<per-session secret> in the child environment",
+    "stdio": "first stdout line is {\"url\": \"http://127.0.0.1:<port>\"}; stdin must stay open or the server exits; auth state is the env secret, never the stdio bytes",
+    "auth": "HTTP Basic, username `opencode`, password the per-session env secret, on every request",
+    "polling": "observe() polls GET message + GET permission; no SSE, no shared server across sessions"
+  },
+  "restMethods": {
+    "GET /api/info": {
+      "response": { "version": "string (expect the allowlisted CLI)" },
+      "note": "health + version pin, called once at open"
+    },
+    "POST /api/session": {
+      "request": { "title": "string|null", "agent": "Agent.ID|null", "model": "Model.Ref|null" },
+      "response": { "data": { "id": "Session.ID (server session id)" } },
+      "source": "live 2.2.7: create with {title} returns {data:{id,...}}"
+    },
+    "POST /api/session/{sessionID}/prompt": {
+      "request": { "text": "string (required)", "id": "message id|null" },
+      "response": { "data": "the user message echo {id, sessionID, type: user}" },
+      "note": "a timeout after the write is OutcomeUnknown: the turn may still run, never resend",
+      "source": "live 2.2.7"
+    },
+    "GET /api/session/{sessionID}/message": {
+      "response": { "data": ["message list, oldest first"] },
+      "assistantMessage": {
+        "id": "msg_*",
+        "time": { "created": "ms", "completed": "ms|null (null while streaming)" },
+        "model": { "id": "string (OBSERVED model)", "providerID": "string" },
+        "content": "[{type: text|reasoning|tool, text|...}]",
+        "finish": "terminal reason|null",
+        "tokens": { "input": "int", "output": "int", "reasoning": "int", "cache": { "read": "int", "write": "int" } }
+      },
+      "completionRule": "the turn is complete when an assistant message newer than the prompt carries time.completed; Central matches it and emits one completed-turn observation",
+      "source": "live 2.2.7"
+    },
+    "GET /api/session/{sessionID}/permission": {
+      "response": { "data": ["Permission.Request"] },
+      "permissionRequest": {
+        "id": "Permission.ID",
+        "sessionID": "Session.ID",
+        "action": "string (e.g. edit/write/execute class)",
+        "resources": ["affected paths/commands"],
+        "message": "string|null (human-readable ask)"
+      },
+      "source": "live 2.2.7 (empty under default rules); shape from OpenAPI"
+    },
+    "POST /api/session/{sessionID}/permission/{requestID}/reply": {
+      "request": { "decision": "once|always|reject (Central sends once|reject only, never always)", "message": "string|null (feedback on reject)" },
+      "mapping": "domain approved -> once; domain declined:<feedback> -> reject with message=feedback",
+      "note": "NOT live-exercised: the echo/default lab never asked"
+    },
+    "POST /api/session/{sessionID}/interrupt": {
+      "note": "best-effort in-turn stop; cancel() still terminates the owned server process for the identity-checked kill guarantee"
+    }
+  },
+  "toleratedOpaque": {
+    "note": "Every other path (message deltas, inbox, forms, artifacts, mcp, schedule, voice, experimental/*) is never a domain fact. Usage counts stay evidence-only notes."
+  }
+}

@@ -1,0 +1,159 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Central Muse MSP session-host protocol subset (1.4.20, offline-exported)",
+  "description": "Wire surface Central uses for MuseGateway, distilled from the MSP schema export (stable surface, schemaVersion 1, SS1.4.x) and verified live on 1.4.23 via the echo provider (initialize/initialized/session-start/turn-start/turn-completed/tokenUsage/contextUsage). The 2-step approval flow is schema-captured but NOT live-exercised: the gateway must treat unlisted methods/notifications as opaque buffered events, never parsed into domain facts.",
+  "provenance": {
+    "cliVersion": "1.4.23",
+    "schemaSource": "muse schema generate-json-schema (stable, captured 2026-11-17)",
+    "generatedFromLiveCli": true,
+    "liveHandshakeVerified": "initialize/initialized/session-start/turn-start/turn-completed/tokenUsage/contextUsage on 1.4.23 (echo); approval/request + userInput/request + decide/answer not exercised",
+    "observedUserAgent": "muse-build/1.4.23 (serve; linux-x86_64)"
+  },
+  "envelope": {
+    "transport": "JSONL over stdio (one JSON-RPC 2.0 frame per line, UTF-8, LF terminated)",
+    "frameCapBytes": 8388608,
+    "id": "client request ids are numbers or strings; server-initiated request ids correlate with approvalId/userInputId in params",
+    "request": { "id": "number|string", "method": "string", "params": "object" },
+    "response": { "id": "number|string", "result": "any", "error": "absent" },
+    "errorResponse": { "id": "number|string|null", "error": { "code": "integer", "message": "string" } },
+    "serverRequest": { "id": "number|string", "method": "approval/request|userInput/request", "params": "object" },
+    "serverRequestReceipt": { "result": "RequestReceipt {} (presentation only, SS5.3.3 — the decision travels as a separate command)" },
+    "notification": { "method": "string", "params": "object", "id": "absent" }
+  },
+  "clientMethods": {
+    "initialize": {
+      "params": {
+        "clientInfo": { "name": "MACHINE IDENTIFIER (hyphens rejected; live: 'central' ok)", "title": "string", "version": "string" },
+        "capabilities": "ClientCapabilities (absent means all defaults)"
+      },
+      "afterResult": "notify `initialized` {} — the host serves nothing before it (live: session/start fails `notInitialized` without it)",
+      "result": {
+        "serverInfo": "string",
+        "userAgent": "string (contains CLI version; expect 1.4.20)",
+        "schema": "envelope schema version (expect SS1.4.1)",
+        "grantedCapabilities": "array (fixed for the connection lifetime)",
+        "sessionDurability": "object",
+        "sandboxAvailability": "object (absent means unknown — probe, never invent)"
+      },
+      "source": "offline schema: InitializeParams (clientInfo required) / InitializeResult"
+    },
+    "session/start": {
+      "params": {
+        "commandId": "string (UUIDv7, REQUIRED — the server never mints one; de-duplicated retry returns the same result)",
+        "modelId": "string (verbatim, never silently substituted; null accepted by echo)",
+        "approvalMode": "allowAll|promptUnmatched|onRequest|denyUnmatched (select, never create; live: onRequest accepted, echoed back as {mode, source} object)",
+        "permissionProfile": "string",
+        "config": "only the mcpServers member is admitted",
+        "clear": "boolean",
+        "workspaceRoot": "string (REQUIRED in practice — composes the workspace; a turn whose roots were never composed is rejected `workspace_not_composed`; live: '/tmp' ok)"
+      },
+      "result": {
+        "session": "Session object (carries the server session id)",
+        "viewCursor": "string (subscribe from here; every later view event arrives after this cursor)"
+      },
+      "source": "offline schema: SessionStartParams / SessionStartResult (tdd SS2.5.1)"
+    },
+    "session/resume": {
+      "params": { "sessionId": "string" },
+      "result": { "session": "Session object", "history": "renderable history" },
+      "source": "offline schema: SessionResumeParams/Result (SS2.5.2); reconcile evidence, best-effort"
+    },
+    "turn/start": {
+      "params": {
+        "sessionId": "string",
+        "commandId": "string (UUIDv7 idempotency handle; the turnId derives from it — always take turnId from the ack)",
+        "input": "non-empty ordered content parts",
+        "ifBusy": "queue (wire default) | steer | replace",
+        "reasoningEffort": "none|minimal|low|medium|high|xhigh|max|ultra (per-turn override of the session default)",
+        "displayText": "string (transcript presentation only, never model-visible)",
+        "workspaceRoots": "array (equivalent of the gateway working directory)",
+        "userShell": "queued ! shell form"
+      },
+      "result": {
+        "commandId": "echo of the client id",
+        "disposition": "what happened to the input (authoritative)",
+        "startedNewTurn": "boolean shorthand for disposition == started",
+        "status": "admission status",
+        "turnId": "string (authoritative turn handle)"
+      },
+      "source": "offline schema: TurnStartParams / TurnStartResult (tdd SS3.2)"
+    },
+    "turn/cancel": {
+      "params": { "sessionId": "string", "turnId": "string" },
+      "result": { "cancelled": "boolean" },
+      "source": "offline schema: normal command lane (SS3.5); priority lane is turn/interrupt"
+    },
+    "approval/decide": {
+      "params": {
+        "sessionId": "string",
+        "commandId": "string (UUIDv7 idempotency handle)",
+        "approvalId": "string",
+        "choiceId": "string (one of the current availableChoices, else -32052)",
+        "requirementId": "must equal currentRequirementId — the multi-stage race guard (stale is -32053)",
+        "feedback": "string|null (live steer only, never persisted)"
+      },
+      "result": "ack (the terminal arrives as approval/resolved)",
+      "source": "offline schema: ApprovalDecideParams (tdd SS5.4); standard SS3 command — durable intake before ack, value-identical replay"
+    },
+    "userInput/answer": {
+      "params": {
+        "sessionId": "string",
+        "commandId": "string (UUIDv7 idempotency handle)",
+        "userInputId": "string",
+        "answers": "one entry per question: selectedLabel | selectedLabels (within min/max) | freeText (<=500 chars), plus optional note (<=500)"
+      },
+      "result": "ack (the terminal arrives as userInput/settled)",
+      "source": "offline schema: UserInputAnswerParams (tdd SS5.10.2); non-matching answers fail -32057"
+    },
+    "approval/listPending": {
+      "params": { "sessionId": "string" },
+      "result": "full pending approval and user-input payloads",
+      "source": "offline schema: lease-free fold read (SS5.7); reconcile evidence"
+    }
+  },
+  "serverRequests": {
+    "approval/request": {
+      "params": {
+        "approvalId": "string (== itemId)",
+        "sessionId": "string",
+        "itemId": "string",
+        "subject": "{kind: shell, command} (what is being approved)",
+        "rawArgs": "stringified command JSON",
+        "availableChoices": "[{choiceId, decision, label, scope}] — live: allow_once/approved/once, allow_local_prefix/approvedPolicyAmendment/localPersistent, abort/abort/once",
+        "currentRequirementId": "OBJECT {approvalId, sourceIndex} — travel VERBATIM in decide, never as a string"
+      },
+      "response": "RequestReceipt {} ONLY — presentation ack (SS5.3.3). The decision travels as approval/decide.",
+      "decide": "approval/decide {sessionId, commandId UUIDv7, approvalId, choiceId, requirementId (verbatim object), feedback?} — live-verified: abort + feedback accepted, turn cancelled, agent told",
+      "source": "live 1.4.23 (shell approval under approvalMode promptUnmatched; Receipt then decide)"
+    },
+    "userInput/request": {
+      "params": "UserInputRequestParams (userInputId, questions[{id, header, question, isSecret, options}])",
+      "response": "RequestReceipt {} ONLY — presentation ack (SS5.3.3). The answer travels as userInput/answer.",
+      "source": "offline schema; NOT live-exercised"
+    }
+  },
+  "serverNotifications": {
+    "turn/started": { "params": { "sessionId": "string", "turnId": "string" } },
+    "turn/completed": {
+      "params": { "turnId": "string", "terminal": "completed|failed|cancelled", "usage": "object", "error": "object|null" },
+      "note": "The turn terminal. Usage here is incidental: the usage SOURCE is session/tokenUsage + session/contextUsage."
+    },
+    "session/tokenUsage": {
+      "params": { "sessionId": "string", "turnId": "string", "usage": "TokenUsage raw counters", "cumulative": "counted-once derivations", "totalTokens": "integer" },
+      "note": "The usage source (evidence-only, never ledger). `usage`/`cumulative`/`totalTokens` are SIBLINGS — not nested (live shape). Raw counters are verbatim provider facts, not summable across providers."
+    },
+    "session/contextUsage": {
+      "params": { "sessionId": "string", "windowTokens": "integer", "usedTokens": "integer", "pressure": "level" },
+      "note": "Context-occupancy fact; the member is null until a tracked anchor exists (absent is never fabricated)."
+    },
+    "approval/requested": { "params": "ApprovalRequestParams (durable Requested fold, SS5.5.1)" },
+    "approval/updated": { "params": "non-terminal approval change to the pending view" },
+    "approval/resolved": { "params": "first durable approval terminal; protected delivery" },
+    "userInput/requested": { "params": "UserInputRequestParams (durable Requested fold, SS5.10.1)" },
+    "userInput/settled": { "params": "first durable user-input settlement; protected delivery" }
+  },
+  "toleratedOpaque": {
+    "note": "Every other method/notification (computerUse*, goal/*, model/*, plugin/*, recap/*, session/*Changed, skill/*, subagent/*, task/*, view/*, workflow/*, monitor/*) is buffered opaquely, never a domain fact.",
+    "reconcileReads": "session/read, session/list, view/page, view/subscribe, approval/listPending stay best-effort evidence reads"
+  }
+}

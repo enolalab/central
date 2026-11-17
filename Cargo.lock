@@ -448,6 +448,7 @@ dependencies = [
  "central-infrastructure",
  "duckdb",
  "fs2",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2",

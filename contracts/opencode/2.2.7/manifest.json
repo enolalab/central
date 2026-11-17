@@ -1,0 +1,24 @@
+{
+  "name": "central-opencode-adapter",
+  "cliVersion": "2.2.7",
+  "cliVersionAllowlist": ["2.2.7"],
+  "transport": "per-session `opencode serve` on loopback (HTTP REST + JSON polling)",
+  "bodyCapNote": "Measured 2026-11-17 across live turns: largest single REST body ~5 KB (interrupted story message list). Same 8 MiB ceiling posture as the stdio gateways: oversize/unparseable bodies fail the poll as reconcile-required, never partial facts.",
+  "frameCapBytes": 8388608,
+  "notificationBufferCapacity": 256,
+  "allowProviderModelFallback": false,
+  "schemaProvenance": {
+    "generatedFromLiveCli": true,
+    "reason": "REST surface read from the live server's own OpenAPI (`GET /openapi.json`, 139 paths on 2.2.7) and exercised live on 2026-11-17: session.create -> prompt -> assistant message with tokens, permission list (empty: default rules auto-approved), Basic auth capture. The permission request+reply cycle is schema-captured but NOT live-denied (nothing asked).",
+    "schemaSource": "opencode serve 2.2.7 /openapi.json (captured 2026-11-17, kept outside the repo)",
+    "liveHandshakeVerified": "2.2.7: Basic auth, session.create/prompt/message/permission list + permission reply reject (edit ask-rule lab: reject lands, request resolves, model re-asks); interrupt schema-only",
+    "observedUserAgent": "opencode/latest/2.2.7/cli"
+  },
+  "policies": {
+    "timeoutAfterWrite": "OutcomeUnknown, never resend prompt",
+    "oversizeFrame": "close transport, require reconciliation, never parse partial event",
+    "secretHandling": "logs and request errors redact token/secret/authorization material; the server password lives only in the child environment, never logged or persisted",
+    "modelMismatch": "requested/observed model mismatch is a capability error, never silent fallback",
+    "usageSource": "usage is harvested from completed assistant message tokens (input/output/reasoning/cache), evidence-only, never ledgered"
+  }
+}

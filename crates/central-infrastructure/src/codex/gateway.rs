@@ -755,6 +755,7 @@ impl AgentGateway for CodexGateway {
             program: self.config.binary.clone(),
             args: self.config.app_server_args.clone(),
             working_dir: None,
+            env: Vec::new(),
         };
         // Prefer owned pipes: the session is correlation-bound to the
         // process from birth either way, but only the piped attach can

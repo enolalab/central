@@ -704,6 +704,7 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
         clock: std::sync::Arc::new(central_server::bootstrap::SystemClock),
         ids: std::sync::Arc::new(central_server::bootstrap::UuidIds),
         agent: std::sync::Arc::new(central_server::bootstrap::UnavailableGateway),
+        providers: Vec::new(),
         sync_intake: std::sync::Arc::new(NoSync),
         artifact_root: artifact_root.clone(),
         artifacts: std::sync::Arc::new(
@@ -924,6 +925,7 @@ async fn history_reads_use_bounded_store_fetches() {
         clock: std::sync::Arc::new(central_server::bootstrap::SystemClock),
         ids: std::sync::Arc::new(central_server::bootstrap::UuidIds),
         agent: std::sync::Arc::new(central_server::bootstrap::UnavailableGateway),
+        providers: Vec::new(),
         sync_intake: std::sync::Arc::new(NoSync),
         artifact_root: artifact_root.clone(),
         artifacts: std::sync::Arc::new(

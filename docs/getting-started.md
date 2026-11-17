@@ -42,6 +42,49 @@ selected mode with `scripts/test-windows-codex-preflight.ps1` and
 `scripts/test-codex-sandbox-policy.mjs` before enabling live work. See
 [Windows sandbox](https://learn.chatgpt.com/docs/windows/windows-sandbox).
 
+## Muse
+
+Configure the owner-controlled `muse.json` in the Central state directory
+with an allowlisted Muse binary, CLI version, and surveyed models.
+Only surveyed models are advertised — an empty list advertises none,
+so every profile resolves to `ModelUnavailable` until a smoke proves one.
+
+```json
+{"binary":"muse","cli_version":"1.4.23","surveyed_models":["muse-spark-1.3"]}
+```
+
+Surveyed means turn-proven: `muse-spark-1.3` ran a live turn through the
+gateway (session/start → turn/start → completed). The catalog default
+`muse-wonder-1.0` is listed by `model/list` but has not run a turn yet —
+add it only after it proves itself the same way.
+
+The daemon routes by `profile.provider`: a `muse` attempt only touches
+the Muse session host (`muse serve`), never the Codex process. The same
+holds for opencode below.
+
+## opencode
+
+Configure the owner-controlled `opencode.json` in the Central state directory
+with an allowlisted opencode binary, CLI version, and surveyed models.
+
+```json
+{"binary":"opencode","cli_version":"2.2.7","surveyed_models":["hy4-flash-free"]}
+```
+
+Surveyed means turn-proven: `hy4-flash-free` (the default model) ran live
+turns through the gateway, including a permission deny/re-ask cycle.
+
+Each `opencode` attempt owns one `opencode serve` child on loopback (free
+port, per-session secret in the child environment only). No SSE, no shared
+server. `GET /v1/meta` lists the configured providers. The turn flow and
+permission list are live-verified on 2.2.7; the permission reply/reject
+cycle is schema-captured (see `contracts/opencode/2.2.7/`): treat first
+live replies as probes.
+`GET /v1/meta` lists the configured providers. The MSP turn flow is
+live-verified on 1.4.23 (echo provider); only the approval decide/answer
+cycle is schema-captured (see `contracts/muse/1.4.23/`): treat first
+live approvals as probes.
+
 ## First run (five minutes)
 
 ```powershell

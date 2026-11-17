@@ -39,6 +39,7 @@ fn sleeper_spec() -> ProcessSpec {
             "Start-Sleep -Seconds 120".to_string(),
         ],
         working_dir: None,
+        env: Vec::new(),
     }
 }
 
@@ -48,6 +49,7 @@ fn sleeper_spec() -> ProcessSpec {
         program: "sh".to_string(),
         args: vec!["-c".to_string(), "sleep 120".to_string()],
         working_dir: None,
+        env: Vec::new(),
     }
 }
 
@@ -199,6 +201,7 @@ async fn missing_binary_fails_without_side_effects() {
         program: "central-definitely-missing-binary-xyz.exe".to_string(),
         args: vec![],
         working_dir: None,
+        env: Vec::new(),
     };
     match supervisor.spawn(&spec).await {
         Err(AppError::Transport(_)) => {}
@@ -222,6 +225,7 @@ async fn piped_spawn_echoes_and_kills_by_handle() {
             program: "sh".to_string(),
             args: vec!["-c".to_string(), "cat".to_string()],
             working_dir: None,
+            env: Vec::new(),
         })
         .await
         .expect("piped spawn");

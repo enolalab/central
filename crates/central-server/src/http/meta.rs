@@ -32,6 +32,7 @@ pub async fn get_meta(
         "capabilities": {
             "fake_agent": state.fake_agent_enabled,
             "profiles": profiles.len(),
+            "providers": state.providers,
             "streaming": true,
             "pagination": {"default_limit": 100, "max_limit": 500},
         },

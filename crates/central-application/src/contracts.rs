@@ -307,6 +307,11 @@ pub struct ProcessSpec {
     pub program: String,
     pub args: Vec<String>,
     pub working_dir: Option<String>,
+    /// Extra environment for the child, applied on top of the daemon's own.
+    /// Used for per-session harness secrets (e.g. the opencode server
+    /// password); never logged, never persisted.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

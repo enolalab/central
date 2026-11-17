@@ -3,6 +3,7 @@
 //! file lock is acquired before the database is opened, and recovery
 //! runs (with zero external sends) before the listener accepts work.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -15,6 +16,8 @@ use central_application::ports::{AgentGateway, Clock, IdSource};
 use central_domain::{
     Actor, ActorId, CommandId, IntentId, Observation, ResolvedProfile, RunId, Timestamp,
 };
+use central_infrastructure::muse::{MuseConfig, MuseGateway};
+use central_infrastructure::opencode::{OpencodeConfig, OpencodeGateway};
 use central_infrastructure::process::{DaemonError, OwnerLock};
 use central_infrastructure::storage::DuckDbStore;
 use tokio::sync::oneshot;
@@ -28,55 +31,115 @@ pub struct DaemonConfig {
     pub fake_agent: bool,
 }
 
-/// Owner-configured Codex harness (`codex.json` in the state directory,
-/// written by the owner — never fetched from the network):
-/// `{ "binary": "codex", "cli_version": "0.167.0-alpha.3.2",
-///    "surveyed_models": ["gpt-6-luna"], "windows_sandbox": "elevated" }`.
-/// Every field is validated before the gateway is built: the binary
-/// must resolve on `PATH`, the CLI version must pass the allowlist,
-/// and provider model fallback stays off. Anything missing or invalid
-/// keeps the `UnavailableGateway` — dispatch then defers with a
-/// capability error instead of serving fake output.
-fn select_gateway(state_dir: &Path) -> (Arc<dyn AgentGateway>, &'static str) {
-    let path = state_dir.join("codex.json");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(_) => {
-            return (
-                Arc::new(UnavailableGateway),
-                "no codex.json: no agent gateway configured",
-            )
+/// Owner-configured harnesses in the state directory, written by the owner
+/// and never fetched from the network:
+/// - Codex: `codex.json` (`{ "binary": "codex", "cli_version":
+///   "0.167.0-alpha.3.2", "surveyed_models": ["gpt-6-luna"],
+///   "windows_sandbox": "elevated" }`).
+/// - Muse: `muse.json` (`{ "binary": "muse", "cli_version": "1.4.23",
+///   "surveyed_models": [...], "serve_args": ["serve"] }`).
+/// - opencode: `opencode.json` (`{ "binary": "opencode", "cli_version":
+///   "2.2.7", "surveyed_models": [...] }`).
+///
+/// Every field is validated before the gateway is built: the binary must
+/// resolve on `PATH`, the CLI version must pass the allowlist, and
+/// provider model fallback stays off. Anything missing or invalid drops
+/// that provider; with no provider configured the daemon keeps the
+/// `UnavailableGateway` — dispatch then defers with a capability error
+/// instead of serving fake output.
+type BackendList = Vec<(String, Arc<dyn AgentGateway>)>;
+
+fn configured_backends(state_dir: &Path) -> (BackendList, Vec<String>) {
+    let mut backends = Vec::new();
+    let mut notes = Vec::new();
+    match load_codex_gateway(state_dir) {
+        Some(gateway) => {
+            backends.push(("codex".to_string(), gateway));
+            notes.push("codex gateway configured".to_string());
         }
-    };
-    let value: serde_json::Value = match serde_json::from_str(&text) {
-        Ok(value) => value,
-        Err(_) => {
-            return (
-                Arc::new(UnavailableGateway),
-                "codex.json is not valid JSON: ignoring harness config",
-            )
-        }
-    };
-    let binary = value["binary"].as_str().unwrap_or("codex");
-    if find_on_path(binary).is_none() {
-        return (
-            Arc::new(UnavailableGateway),
-            "codex binary not found on PATH: ignoring harness config",
-        );
+        None => notes.push(codex_config_note(state_dir)),
     }
+    match load_muse_gateway(state_dir) {
+        Some(gateway) => {
+            backends.push(("muse".to_string(), gateway));
+            notes.push("muse gateway configured".to_string());
+        }
+        None => notes.push(muse_config_note(state_dir)),
+    }
+    match load_opencode_gateway(state_dir) {
+        Some(gateway) => {
+            backends.push(("opencode".to_string(), gateway));
+            notes.push("opencode gateway configured".to_string());
+        }
+        None => notes.push(opencode_config_note(state_dir)),
+    }
+    (backends, notes)
+}
+
+fn codex_config_note(state_dir: &Path) -> String {
+    let path = state_dir.join("codex.json");
+    if std::fs::read_to_string(&path).is_err() {
+        return "no codex.json: codex provider not configured".to_string();
+    }
+    "codex.json invalid (bad JSON, binary not on PATH, version not allowlisted, or bad windows_sandbox): ignoring codex config".to_string()
+}
+
+fn muse_config_note(state_dir: &Path) -> String {
+    let path = state_dir.join("muse.json");
+    if std::fs::read_to_string(&path).is_err() {
+        return "no muse.json: muse provider not configured".to_string();
+    }
+    "muse.json invalid (bad JSON, binary not on PATH, version not allowlisted, or bad serve_args): ignoring muse config".to_string()
+}
+
+fn opencode_config_note(state_dir: &Path) -> String {
+    let path = state_dir.join("opencode.json");
+    if std::fs::read_to_string(&path).is_err() {
+        return "no opencode.json: opencode provider not configured".to_string();
+    }
+    "opencode.json invalid (bad JSON, binary not on PATH, or version not allowlisted): ignoring opencode config".to_string()
+}
+
+fn load_opencode_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
+    let text = std::fs::read_to_string(state_dir.join("opencode.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let binary = value["binary"].as_str().unwrap_or("opencode");
+    find_on_path(binary)?;
     let cli_version = value["cli_version"]
         .as_str()
-        .unwrap_or(central_infrastructure::codex::SUPPORTED_CLI_VERSION);
-    let version_ok = central_infrastructure::codex::parse_cli_version(cli_version)
-        .map(|parsed| central_infrastructure::codex::check_supported_version(&parsed).is_ok())
+        .unwrap_or(central_infrastructure::opencode::SUPPORTED_CLI_VERSION);
+    let version_ok = central_infrastructure::opencode::parse_cli_version(cli_version)
+        .map(|parsed| central_infrastructure::opencode::check_supported_version(&parsed).is_ok())
         .unwrap_or(false);
     if !version_ok {
-        return (
-            Arc::new(UnavailableGateway),
-            "codex CLI version not allowlisted: ignoring harness config",
-        );
+        return None;
     }
-    let surveyed: Vec<String> = value["surveyed_models"]
+    let extra_args: Vec<String> = value["extra_args"]
+        .as_array()
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let config = OpencodeConfig {
+        binary: binary.to_string(),
+        cli_version: cli_version.to_string(),
+        surveyed_models: surveyed_models(&value),
+        extra_args,
+        ..OpencodeConfig::default()
+    };
+    let supervisor = Arc::new(central_infrastructure::process::OwnedProcessSupervisor::new());
+    let gateway = OpencodeGateway::new(
+        supervisor.clone() as Arc<dyn central_application::ports::ProcessSupervisor>,
+        config,
+    )
+    .with_piped(supervisor as Arc<dyn central_infrastructure::process::PipedSpawner>);
+    Some(Arc::new(gateway))
+}
+
+fn surveyed_models(value: &serde_json::Value) -> Vec<String> {
+    value["surveyed_models"]
         .as_array()
         .map(|models| {
             models
@@ -84,20 +147,28 @@ fn select_gateway(state_dir: &Path) -> (Arc<dyn AgentGateway>, &'static str) {
                 .filter_map(|model| model.as_str().map(|model| model.to_string()))
                 .collect()
         })
-        .unwrap_or_default();
-    let app_server_args = match codex_server_args(value.get("windows_sandbox")) {
-        Ok(args) => args,
-        Err(()) => {
-            return (
-                Arc::new(UnavailableGateway),
-                "invalid windows_sandbox in codex.json: ignoring harness config",
-            )
-        }
-    };
+        .unwrap_or_default()
+}
+
+fn load_codex_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
+    let text = std::fs::read_to_string(state_dir.join("codex.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let binary = value["binary"].as_str().unwrap_or("codex");
+    find_on_path(binary)?;
+    let cli_version = value["cli_version"]
+        .as_str()
+        .unwrap_or(central_infrastructure::codex::SUPPORTED_CLI_VERSION);
+    let version_ok = central_infrastructure::codex::parse_cli_version(cli_version)
+        .map(|parsed| central_infrastructure::codex::check_supported_version(&parsed).is_ok())
+        .unwrap_or(false);
+    if !version_ok {
+        return None;
+    }
+    let app_server_args = codex_server_args(value.get("windows_sandbox")).ok()?;
     let config = central_infrastructure::codex::CodexConfig {
         binary: binary.to_string(),
         cli_version: cli_version.to_string(),
-        surveyed_models: surveyed,
+        surveyed_models: surveyed_models(&value),
         app_server_args,
         ..central_infrastructure::codex::CodexConfig::default()
     };
@@ -110,7 +181,200 @@ fn select_gateway(state_dir: &Path) -> (Arc<dyn AgentGateway>, &'static str) {
         config,
     )
     .with_piped(supervisor as Arc<dyn central_infrastructure::process::PipedSpawner>);
-    (Arc::new(gateway), "codex gateway configured")
+    Some(Arc::new(gateway))
+}
+
+fn load_muse_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
+    let text = std::fs::read_to_string(state_dir.join("muse.json")).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let binary = value["binary"].as_str().unwrap_or("muse");
+    find_on_path(binary)?;
+    let cli_version = value["cli_version"]
+        .as_str()
+        .unwrap_or(central_infrastructure::muse::SUPPORTED_CLI_VERSION);
+    let version_ok = central_infrastructure::muse::parse_cli_version(cli_version)
+        .map(|parsed| central_infrastructure::muse::check_supported_version(&parsed).is_ok())
+        .unwrap_or(false);
+    if !version_ok {
+        return None;
+    }
+    let serve_args = match value.get("serve_args") {
+        None => vec!["serve".to_string()],
+        Some(array) => {
+            let args: Vec<String> = array
+                .as_array()?
+                .iter()
+                .map(|arg| arg.as_str().map(str::to_string))
+                .collect::<Option<Vec<_>>>()?;
+            if args.is_empty() {
+                return None;
+            }
+            args
+        }
+    };
+    let config = MuseConfig {
+        binary: binary.to_string(),
+        cli_version: cli_version.to_string(),
+        surveyed_models: surveyed_models(&value),
+        serve_args,
+        ..MuseConfig::default()
+    };
+    let supervisor = Arc::new(central_infrastructure::process::OwnedProcessSupervisor::new());
+    let gateway = MuseGateway::new(
+        supervisor.clone() as Arc<dyn central_application::ports::ProcessSupervisor>,
+        config,
+    )
+    .with_piped(supervisor as Arc<dyn central_infrastructure::process::PipedSpawner>);
+    Some(Arc::new(gateway))
+}
+
+/// Fan-out over the configured harness backends. Every method routes on
+/// the provider the caller names (`profile.provider` for capabilities/open,
+/// the session/key provider otherwise) BEFORE any profile resolution, so a
+/// `muse` attempt never touches the Codex process and vice versa. An
+/// unconfigured or unknown provider fails closed as a capability error —
+/// never fake output, never a cross-harness send.
+pub struct RouterGateway {
+    backends: HashMap<String, Arc<dyn AgentGateway>>,
+}
+
+impl RouterGateway {
+    pub fn new() -> Self {
+        Self {
+            backends: HashMap::new(),
+        }
+    }
+
+    pub fn insert(&mut self, provider: &str, gateway: Arc<dyn AgentGateway>) {
+        self.backends.insert(provider.to_string(), gateway);
+    }
+
+    /// Configured providers, sorted. Published on `GET /v1/meta`.
+    pub fn providers(&self) -> Vec<String> {
+        let mut providers: Vec<String> = self.backends.keys().cloned().collect();
+        providers.sort();
+        providers
+    }
+
+    fn route(&self, provider: &str) -> Result<Arc<dyn AgentGateway>, AppError> {
+        self.backends.get(provider).cloned().ok_or_else(|| {
+            let mut configured = self.providers();
+            if configured.is_empty() {
+                configured.push("(none)".to_string());
+            }
+            AppError::Capability(format!(
+                "provider '{provider}' is not configured in this daemon (configured: [{}]); \
+                 add the harness config to the state directory and restart",
+                configured.join(", "),
+            ))
+        })
+    }
+}
+
+impl Default for RouterGateway {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AgentGateway for RouterGateway {
+    async fn capabilities(
+        &self,
+        profile: &central_domain::ResolvedProfile,
+    ) -> Result<central_application::contracts::Capabilities, AppError> {
+        self.route(&profile.provider)?.capabilities(profile).await
+    }
+
+    async fn open(
+        &self,
+        request: central_application::contracts::OpenSession,
+    ) -> Result<central_application::contracts::SessionRef, AppError> {
+        self.route(&request.profile.provider)?.open(request).await
+    }
+
+    async fn send(
+        &self,
+        request: central_application::contracts::SendTurn,
+    ) -> Result<
+        central_application::contracts::TurnRef,
+        central_application::contracts::DispatchError,
+    > {
+        self.route(&request.session.provider)
+            .map_err(|error| DispatchError::Rejected(error.to_string()))?
+            .send(request)
+            .await
+    }
+
+    async fn observe(
+        &self,
+        session: &central_application::contracts::SessionRef,
+    ) -> Result<Vec<central_domain::Observation>, AppError> {
+        self.route(&session.provider)?.observe(session).await
+    }
+
+    async fn answer(
+        &self,
+        answer: central_application::contracts::ExternalAnswer,
+    ) -> Result<(), central_application::contracts::DispatchError> {
+        self.route(&answer.key.session.provider)
+            .map_err(|error| DispatchError::Rejected(error.to_string()))?
+            .answer(answer)
+            .await
+    }
+
+    async fn cancel(
+        &self,
+        target: &central_application::contracts::ExecutionRef,
+    ) -> Result<central_application::contracts::CancelObservation, AppError> {
+        self.route(&target.session.provider)?.cancel(target).await
+    }
+
+    async fn reconcile(
+        &self,
+        target: &central_application::contracts::ExecutionRef,
+    ) -> Result<central_application::contracts::ReconcileEvidence, AppError> {
+        self.route(&target.session.provider)?
+            .reconcile(target)
+            .await
+    }
+
+    async fn drain_requests(
+        &self,
+        session: &central_application::contracts::SessionRef,
+    ) -> Result<Vec<central_application::contracts::ExternalRequest>, AppError> {
+        self.route(&session.provider)?.drain_requests(session).await
+    }
+}
+
+/// Build the daemon's agent from the owner-configured backends. One
+/// backend serves directly (today's single-harness behavior); several
+/// fan out through the [`RouterGateway`]; none keeps the
+/// [`UnavailableGateway`]. Returns the agent plus the sorted provider
+/// list published on `GET /v1/meta`.
+fn build_agent(state_dir: &Path) -> (Arc<dyn AgentGateway>, Vec<String>) {
+    let (backends, notes) = configured_backends(state_dir);
+    for note in &notes {
+        eprintln!("central-server: gateway: {note}");
+    }
+    let mut providers: Vec<String> = backends.iter().map(|(p, _)| p.clone()).collect();
+    providers.sort();
+    let agent: Arc<dyn AgentGateway> = if backends.is_empty() {
+        Arc::new(UnavailableGateway)
+    } else if backends.len() == 1 {
+        backends
+            .into_iter()
+            .next()
+            .map(|(_, gateway)| gateway)
+            .expect("one backend")
+    } else {
+        let mut router = RouterGateway::new();
+        for (provider, gateway) in backends {
+            router.insert(&provider, gateway);
+        }
+        Arc::new(router)
+    };
+    (agent, providers)
 }
 
 /// An optional, explicit per-daemon override; never substitute a weaker
@@ -153,6 +417,97 @@ mod codex_sandbox_config_tests {
         ] {
             assert!(codex_server_args(Some(&invalid)).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod router_tests {
+    use super::RouterGateway;
+    use central_application::contracts::SessionRef;
+    use central_application::ports::AgentGateway;
+    use central_domain::{ContentHash, ProfileId, ResolvedProfile};
+
+    fn profile_for(provider: &str) -> ResolvedProfile {
+        ResolvedProfile {
+            id: ProfileId::from_u128(7),
+            provider: provider.to_string(),
+            model: "model-under-test".to_string(),
+            effort: "low".to_string(),
+            skills: vec![],
+            subagents: vec![],
+            permissions: vec![],
+            fallbacks: vec![],
+            hash: ContentHash::from_hex("e".repeat(64)),
+        }
+    }
+
+    fn session_for(provider: &str, epoch: &str) -> SessionRef {
+        SessionRef {
+            provider: provider.to_string(),
+            instance_epoch: epoch.to_string(),
+            thread_id: "thread-under-test".to_string(),
+        }
+    }
+
+    #[test]
+    fn providers_are_sorted_and_empty_router_fails_closed() {
+        let empty = RouterGateway::new();
+        assert!(empty.providers().is_empty());
+        let error = match empty.route("muse") {
+            Ok(_) => panic!("empty router must fail closed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("(none)"));
+
+        let mut router = RouterGateway::new();
+        router.insert("muse", std::sync::Arc::new(super::UnavailableGateway));
+        router.insert("codex", std::sync::Arc::new(super::UnavailableGateway));
+        assert_eq!(router.providers(), vec!["codex", "muse"]);
+        let error = match router.route("opencode") {
+            Ok(_) => panic!("unknown provider must fail closed"),
+            Err(error) => error,
+        };
+        let message = error.to_string();
+        assert!(message.contains("opencode"), "{message}");
+        assert!(
+            message.contains("codex") && message.contains("muse"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_route_by_profile_provider() {
+        let mut router = RouterGateway::new();
+        router.insert("muse", std::sync::Arc::new(super::UnavailableGateway));
+        // A muse profile reaches the muse backend (here the closed
+        // UnavailableGateway), never a cross-harness send.
+        let error = router
+            .capabilities(&profile_for("muse"))
+            .await
+            .expect_err("unavailable backend reports capability");
+        assert!(matches!(
+            error,
+            central_application::contracts::AppError::Capability(_)
+        ));
+        // An unconfigured provider fails before touching any backend.
+        let error = router
+            .capabilities(&profile_for("opencode"))
+            .await
+            .expect_err("opencode is not configured");
+        assert!(error.to_string().contains("opencode"));
+    }
+
+    #[tokio::test]
+    async fn observe_routes_by_session_provider() {
+        let mut router = RouterGateway::new();
+        router.insert("codex", std::sync::Arc::new(super::UnavailableGateway));
+        let error = router
+            .observe(&session_for("muse", "epoch-1"))
+            .await
+            .expect_err("muse is not configured");
+        let message = error.to_string();
+        assert!(message.contains("muse"), "{message}");
+        assert!(message.contains("codex"), "{message}");
     }
 }
 
@@ -507,32 +862,38 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
     let ids: Arc<dyn IdSource> = Arc::new(UuidIds);
 
     #[cfg(feature = "test-support")]
-    let (agent, fake_counts): (Arc<dyn AgentGateway>, Option<crate::http::FakeCounts>) =
-        if config.fake_agent {
-            let fake = Arc::new(crate::fake_agent::FakeAgent::new());
-            let counter = fake.clone();
-            (
-                fake as Arc<dyn AgentGateway>,
-                Some(
-                    Arc::new(move || (counter.send_count(), counter.cancel_count()))
-                        as crate::http::FakeCounts,
-                ),
-            )
-        } else {
-            // P4 step 8: the owner-configured Codex gateway when
-            // `codex.json` validates, else the capability-closed
-            // gateway that defers instead of faking.
-            let (gateway, note) = select_gateway(&config.state_dir);
-            eprintln!("central-server: gateway: {note}");
-            (gateway, None)
-        };
+    let (agent, providers, fake_counts): (
+        Arc<dyn AgentGateway>,
+        Vec<String>,
+        Option<crate::http::FakeCounts>,
+    ) = if config.fake_agent {
+        let fake = Arc::new(crate::fake_agent::FakeAgent::new());
+        let counter = fake.clone();
+        (
+            fake as Arc<dyn AgentGateway>,
+            vec!["fake".to_string()],
+            Some(
+                Arc::new(move || (counter.send_count(), counter.cancel_count()))
+                    as crate::http::FakeCounts,
+            ),
+        )
+    } else {
+        // Owner-configured harness backends (`codex.json` / `muse.json`
+        // when each validates), else the capability-closed gateway that
+        // defers instead of faking.
+        let (gateway, providers) = build_agent(&config.state_dir);
+        (gateway, providers, None)
+    };
     #[cfg(not(feature = "test-support"))]
-    let (agent, fake_counts): (Arc<dyn AgentGateway>, Option<crate::http::FakeCounts>) = {
+    let (agent, providers, fake_counts): (
+        Arc<dyn AgentGateway>,
+        Vec<String>,
+        Option<crate::http::FakeCounts>,
+    ) = {
         // Release builds never serve the fake agent; the real gateway
-        // still needs the owner's explicit `codex.json`.
-        let (gateway, note) = select_gateway(&config.state_dir);
-        eprintln!("central-server: gateway: {note}");
-        (gateway, None)
+        // still needs the owner's explicit harness config.
+        let (gateway, providers) = build_agent(&config.state_dir);
+        (gateway, providers, None)
     };
 
     // (4) Startup recovery: park nonterminal runs, mark dispatching
@@ -593,6 +954,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
         clock,
         ids,
         agent,
+        providers,
         sync_intake: Arc::new(central_infrastructure::workspace::DaemonSyncIntake::new(
             config.state_dir.clone(),
         )),

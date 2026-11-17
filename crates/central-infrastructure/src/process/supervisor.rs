@@ -189,6 +189,9 @@ impl OwnedProcessSupervisor {
     > {
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
+        // Owner-configured per-session environment (harness secrets).
+        // Applied on top of the daemon environment, never logged.
+        command.envs(spec.env.iter().map(|(key, value)| (key, value)));
         if piped {
             // Owned pipes for RPC: the gateway consumes both ends, so a
             // full buffer can never park the child. Stderr stays null.
