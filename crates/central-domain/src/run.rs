@@ -55,8 +55,14 @@ pub enum AttemptStatus {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VerificationOutcome {
+    /// The wire contract (`contracts/verification-v1.schema.json`) spells
+    /// outcomes lowercase; stored events keep the PascalCase spelling, so
+    /// both deserialize while only the canonical form is ever written.
+    #[serde(alias = "pass")]
     Pass,
+    #[serde(alias = "fail")]
     Fail,
+    #[serde(alias = "blocked")]
     Blocked,
 }
 

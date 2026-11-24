@@ -990,6 +990,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
             state.actor.clone(),
             scan_config,
             scan_notify,
+            Arc::clone(&state.secrets),
             Some(Arc::clone(&state.workspace)
                 as Arc<
                     dyn central_application::ports::workspace::WorkspaceManager,

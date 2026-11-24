@@ -121,6 +121,7 @@ pub fn router(state: AppState) -> Router {
             post(results::post_results),
         )
         .route("/v1/runs/{id}/handover", post(results::post_handover))
+        .route("/v1/runs/{id}/verdicts", post(results::post_verdicts))
         .route("/v1/runs/{id}/usage", get(usage::get_usage))
         .route("/v1/runs/{id}/usage/resolve", post(usage::post_resolve))
         .route(

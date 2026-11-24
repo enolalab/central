@@ -1,0 +1,31 @@
+{
+  "name": "central-muse-adapter",
+  "cliVersion": "1.4.25",
+  "cliVersionAllowlist": [
+    "1.4.20",
+    "1.4.23",
+    "1.4.24",
+    "1.4.25"
+  ],
+  "schemaVersion": 1,
+  "experimental": false,
+  "transport": "stdio JSONL (JSON-RPC 2.0, one frame per line)",
+  "frameCapBytes": 8388608,
+  "frameCapNote": "Measured 2026-11-17 across live echo + meta turns: largest single frame ~2 KB (session objects with sourceRange). 8 MiB inherits the Codex cap: ~4000x headroom, close-on-oversize proven by unit test, never partial parse.",
+  "notificationBufferCapacity": 256,
+  "allowProviderModelFallback": false,
+  "schemaProvenance": {
+    "generatedFromLiveCli": true,
+    "reason": "Schema exported offline on 2026-11-23 from installed muse 1.4.25 (stable surface, schemaVersion 1; identical 75 methods / 47 notifications / 2 requests / 39 error codes as all prior captures, ApprovalCuaBrowser def still present). The serve handshake was then exercised LIVE on 1.4.25 via the echo provider: initialize (+initialized notify) -> session/start -> turn/start -> turn/completed with session/tokenUsage + session/contextUsage. Wire finding: the server answers -32600 to turn/start frames missing the JSON-RPC \"jsonrpc\" member (initialize/session-start tolerate it); Central now sends \"jsonrpc\":\"2.0\" on every client frame. Approval/userInput request+decide flows are schema-captured but NOT live-exercised (echo never asks).",
+    "schemaSource": "muse schema generate-json-schema (stable, captured 2026-11-23, kept outside the repo)",
+    "liveHandshakeVerified": "1.4.25, 2026-11-23: echo turn flow (initialize/initialized/session-start/turn-start/turn-completed/tokenUsage/contextUsage) with JSON-RPC jsonrpc member on every client frame; approval/request + userInput/request + decide/answer not exercised",
+    "observedUserAgent": "muse-build/1.4.25 (serve; linux-x86_64; build 277a7fe7b7a0138f86e86ee242b96cdde25dfe2b)"
+  },
+  "policies": {
+    "timeoutAfterWrite": "OutcomeUnknown, never resend turn/start",
+    "oversizeFrame": "close transport, require reconciliation, never parse partial event",
+    "secretHandling": "logs and request errors redact token/secret/authorization material; no tokens or env in durable outbox",
+    "modelMismatch": "requested/observed model mismatch is a capability error, never silent fallback",
+    "usageSource": "usage is harvested from session/tokenUsage (usage/cumulative/totalTokens siblings) and session/contextUsage notifications, not from turn/completed (which carries terminal status only)"
+  }
+}

@@ -21,11 +21,24 @@ session: cô lập theo process.
 
 ## 2. Vòng đời một turn
 
-`POST /api/session` {title} → `POST /session/{id}/prompt` {text} →
+`POST /api/session` {title, model: Model.Ref {providerID, id}} →
+`POST /session/{id}/prompt` {text} →
 poll `GET /session/{id}/message`: assistant message có `time.completed`
 là terminal (streaming có `completed: null`, không tính). Timeout sau write
-prompt = OutcomeUnknown, không resend. Model trong message (`model.id`)
-verify với profile — mismatch là capability error.
+prompt = OutcomeUnknown, không resend. **Model BẮT BUỘC đi theo session
+create** (verbatim từ profile, tách `provider/id` thành Model.Ref): session
+không model + prompt text-only được server nhận (200 + user msg id) nhưng
+turn không bao giờ completed — attempt kẹt Running với 0 observation
+(verified 21/11, fix trong `client.rs::create_session`; prompt giữ nguyên
+`{text}` đúng wire đã verify). Bare id không provider bị server 400
+(`Expected Model.Ref`). Session create echo lại model đã chọn — gateway
+verify echo fail-fast trước khi gửi prompt; message verify theo cặp
+(providerID, id) qua `check_model_ref_match` — mismatch là capability
+error. Alias free (`opencode/*-free`) được server resolve sang backend id
+(vd `gemini-4-neon`, `providerID: opencode`) và wire CHỈ báo backend, không
+echo alias — mọi turn alias đều rớt exact-match cho đến khi có quota thật
+kiểm chứng success-path. `finish: error` vẫn mang `time.completed` nên
+gateway ghi server error vào evidence thay vì success trống.
 
 Usage từ message tokens {input, output, reasoning, cache{read, write}} →
 note evidence-only, không vào ledger.
@@ -87,3 +100,21 @@ reply `reject` + message → request resolve, model re-ask request mới
 `{"interrupted":true}`, turn dừng. Surveyed: `hy4-flash-free` (default,
 turn-proven). REST body lớn nhất đo được ~5 KB; giữ trần 8MiB, poll lỗi
 → reconcile-required, không parse nửa vời.
+
+Lab 21/11 (xem validation 2026-11-21): model BẮT BUỘC đi theo session
+create (đã fix; lần đầu fix nhầm vào prompt — probe tay "thành công" là false
+positive vì trial quota chạy trên backend default). Alias free resolve sang
+backend `gemini-4-neon` trên wire; 402 `provider.quota` hết free trial sau 3
+probe direct thành công. Turn live thành công đầu tiên qua daemon: run
+`593afbed`, model local `ollama/qwen3:4b` (free, không quota), 7 observations
+match pass, artifact `hello.txt` đúng 5 bytes (`sha256:3733cd97…`), result
+import seal `awaiting_verification` với hash thật, verifier độc lập đọc
+bytes xác nhận PASS (lúc đó `SubmitVerification` chưa có đường ra public
+API — đã lấp sau đó bằng `POST /v1/runs/{id}/verdicts`, xem validation
+2026-11-21 §5). Phụ thêm: task `profileId: null` ở live mode (không
+fake) resolve ra None → attempt kẹt Queued im lặng (phải ghim đúng profile
+id); scan không tự observe — observation chỉ vào log khi gọi
+`POST /v1/runs/{id}/inbox/reconcile` với đúng session ref (gateway epoch
+trong store, không phải daemon epoch từ `/v1/meta`), CLI chưa có lệnh này
+(chỉ có attempt-reconcile không poll message); serve child CWD = worktree
+attempt (đúng).

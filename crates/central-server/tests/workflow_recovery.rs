@@ -1053,6 +1053,7 @@ async fn scan_tick_all_leaves_parked_run_untouched() {
     let agent: Arc<dyn AgentGateway> = h.gateway.clone();
     let mut last_tick = HashMap::new();
     let profiles = central_server::scan::empty_profile_cache();
+    let secrets = std::sync::Arc::new(central_application::inbox::SecretVault::new());
     let (ticked, sent, _) = tick_all(
         &store,
         &clock,
@@ -1061,6 +1062,7 @@ async fn scan_tick_all_leaves_parked_run_untouched() {
         &system(),
         &ScanConfig::disabled(true),
         &profiles,
+        &secrets,
         None,
         &mut last_tick,
     )

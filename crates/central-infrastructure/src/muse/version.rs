@@ -1,10 +1,13 @@
 //! Pinned Muse Code CLI version allowlist.
 //!
 //! The MSP session-host protocol is versioned; Central pins the exact CLI
-//! build it was validated against (offline schema export of `1.4.20`) and
-//! refuses anything outside the allowlist with an actionable error (see
-//! [`check_supported_version`]). The serve handshake itself is not
-//! live-exercised yet — see `contracts/muse/1.4.20/manifest.json`.
+//! builds it was validated against (offline schema export of `1.4.20`,
+//! extended to `1.4.23` after the live echo-provider handshake on
+//! 2026-11-17, to `1.4.24` after the same echo chain on 2026-11-21 and
+//! to `1.4.25` after the same echo chain on 2026-11-23)
+//! and refuses anything outside the allowlist with an actionable error
+//! (see [`check_supported_version`]).
+//! See `contracts/muse/1.4.25/manifest.json`.
 
 /// CLI build the MSP protocol subset was live-verified against.
 pub const SUPPORTED_CLI_VERSION: &str = "1.4.23";
@@ -12,9 +15,11 @@ pub const SUPPORTED_CLI_VERSION: &str = "1.4.23";
 /// CLI builds Central speaks. Extended only with a new capture + subset.
 /// `1.4.20` shares the identical stable surface (75 methods / 47
 /// notifications / 2 requests / 39 errors); `1.4.23` additionally passed
-/// the live echo-provider handshake on 2026-11-17. See
-/// `contracts/muse/1.4.23/protocol-subset.json`.
-pub const CLI_VERSION_ALLOWLIST: &[&str] = &["1.4.20", SUPPORTED_CLI_VERSION];
+/// the live echo-provider handshake on 2026-11-17, `1.4.24` passed the
+/// same echo chain on 2026-11-21, and `1.4.25` on 2026-11-23 (identical
+/// surface + error codes throughout). See
+/// `contracts/muse/1.4.25/protocol-subset.json`.
+pub const CLI_VERSION_ALLOWLIST: &[&str] = &["1.4.20", "1.4.23", "1.4.24", "1.4.25"];
 
 /// A parsed `major.minor.patch[-pre][+build]` version. Suffixes compare
 /// lexically; only exact allowlist membership is accepted.
@@ -122,6 +127,15 @@ mod tests {
         // The 1.4.20 schema capture stays speakable: identical stable surface.
         let older = parse_cli_version("1.4.20").unwrap();
         assert!(check_supported_version(&older).is_ok());
+        // 1.4.23 passed the live echo handshake on 2026-11-17.
+        let mid = parse_cli_version("1.4.23").unwrap();
+        assert!(check_supported_version(&mid).is_ok());
+        // 1.4.24 passed the same echo chain on 2026-11-21.
+        let newer = parse_cli_version("1.4.24").unwrap();
+        assert!(check_supported_version(&newer).is_ok());
+        // 1.4.25 passed the same echo chain on 2026-11-23.
+        let newest = parse_cli_version("1.4.25").unwrap();
+        assert!(check_supported_version(&newest).is_ok());
     }
 
     #[test]

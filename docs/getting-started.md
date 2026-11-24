@@ -81,9 +81,11 @@ permission list are live-verified on 2.2.7; the permission reply/reject
 cycle is schema-captured (see `contracts/opencode/2.2.7/`): treat first
 live replies as probes.
 `GET /v1/meta` lists the configured providers. The MSP turn flow is
-live-verified on 1.4.23 (echo provider); only the approval decide/answer
-cycle is schema-captured (see `contracts/muse/1.4.23/`): treat first
-live approvals as probes.
+live-verified on 1.4.23–1.4.25 (echo provider), and the approval
+decide/answer cycle is live-verified on 1.4.25 via meta (`allow_once`
+→ server-applied `human_approval`, see `docs/validation/`); only
+`userInput`/question answering is schema-captured (see
+`contracts/muse/1.4.25/`).
 
 ## First run (five minutes)
 

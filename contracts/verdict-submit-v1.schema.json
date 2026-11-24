@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "central/verdict-submit-v1.schema.json",
+  "title": "VerdictSubmitV1",
+  "description": "Independent verifier verdict submission. Binds an explicit task and producing attempt to a VerificationV1 verdict plus the verifier-side context. The daemon re-derives the seal from the persisted worker-result events and refuses anything that does not cite the exact sealed subject, criteria and input.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task", "attempt", "verdict", "context"],
+  "properties": {
+    "task": { "type": "string", "minLength": 1 },
+    "attempt": { "type": "string", "minLength": 1 },
+    "verdict": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["version", "subjectHash", "criteriaHash", "outcome", "evidenceIds", "findings"],
+      "properties": {
+        "version": { "const": 1 },
+        "subjectHash": { "type": "string", "minLength": 1 },
+        "criteriaHash": { "type": "string", "minLength": 1 },
+        "outcome": { "type": "string", "enum": ["pass", "fail", "blocked"] },
+        "evidenceIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "findings": { "type": "string", "minLength": 1 }
+      }
+    },
+    "context": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["verifierThread", "environment", "checkRefs", "failedCriteria", "verifierWroteTrackedSource", "taintedEvidence", "sameSessionOverride"],
+      "properties": {
+        "verifierThread": { "type": "string", "minLength": 1 },
+        "environment": { "type": "string" },
+        "checkRefs": { "type": "array", "items": { "type": "string" } },
+        "failedCriteria": { "type": "array", "items": { "type": "string" } },
+        "verifierWroteTrackedSource": { "type": "boolean" },
+        "taintedEvidence": { "type": "array", "items": { "type": "string" } },
+        "sameSessionOverride": { "type": "boolean" }
+      }
+    }
+  }
+}

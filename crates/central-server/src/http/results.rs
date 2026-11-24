@@ -1,5 +1,6 @@
-//! Result and handover import: `POST /v1/runs/{id}/attempts/{attempt}/results`
-//! and `POST /v1/runs/{id}/handover`.
+//! Result, handover and verdict import: `POST
+//! /v1/runs/{id}/attempts/{attempt}/results`, `POST /v1/runs/{id}/handover`
+//! and `POST /v1/runs/{id}/verdicts`.
 //!
 //! Validated import with binding and candidate checks that records for
 //! real — never a print-only validation. A worker report is sealed
@@ -8,8 +9,11 @@
 //! which parks the task in `AwaitingVerification` and never marks it
 //! passed. A handover is parsed, evidence-checked and recorded as a
 //! durable observation for the new session to inspect — prose without
-//! evidence stays unverified. Owner imports, or the attempt-bound
-//! bridge filing for its own attempt; every other caller is 403.
+//! evidence stays unverified. A verdict is bound to the sealed candidate
+//! re-derived from the persisted result events and committed through
+//! `SubmitVerification`, which routes quality (pass, repair, leader).
+//! Owner imports verdicts, or a control client; the attempt-bound bridge
+//! files only its own attempt's results. Every other caller is 403.
 
 use std::sync::Arc;
 
@@ -239,5 +243,60 @@ pub async fn post_handover(
         "handover_hash": hash.to_string(),
         "verified_facts": verified,
         "unverified_notes": unverified,
+    })))
+}
+
+/// Submit one independent verifier verdict: bound to the sealed
+/// candidate re-derived from the persisted worker-result events, then
+/// committed through `SubmitVerification`, which routes quality (pass,
+/// repair rounds, leader escalation). Stale subjects, wrong inputs and
+/// malformed fail verdicts are refused before anything commits. Owner
+/// or control only: judging is an operator act, never a bridge write.
+pub async fn post_verdicts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
+    let run_id = raw_id.parse::<RunId>().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
+    })?;
+    let submitted = central_application::quality_loop::parse_verdict_submit(&body)
+        .map_err(app_error_response)?;
+    let (receipt, status) = runtime_for(&state, run_id)
+        .submit_verdict(
+            auth.actor,
+            submitted.task,
+            submitted.attempt,
+            submitted.verdict,
+            submitted.context,
+        )
+        .await
+        .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
+    let receipt = serde_json::to_value(&receipt).map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("cannot encode receipt: {error}"),
+        )
+    })?;
+    let status = serde_json::to_value(status).map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("cannot encode task status: {error}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.to_string(),
+        "receipt": receipt,
+        "verdict": {"task": submitted.task.to_string(), "status": status},
     })))
 }

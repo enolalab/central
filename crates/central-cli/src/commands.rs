@@ -17,7 +17,7 @@ use central_infrastructure::process::{spawn_detached, DetachPlacement, ALREADY_R
 use crate::client::{health_ok, read_server_info, resolve_state_dir, DaemonClient};
 use crate::{
     Cli, ClientCommands, Commands, DaemonCommands, HandoverCommands, MaintenanceCommands,
-    PlanCommands, ProfileCommands, ResultCommands,
+    PlanCommands, ProfileCommands, ResultCommands, VerdictCommands,
 };
 
 fn print_json(value: &serde_json::Value) {
@@ -91,6 +91,7 @@ pub fn execute(cli: Cli) -> i32 {
         Commands::Plan { command } => plan(&state_dir, command),
         Commands::Result { command } => result(&state_dir, command),
         Commands::Handover { command } => handover_cmd(&state_dir, command),
+        Commands::Verdict { command } => verdict_cmd(&state_dir, command),
         Commands::Budget { run } => budget(&state_dir, run),
         Commands::UsageResolve {
             run,
@@ -1081,5 +1082,58 @@ fn sibling_server_exe() -> Result<PathBuf, String> {
             "central-server binary not found next to the CLI at {}",
             candidate.display()
         ))
+    }
+}
+
+/// Submit a verdict file through the daemon: validated, bound to the
+/// sealed candidate, then quality-routed. Only an independent verdict
+/// moves a parked task; submitting never edits the candidate.
+fn verdict_cmd(state_dir: &Path, command: &VerdictCommands) -> i32 {
+    let VerdictCommands::Import {
+        run,
+        task,
+        attempt,
+        file,
+    } = command;
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(error) => return fail(&format!("cannot read verdict file: {error}")),
+    };
+    let submitted = match central_application::quality_loop::parse_verdict_submit(&text) {
+        Ok(submitted) => submitted,
+        Err(error) => return fail(&format!("invalid verdict: {error}")),
+    };
+    if submitted.task != *task {
+        return fail(&format!(
+            "verdict names task {} but --task is {task}",
+            submitted.task,
+        ));
+    }
+    if submitted.attempt != *attempt {
+        return fail(&format!(
+            "verdict names attempt {} but --attempt is {attempt}",
+            submitted.attempt,
+        ));
+    }
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    match client.get(&format!("/v1/runs/{run}")) {
+        Ok(view) => {
+            if !snapshot_has_attempt(&view, attempt) {
+                return fail(&format!(
+                    "foreign verdict: attempt {attempt} does not belong to run {run}"
+                ));
+            }
+        }
+        Err(message) => return fail(&message),
+    }
+    match client.post_text(&format!("/v1/runs/{run}/verdicts"), &text) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
     }
 }

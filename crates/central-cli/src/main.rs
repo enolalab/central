@@ -4,7 +4,7 @@ mod commands;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use central_domain::{AttemptId, PlanHash, RunId};
+use central_domain::{AttemptId, PlanHash, RunId, TaskId};
 use clap::{Parser, Subcommand};
 
 /// Central local runtime CLI. Every run operation talks to the single
@@ -64,6 +64,13 @@ pub enum Commands {
     Handover {
         #[command(subcommand)]
         command: HandoverCommands,
+    },
+    /// Verdict operations: validate locally, then submit through the
+    /// daemon, which binds the verdict to the sealed candidate and routes
+    /// quality (pass, repair, leader).
+    Verdict {
+        #[command(subcommand)]
+        command: VerdictCommands,
     },
     /// Show pending approval/question entries for a run.
     Inbox {
@@ -322,6 +329,23 @@ pub enum HandoverCommands {
     Import {
         #[arg(long)]
         run: RunId,
+        #[arg(long)]
+        file: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum VerdictCommands {
+    /// Submit a verdict JSON file through the daemon: validated, bound to
+    /// the sealed candidate, then quality-routed. Only an independent
+    /// verdict moves a parked task.
+    Import {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        task: TaskId,
+        #[arg(long)]
+        attempt: AttemptId,
         #[arg(long)]
         file: PathBuf,
     },

@@ -17,8 +17,9 @@ use central_application::contracts::{
 use central_application::ports::{AgentGateway, Clock, IdSource, Store};
 use central_application::Runtime;
 use central_domain::{
-    decide, Actor, ActorId, ActorKind, Attempt, AttemptId, AttemptStatus, Command, CommandEnvelope,
-    CommandId, IntentId, Observation, Revision, RunControl, RunId, RunState, TaskId, Timestamp,
+    decide, Actor, ActorId, ActorKind, Attempt, AttemptId, AttemptSession, AttemptStatus, Command,
+    CommandEnvelope, CommandId, IntentId, Observation, Revision, RunControl, RunId, RunState,
+    TaskId, Timestamp,
 };
 
 // ---------- fakes ----------
@@ -48,6 +49,7 @@ struct FakeGateway {
     sends: AtomicUsize,
     cancels: AtomicUsize,
     ambiguous: AtomicBool,
+    cancel_targets: Mutex<Vec<SessionRef>>,
 }
 
 impl FakeGateway {
@@ -97,8 +99,12 @@ impl AgentGateway for FakeGateway {
     async fn answer(&self, _answer: ExternalAnswer) -> Result<(), DispatchError> {
         Ok(())
     }
-    async fn cancel(&self, _target: &ExecutionRef) -> Result<CancelObservation, AppError> {
+    async fn cancel(&self, target: &ExecutionRef) -> Result<CancelObservation, AppError> {
         self.cancels.fetch_add(1, Ordering::SeqCst);
+        self.cancel_targets
+            .lock()
+            .expect("targets")
+            .push(target.session.clone());
         if self.ambiguous.load(Ordering::SeqCst) {
             return Err(AppError::Transport("lost after cancel".to_string()));
         }
@@ -380,6 +386,52 @@ async fn dispatch_with_evidence_completes_intent() {
     let summary = runtime.dispatch_once(run_id()).await.expect("redispatch");
     assert_eq!(summary.dispatched, 0);
     assert_eq!(gateway.cancel_count(), 1);
+}
+
+#[tokio::test]
+async fn cancel_targets_the_attempt_live_session() {
+    let store = Arc::new(MemoryStore::default());
+    let gateway = Arc::new(FakeGateway::default());
+    let runtime = runtime(store.clone(), gateway.clone());
+    let mut state = created_state();
+    state.attempts.insert(
+        AttemptId::from_u128(42),
+        attempt(42, AttemptStatus::Running),
+    );
+    state.attempt_sessions.insert(
+        AttemptId::from_u128(42),
+        AttemptSession {
+            provider: "fake".to_string(),
+            instance_epoch: "epoch-7".to_string(),
+            thread_id: "thread-7".to_string(),
+        },
+    );
+    store.seed_state(state);
+    runtime
+        .execute(
+            user(),
+            CommandEnvelope {
+                id: CommandId::from_u128(900),
+                expected_revision: None,
+                command: Command::Stop,
+            },
+        )
+        .await
+        .expect("stop");
+
+    let summary = runtime.dispatch_once(run_id()).await.expect("dispatch");
+    assert_eq!(summary.dispatched, 1);
+    assert_eq!(gateway.cancel_count(), 1);
+    let targets = gateway.cancel_targets.lock().expect("targets").clone();
+    assert_eq!(targets.len(), 1, "one cancel names one session");
+    assert_eq!(targets[0].provider, "fake");
+    assert_eq!(targets[0].instance_epoch, "epoch-7");
+    assert_eq!(targets[0].thread_id, "thread-7");
+    let state = store.load(run_id()).await.expect("load").expect("run");
+    assert_eq!(
+        state.attempts[&AttemptId::from_u128(42)].status,
+        AttemptStatus::Cancelled
+    );
 }
 
 #[tokio::test]

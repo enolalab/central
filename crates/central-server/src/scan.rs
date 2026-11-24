@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use central_application::inbox::SecretVault;
 use central_application::ports::{AgentGateway, Clock, IdSource, Store};
 use central_application::scheduler::{Scheduler, SchedulerConfig};
 use central_domain::{Actor, ContentHash, ResolvedProfile, RunControl, RunId, Task, Timestamp};
@@ -162,6 +163,7 @@ fn scheduler_for(
     actor: &Actor,
     config: &ScanConfig,
     profiles: &ProfileCache,
+    secrets: &Arc<SecretVault>,
     workspace: Option<Arc<dyn central_application::ports::workspace::WorkspaceManager>>,
 ) -> Result<Scheduler, central_application::contracts::AppError> {
     Ok(Scheduler::new(
@@ -173,6 +175,7 @@ fn scheduler_for(
         resolver(config.fake_agent, Arc::clone(profiles)),
         actor.clone(),
     )?
+    .with_secrets(Arc::clone(secrets))
     .with_workspace(workspace))
 }
 
@@ -189,20 +192,22 @@ pub async fn tick_all(
     actor: &Actor,
     config: &ScanConfig,
     profiles: &ProfileCache,
+    secrets: &Arc<SecretVault>,
     workspace: Option<Arc<dyn central_application::ports::workspace::WorkspaceManager>>,
     last_tick: &mut HashMap<RunId, Timestamp>,
 ) -> (usize, usize, usize) {
     // The owner registry refreshes every pass; a failed refresh keeps
     // the previous cache, so dispatch waits rather than substituting.
     refresh_profiles(store, profiles).await;
-    let scheduler =
-        match scheduler_for(store, clock, ids, agent, actor, config, profiles, workspace) {
-            Ok(scheduler) => scheduler,
-            Err(error) => {
-                eprintln!("central-server: scan scheduler unavailable: {error}");
-                return (0, 0, 0);
-            }
-        };
+    let scheduler = match scheduler_for(
+        store, clock, ids, agent, actor, config, profiles, secrets, workspace,
+    ) {
+        Ok(scheduler) => scheduler,
+        Err(error) => {
+            eprintln!("central-server: scan scheduler unavailable: {error}");
+            return (0, 0, 0);
+        }
+    };
     let now = clock.now();
     let run_ids = match store.list_run_ids().await {
         Ok(ids) => ids,
@@ -257,6 +262,7 @@ pub fn spawn_scan_loop(
     actor: Actor,
     config: ScanConfig,
     notify: Arc<Notify>,
+    secrets: Arc<SecretVault>,
     workspace: Option<Arc<dyn central_application::ports::workspace::WorkspaceManager>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -276,6 +282,7 @@ pub fn spawn_scan_loop(
                 &actor,
                 &config,
                 &profiles,
+                &secrets,
                 workspace.clone(),
                 &mut last_tick,
             )

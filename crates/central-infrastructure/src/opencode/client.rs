@@ -107,25 +107,50 @@ impl OpencodeClient {
         Self::data(self.get("/api/info").send().await, "server info").await
     }
 
-    /// Create a server session. Returns the server session id.
-    pub async fn create_session(&self, title: &str) -> Result<String, ClientError> {
+    /// Create a server session bound to one model. The model rides on the
+    /// session — never on the prompt: the documented prompt shape is
+    /// `{text}` only, and an unmodelled session accepts prompts but never
+    /// produces a completed message. `provider_id`/`model_id` is the
+    /// `Model.Ref` (`{"providerID","id"}`); a bare id without provider is
+    /// refused by the server. Returns the server session plus its echoed
+    /// model selection for fail-fast verification.
+    pub async fn create_session(
+        &self,
+        title: &str,
+        provider_id: Option<&str>,
+        model_id: &str,
+    ) -> Result<(String, Option<(String, String)>), ClientError> {
+        let model = match provider_id {
+            Some(provider) => serde_json::json!({"providerID": provider, "id": model_id}),
+            None => serde_json::json!({"id": model_id}),
+        };
         let body = Self::data(
             self.post("/api/session")
-                .json(&serde_json::json!({ "title": title }))
+                .json(&serde_json::json!({ "title": title, "model": model }))
                 .send()
                 .await,
             "session create",
         )
         .await?;
-        body.get("id")
-            .and_then(serde_json::Value::as_str)
+        let id = body
+            .get("id")
+            .and_then(|value| value.as_str())
             .map(str::to_string)
             .ok_or_else(|| {
                 ClientError::Transport("session create did not return a session id".to_string())
-            })
+            })?;
+        let echoed = body.get("model").and_then(|model| {
+            Some((
+                model.get("providerID")?.as_str()?.to_string(),
+                model.get("id")?.as_str()?.to_string(),
+            ))
+        });
+        Ok((id, echoed))
     }
 
-    /// Send one prompt. Returns the user message id. A timeout here is
+    /// Send one prompt on the session. The session already names its model
+    /// (see [`Self::create_session`]); the documented prompt shape carries
+    /// text only. Returns the user message id. A timeout here is
     /// OutcomeUnknown — never resend.
     pub async fn prompt(&self, session: &str, text: &str) -> Result<String, ClientError> {
         let body = Self::data(

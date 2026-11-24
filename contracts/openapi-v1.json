@@ -425,6 +425,33 @@
     }
    }
   },
+  "/v1/runs/{id}/verdicts": {
+   "post": {
+    "summary": "Submit one independent verifier verdict bound to the sealed candidate re-derived from the persisted worker-result events. Routes quality (pass, repair, leader). Stale subjects, wrong inputs and malformed fails are refused. Owner or control only.",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "receipt plus verdict task status"
+     },
+     "400": {
+      "description": "malformed verdict"
+     },
+     "403": {
+      "description": "reader or bridge token"
+     },
+     "404": {
+      "description": "unknown run, attempt without seal, or foreign attempt"
+     },
+     "409": {
+      "description": "stale verdict or closed task"
+     }
+    }
+   }
+  },
   "/v1/runs/{id}/usage": {
    "get": {
     "summary": "Usage ledger with the observed/estimated/unknown split plus the admission reason.",

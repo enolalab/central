@@ -14,9 +14,9 @@
 //! server to re-ask — never a resend.
 //!
 //! Schema provenance: offline export (`muse schema generate-json-schema`)
-//! from muse 1.4.20; see `contracts/muse/1.4.20/`. The serve handshake is
-//! NOT live-exercised yet: shapes the server does not confirm are refused
-//! loudly instead of guessed.
+//! from muse 1.4.20, extended with the live echo-provider handshake capture
+//! on 1.4.23 (2026-11-17); see `contracts/muse/1.4.23/`. Shapes the server
+//! does not confirm are refused loudly instead of guessed.
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -1040,12 +1040,14 @@ impl AgentGateway for MuseGateway {
                 rest.push(event);
             }
         }
-        if matched.is_empty() {
-            if rest.is_empty() {
-                return Ok(Vec::new());
-            }
-            return Err(unattributed(&mut state, rest));
-        }
+        // Our session is live (it was found above), but this poll carried
+        // nothing bound to it — only other sessions' traffic or
+        // session-less broadcasts. Stash those and report nothing instead
+        // of failing the whole reconcile: our turn events still surface
+        // on later polls, and an ever-growing foreign backlog trips the
+        // overflow guard below instead of an instant failure. A poll for
+        // a genuinely unknown session still fails loudly in the
+        // no-session branch above.
         for event in rest {
             state.buffer.push(event);
             if state.buffer.overflowed() {

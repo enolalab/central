@@ -220,10 +220,12 @@ async fn loopback_wire_speaks_verified_protocol() {
     let port = listener.local_addr().expect("port").port();
     let password_slot: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let seen_replies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_session_bodies: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let message_calls = Arc::new(AtomicUsize::new(0));
 
     let server_passwords = Arc::clone(&password_slot);
     let server_replies = Arc::clone(&seen_replies);
+    let session_bodies = Arc::clone(&seen_session_bodies);
     let server_calls = Arc::clone(&message_calls);
     tokio::spawn(async move {
         loop {
@@ -232,6 +234,7 @@ async fn loopback_wire_speaks_verified_protocol() {
             };
             let passwords = Arc::clone(&server_passwords);
             let replies = Arc::clone(&server_replies);
+            let session_bodies = Arc::clone(&session_bodies);
             let calls = Arc::clone(&server_calls);
             tokio::spawn(async move {
                 let (mut reader, mut writer) = socket.into_split();
@@ -282,7 +285,15 @@ async fn loopback_wire_speaks_verified_protocol() {
                 let response = if path == "/api/info" {
                     reply(r#"{"version":"2.2.7"}"#)
                 } else if path == "/api/session" {
-                    reply(r#"{"data":{"id":"ses_stub"}}"#)
+                    let value = serde_json::from_slice::<Value>(&body).unwrap_or(Value::Null);
+                    {
+                        session_bodies.lock().expect("sessions").push(value);
+                    }
+                    // The server echoes its model selection for fail-fast
+                    // verification at open.
+                    reply(
+                        r#"{"data":{"id":"ses_stub","model":{"id":"probe-model","providerID":"stub"}}}"#,
+                    )
                 } else if path == "/api/session/ses_stub/prompt" {
                     reply(r#"{"data":{"id":"msg_p1","sessionID":"ses_stub","type":"user"}}"#)
                 } else if path == "/api/session/ses_stub/message" {
@@ -343,6 +354,18 @@ async fn loopback_wire_speaks_verified_protocol() {
         .await
         .expect("send prompts the server session");
     assert_eq!(turn.turn_id, "msg_p1");
+    // The session create names the profile model as a Model.Ref: a bare
+    // profile id travels as `{"id"}` and the server echo is verified at
+    // open, before any prompt is sent.
+    {
+        let bodies = seen_session_bodies.lock().expect("sessions");
+        assert_eq!(bodies.len(), 1, "one session create, got {bodies:?}");
+        assert_eq!(
+            bodies[0]["model"]["id"],
+            Value::String("probe-model".to_string()),
+            "session create carries the profile model"
+        );
+    }
 
     // First poll: streaming (no completed message yet) plus one permission.
     let first = gateway.observe(&session).await.expect("observe polls");

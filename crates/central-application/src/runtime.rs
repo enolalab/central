@@ -395,13 +395,26 @@ impl Runtime {
                     }
                 }
                 Effect::CancelAttempt { attempt_id } => {
-                    let target = ExecutionRef {
-                        attempt_id: *attempt_id,
-                        session: SessionRef {
+                    // Cancel the attempt's live harness session, never a
+                    // blank reference: without the bound provider/epoch/
+                    // thread the gateway cannot route or identity-check the
+                    // kill, and the agent keeps running after the stop.
+                    let session = state
+                        .attempt_sessions
+                        .get(attempt_id)
+                        .map(|binding| SessionRef {
+                            provider: binding.provider.clone(),
+                            instance_epoch: binding.instance_epoch.clone(),
+                            thread_id: binding.thread_id.clone(),
+                        })
+                        .unwrap_or(SessionRef {
                             provider: "central".to_string(),
                             instance_epoch: String::new(),
                             thread_id: String::new(),
-                        },
+                        });
+                    let target = ExecutionRef {
+                        attempt_id: *attempt_id,
+                        session,
                         turn: None,
                     };
                     match self.agent.cancel(&target).await {

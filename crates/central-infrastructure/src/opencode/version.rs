@@ -108,6 +108,45 @@ pub fn check_model_match(requested: &str, observed: &str) -> Result<(), VersionE
     )))
 }
 
+/// Split a profile model reference into its opencode-side provider and id.
+/// `"ollama/qwen3:4b"` splits at the first `/`; a bare id carries no
+/// provider and only ever matches on the id itself.
+pub fn split_model_ref(requested: &str) -> (Option<&str>, &str) {
+    match requested.split_once('/') {
+        Some((provider, id)) => (Some(provider), id),
+        None => (None, requested),
+    }
+}
+
+/// Requested/observed model match on the resolved `Model.Ref` pair. The
+/// server echoes its selection per session and per message as
+/// `{providerID, id}`; a `provider/id` profile must match both halves, a
+/// bare profile id must match the observed id exactly. Anything else is a
+/// capability error, never a silent fallback.
+pub fn check_model_ref_match(
+    requested: &str,
+    observed_provider: Option<&str>,
+    observed_id: &str,
+) -> Result<(), VersionError> {
+    let (provider, id) = split_model_ref(requested);
+    let matched = match provider {
+        Some(provider) => observed_provider == Some(provider) && observed_id == id,
+        None => observed_id == id,
+    };
+    if matched {
+        return Ok(());
+    }
+    let observed = match observed_provider {
+        Some(provider) => format!("{provider}/{observed_id}"),
+        None => observed_id.to_string(),
+    };
+    Err(VersionError(format!(
+        "model capability mismatch: requested '{requested}' but the server resolved '{observed}'. \
+         Central never falls back silently; \
+         resolve the profile to an available model and retry"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +176,24 @@ mod tests {
     fn model_mismatch_is_an_error_never_a_fallback() {
         assert!(check_model_match("m", "m").is_ok());
         assert!(check_model_match("a", "b").is_err());
+    }
+
+    #[test]
+    fn model_ref_match_covers_pairs_and_bare_ids() {
+        // Full ref: both halves must match.
+        assert!(check_model_ref_match("ollama/qwen3:4b", Some("ollama"), "qwen3:4b").is_ok());
+        assert!(check_model_ref_match("ollama/qwen3:4b", Some("ollama"), "other").is_err());
+        assert!(check_model_ref_match("ollama/qwen3:4b", Some("opencode"), "qwen3:4b").is_err());
+        // Backend aliasing (free router resolving to another backend) fails loud.
+        assert!(check_model_ref_match(
+            "opencode/deepseek-v4.1-flash-free",
+            Some("opencode"),
+            "gemini-4-neon"
+        )
+        .is_err());
+        // Bare id: exact id match only.
+        assert!(check_model_ref_match("probe-model", None, "probe-model").is_ok());
+        assert!(check_model_ref_match("probe-model", Some("stub"), "probe-model").is_ok());
+        assert!(check_model_ref_match("probe-model", Some("stub"), "other").is_err());
     }
 }

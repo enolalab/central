@@ -26,6 +26,7 @@ use central_domain::{
 use crate::contracts::{AppError, DispatchSummary};
 use crate::dispatcher::Dispatcher;
 use crate::fallback::FallbackOverrides;
+use crate::inbox::SecretVault;
 use crate::ports::{AgentGateway, Clock, IdSource, Store};
 use crate::Runtime;
 
@@ -114,6 +115,7 @@ pub struct Scheduler {
     resolver: Arc<ProfileResolver>,
     fallbacks: Arc<FallbackOverrides>,
     actor: Actor,
+    secrets: Arc<SecretVault>,
     workspace: Option<Arc<dyn crate::ports::workspace::WorkspaceManager>>,
 }
 
@@ -137,8 +139,18 @@ impl Scheduler {
             resolver,
             fallbacks: Arc::new(FallbackOverrides::default()),
             actor,
+            secrets: Arc::new(SecretVault::new()),
             workspace: None,
         })
+    }
+
+    /// Share the memory-only secret vault answer dispatch resolves
+    /// secret references through. A scheduler with a fresh (empty) vault
+    /// sends nothing secret-bearing and waits for re-entry instead of
+    /// replaying secrets — same rule as an explicit dispatch.
+    pub fn with_secrets(mut self, secrets: Arc<SecretVault>) -> Self {
+        self.secrets = secrets;
+        self
     }
 
     /// Attach a Git workspace manager: dispatches for runs targeting a
@@ -226,6 +238,17 @@ impl Scheduler {
     /// against current state, one CAS commit at a time.
     pub async fn tick(&self, run_id: RunId) -> Result<ScheduleReport, AppError> {
         let mut report = ScheduleReport::default();
+        // Flush pending outbox intents (operator answers, stop-requested
+        // cancels) on the same pass: replies must reach the harness on the
+        // scan cadence, not wait for a manual dispatch call. dispatch_once
+        // keeps its own control gate, so a parked run never sends here.
+        let outbox = self
+            .runtime_for(run_id)
+            .with_secrets(Arc::clone(&self.secrets))
+            .dispatch_once(run_id)
+            .await?;
+        report.sent += outbox.dispatched;
+        report.unknown += outbox.unknown;
         let runtime = self.runtime_for(run_id);
         let now = runtime.clock().now();
         let state = self

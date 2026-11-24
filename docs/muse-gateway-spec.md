@@ -2,8 +2,12 @@
 
 Trạng thái: đã triển khai (`crates/central-infrastructure/src/muse/`,
 `RouterGateway` trong `crates/central-server/src/bootstrap.rs`, `muse.json`,
-`providers` trên `GET /v1/meta`). Wire live CHƯA kiểm chứng
-(serve handshake, RequestReceipt+decide) — xem `contracts/muse/1.4.23/`.
+`providers` trên `GET /v1/meta`). Serve handshake live đã kiểm chứng trên
+echo cho 1.4.23 (17/11), 1.4.24 (21/11) và 1.4.25 (23/11) — xem
+`contracts/muse/1.4.25/`. RequestReceipt+decide đã kiểm chứng LIVE trên meta
+(run `26f3d0ed`: approval/request → inbox → approve → decide applied as
+`human_approval`); userInput/question vẫn schema-only (chưa model nào hỏi
+live).
 
 ## 1. Transport
 
@@ -30,7 +34,7 @@ re-ask, không resend. Không bao giờ trả lời inline trong response như C
 ```rust
 struct MuseConfig {
     binary: String,              // "muse", resolve trên PATH
-    cli_version: String,         // allowlist-check, pin "1.4.20"
+    cli_version: String,         // allowlist-check ["1.4.20","1.4.23","1.4.24","1.4.25"], pin "1.4.23"
     surveyed_models: Vec<String>,// default rỗng → chưa advertise model nào
     serve_args: Vec<String>,     // default ["serve"]
     provider: &'static str,      // "muse"

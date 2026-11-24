@@ -10,9 +10,11 @@
 //! fabricates a second observation.
 //!
 //! Schema provenance: the live 2.2.7 OpenAPI plus wire probes; see
-//! `contracts/opencode/2.2.7/`. The permission request+reply cycle is
-//! schema-captured but NOT live-denied (the lab never asked): shapes the
-//! server does not confirm are refused loudly instead of guessed.
+//! `contracts/opencode/2.2.7/`. Turn flow, auth and the permission LIST are
+//! live-verified; the permission reply/reject + interrupt cycle was
+//! live-exercised once in the 2026-11-17 lab (recorded in
+//! `docs/opencode-gateway-spec.md`, no machine-checkable artifact in repo):
+//! shapes the server does not confirm are refused loudly instead of guessed.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -34,7 +36,10 @@ use crate::process::{PipedSpawner, PipedStdio};
 
 use super::client::{ClientError, OpencodeClient};
 use super::requests::{normalize_request, observation_for as permission_observation};
-use super::version::{check_model_match, check_supported_version, parse_cli_version, VersionError};
+use super::version::{
+    check_model_ref_match, check_supported_version, parse_cli_version, split_model_ref,
+    VersionError,
+};
 
 /// Static configuration for one gateway instance.
 #[derive(Clone, Debug)]
@@ -339,20 +344,41 @@ impl OpencodeGateway {
                         .to_string(),
                 ));
             }
-            None => client
-                .create_session(&format!("central-{attempt_id}"))
-                .await
-                .map_err(|error| match error {
-                    ClientError::Rejected(message) | ClientError::Transport(message) => {
-                        AppError::Transport(format!("opencode session create failed: {message}"))
+            None => {
+                let (provider_id, model_id) = split_model_ref(&taken_profile.model);
+                let (session, echoed) = client
+                    .create_session(&format!("central-{attempt_id}"), provider_id, model_id)
+                    .await
+                    .map_err(|error| match error {
+                        ClientError::Rejected(message) | ClientError::Transport(message) => {
+                            AppError::Transport(format!(
+                                "opencode session create failed: {message}"
+                            ))
+                        }
+                        ClientError::OutcomeUnknown(message) => AppError::Transport(format!(
+                            "opencode session create is outcome-unknown: {message}; \
+                             reconcile before reuse"
+                        )),
+                    })?;
+                // Fail fast on a misrouted session: the server echoes its
+                // selection, and anything but the requested Model.Ref is a
+                // capability error before any prompt is sent.
+                match echoed {
+                    Some((provider, id)) => {
+                        check_model_ref_match(&taken_profile.model, Some(&provider), &id)
+                            .map_err(|error| AppError::Capability(error.to_string()))?
                     }
-                    ClientError::OutcomeUnknown(message) => AppError::Transport(format!(
-                        "opencode session create is outcome-unknown: {message}; \
-                         reconcile before reuse"
-                    )),
-                })?,
+                    None => {
+                        return Err(AppError::Capability(
+                            "session create did not echo its model selection; \
+                             refusing to run blind"
+                                .to_string(),
+                        ));
+                    }
+                }
+                session
+            }
         };
-        let _ = taken_profile;
         Ok((
             identity,
             AttachedTransport {
@@ -483,11 +509,15 @@ fn completed_id(message: &serde_json::Value) -> Option<&str> {
     message.get("id").and_then(|v| v.as_str())
 }
 
-fn message_model(message: &serde_json::Value) -> Option<&str> {
-    message
-        .get("model")
-        .and_then(|v| v.get("id"))
-        .and_then(|v| v.as_str())
+fn message_model(message: &serde_json::Value) -> Option<(Option<String>, String)> {
+    let model = message.get("model")?;
+    Some((
+        model
+            .get("providerID")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        model.get("id")?.as_str()?.to_string(),
+    ))
 }
 
 #[async_trait]
@@ -617,17 +647,31 @@ impl AgentGateway for OpencodeGateway {
                     }
                     // The server reports the model that actually ran: mismatch
                     // is a capability error, never a silent fallback.
-                    if let Some(observed) = message_model(message) {
-                        check_model_match(&profile_model, observed)
+                    if let Some((provider, id)) = message_model(message) {
+                        check_model_ref_match(&profile_model, provider.as_deref(), &id)
                             .map_err(|error| AppError::Capability(error.to_string()))?;
                     }
+                    // A failed turn still carries `time.completed`: surface the
+                    // server error in the evidence so the operator sees why
+                    // (e.g. provider quota) instead of an empty success.
+                    let server_error = message
+                        .get("finish")
+                        .and_then(|v| v.as_str())
+                        .filter(|finish| *finish == "error")
+                        .and_then(|_| message.pointer("/error/message").and_then(|v| v.as_str()))
+                        .map(|text| {
+                            let clean = crate::codex::wire::sanitize_text(text);
+                            let short: String = clean.chars().take(500).collect();
+                            format!(" error: {short}")
+                        })
+                        .unwrap_or_default();
                     observations.push(Observation {
                         attempt_id,
                         provider_epoch: epoch.clone(),
                         dedup_key: format!("session.message:{server}:{id}"),
                         outcome: None,
                         detail: format!(
-                            "turn completed{} ({})",
+                            "turn completed{} ({}){server_error}",
                             message
                                 .get("finish")
                                 .and_then(|v| v.as_str())

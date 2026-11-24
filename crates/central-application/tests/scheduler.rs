@@ -84,6 +84,7 @@ struct FakeGateway {
     delay_ms: AtomicI64,
     opens: AtomicUsize,
     sends: AtomicUsize,
+    cancels: AtomicUsize,
     script: Mutex<SendScript>,
     block_sends: AtomicBool,
     release_sends: AtomicBool,
@@ -97,6 +98,7 @@ impl FakeGateway {
             delay_ms: AtomicI64::new(0),
             opens: AtomicUsize::new(0),
             sends: AtomicUsize::new(0),
+            cancels: AtomicUsize::new(0),
             script: Mutex::new(SendScript::Ok),
             block_sends: AtomicBool::new(false),
             release_sends: AtomicBool::new(false),
@@ -114,6 +116,10 @@ impl FakeGateway {
 
     fn send_count(&self) -> usize {
         self.sends.load(Ordering::SeqCst)
+    }
+
+    fn cancel_count(&self) -> usize {
+        self.cancels.load(Ordering::SeqCst)
     }
 
     fn block_until_released(&self) {
@@ -198,6 +204,7 @@ impl AgentGateway for FakeGateway {
     }
 
     async fn cancel(&self, _target: &ExecutionRef) -> Result<CancelObservation, AppError> {
+        self.cancels.fetch_add(1, Ordering::SeqCst);
         Ok(CancelObservation {
             cancelled: true,
             detail: "cancelled".to_string(),
@@ -1402,4 +1409,60 @@ async fn integration_without_spec_never_dispatches() {
     assert_eq!(report.sent, 1, "only the worker dispatches");
     assert!(harness.attempts_of(gate).is_empty());
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The scan tick flushes pending outbox intents on the same pass: an
+/// operator answer or a stop-requested cancel must reach the harness
+/// without a manual dispatch call. Before this, only an explicit
+/// POST /v1/runs/{id}/dispatch (or a command-attached dispatch) sent
+/// them, so an approval sat Answered until someone kicked dispatch.
+#[tokio::test]
+async fn scheduler_tick_sends_pending_cancel_without_manual_dispatch() {
+    use central_domain::AttemptSession;
+
+    let harness = Harness::new();
+    harness
+        .execute(
+            user(),
+            Command::CreateRun {
+                goal: "cancel live".to_string(),
+                repository: "repo".to_string(),
+            },
+        )
+        .await;
+    let attempt = AttemptId::from_u128(4242);
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.attempts.insert(
+            attempt,
+            Attempt {
+                id: attempt,
+                task_id: TaskId::from_u128(4243),
+                plan_hash: central_domain::PlanHash::from_hex("h1"),
+                status: AttemptStatus::Running,
+                profile_id: None,
+                created_at: Timestamp(1_700_000_000_000),
+            },
+        );
+        state.attempt_sessions.insert(
+            attempt,
+            AttemptSession {
+                provider: "fake".to_string(),
+                instance_epoch: "epoch-1".to_string(),
+                thread_id: "thread-1".to_string(),
+            },
+        );
+    });
+    harness.execute(user(), Command::Stop).await;
+    assert_eq!(harness.gateway.cancel_count(), 0);
+
+    let scheduler = harness.scheduler(default_config());
+    let report = scheduler.tick(harness.run_id).await.expect("tick");
+    assert_eq!(report.sent, 1, "cancel sent on the scan pass: {report:?}");
+    assert_eq!(harness.gateway.cancel_count(), 1);
+    let state = harness.load();
+    assert_eq!(
+        state.attempts[&attempt].status,
+        AttemptStatus::Cancelled,
+        "cancel confirmed by the harness"
+    );
 }

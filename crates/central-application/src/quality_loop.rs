@@ -20,13 +20,15 @@
 use std::collections::HashMap;
 
 use central_domain::{
-    decide_quality, AttemptId, ContentHash, DomainError, QualityDecision, RunState, TaskId,
-    TaskStatus, VerificationOutcome, VerificationReport,
+    decide_quality, Actor, AttemptId, Command, CommandEnvelope, ContentHash, DomainError, Event,
+    QualityDecision, RunState, TaskId, TaskStatus, VerificationOutcome, VerificationReport,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::contracts::AppError;
 use crate::handover::VerificationV1;
 use crate::verification::{criteria_hash, SealedCandidate, VerificationService, WorkerDone};
+use crate::Runtime;
 
 /// Route one verifier verdict to its quality decision.
 ///
@@ -73,7 +75,8 @@ pub fn route_verification(
 /// session the verifier ran in, the pinned environment/check references the
 /// verdict rests on, the failed criteria a fail verdict must name, and the
 /// tracked-source signal that invalidates evidence.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct VerifierContext {
     /// Harness thread the verifier ran in (independence check).
     pub verifier_thread: String,
@@ -190,6 +193,31 @@ impl QualityLoop {
         verdict: &VerificationV1,
         ctx: &VerifierContext,
     ) -> Result<VerificationReport, AppError> {
+        let seal = self
+            .service
+            .seal_for(task, &verdict.subject_hash)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "no sealed candidate for task {task} subject {}; \
+                 reverify against the current seal",
+                    verdict.subject_hash,
+                ))
+            })?;
+        Self::build_report_from_seal(state, task, &seal, verdict, ctx)
+    }
+
+    /// The same report against an explicitly supplied seal. The daemon has
+    /// no durable in-memory seal table across restarts, so the verdict
+    /// endpoint reconstructs the seal from the persisted
+    /// `WorkerResultRecorded` events and checks it here — the identical
+    /// binding the in-memory path enforces, never a weaker one.
+    pub fn build_report_from_seal(
+        state: &RunState,
+        task: TaskId,
+        seal: &SealedCandidate,
+        verdict: &VerificationV1,
+        ctx: &VerifierContext,
+    ) -> Result<VerificationReport, AppError> {
         let task_state = state
             .tasks
             .get(&task)
@@ -211,16 +239,6 @@ impl QualityLoop {
                  criteria change only through an approved plan revision, reverify",
             )));
         }
-        let seal = self
-            .service
-            .seal_for(task, &verdict.subject_hash)
-            .ok_or_else(|| {
-                AppError::NotFound(format!(
-                    "no sealed candidate for task {task} subject {}; \
-                     reverify against the current seal",
-                    verdict.subject_hash,
-                ))
-            })?;
         if seal.criteria_hash != verdict.criteria_hash {
             return Err(AppError::Conflict(format!(
                 "stale verdict for task {task}: criteria changed since the seal; reverify",
@@ -353,4 +371,170 @@ fn prior_attempt(state: &RunState, task: TaskId) -> Option<AttemptId> {
         .filter(|attempt| attempt.task_id == task)
         .max_by_key(|attempt| attempt.created_at)
         .map(|attempt| attempt.id)
+}
+
+/// The verdict endpoint body: the task and producing attempt the verdict
+/// judges, the independent verdict itself, and the verifier-side context
+/// the verdict envelope does not carry. The task binding is explicit —
+/// criteria alone never identify the task — and the seal binding is
+/// re-derived from the persisted `WorkerResultRecorded` events, never
+/// from agent word alone.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct VerdictSubmitBody {
+    pub task: TaskId,
+    pub attempt: AttemptId,
+    pub verdict: VerificationV1,
+    pub context: VerifierContext,
+}
+
+/// Strict parse for the verdict endpoint and the CLI import: schema
+/// version, unknown fields and empty text are refused before any state.
+pub fn parse_verdict_submit(text: &str) -> Result<VerdictSubmitBody, AppError> {
+    let submitted: VerdictSubmitBody = serde_json::from_str(text)
+        .map_err(|error| AppError::Validation(format!("invalid verdict submission: {error}")))?;
+    if submitted.verdict.version != crate::handover::VERIFICATION_VERSION {
+        return Err(AppError::Validation(format!(
+            "unknown {} version {}; Central supports version {}",
+            crate::handover::VERIFICATION_SCHEMA,
+            submitted.verdict.version,
+            crate::handover::VERIFICATION_VERSION,
+        )));
+    }
+    if submitted.verdict.findings.trim().is_empty() {
+        return Err(AppError::Validation(
+            "verdict findings must not be empty".to_string(),
+        ));
+    }
+    Ok(submitted)
+}
+
+impl Runtime {
+    /// Record one independent verifier verdict through the durable seal.
+    ///
+    /// The seal is reconstructed from the persisted `WorkerResultRecorded`
+    /// events — the latest recording for this task — so a verdict survives
+    /// daemon restarts exactly like the seal it judges. The report is
+    /// built with the same binding the in-memory path enforces (exact
+    /// subject, exact criteria, sealed input cited, untainted evidence,
+    /// fail names its criteria); the domain commit then enforces actor
+    /// kind, attempt membership, task openness, plan binding and verifier
+    /// independence. Returns the receipt and the task status after commit.
+    pub async fn submit_verdict(
+        &self,
+        actor: Actor,
+        task: TaskId,
+        attempt: AttemptId,
+        verdict: VerificationV1,
+        ctx: VerifierContext,
+    ) -> Result<(crate::contracts::Receipt, TaskStatus), AppError> {
+        let Some(state) = self.store().load(self.run_id()).await? else {
+            return Err(AppError::NotFound(format!(
+                "run {} not found",
+                self.run_id()
+            )));
+        };
+        let attempt_task = state
+            .attempts
+            .get(&attempt)
+            .map(|record| record.task_id)
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "attempt {attempt} is unknown to run {}",
+                    self.run_id()
+                ))
+            })?;
+        if attempt_task != task {
+            return Err(AppError::Validation(format!(
+                "attempt {attempt} does not belong to task {task}"
+            )));
+        }
+        let task_state = state.tasks.get(&task).ok_or_else(|| {
+            AppError::NotFound(format!("task {task} is not part of run {}", self.run_id()))
+        })?;
+        let recorded = self
+            .store()
+            .events(self.run_id())
+            .await?
+            .into_iter()
+            .filter_map(|event| match event {
+                Event::WorkerResultRecorded {
+                    task: event_task,
+                    input_hash,
+                    candidate_hash,
+                    criteria_hash,
+                    ..
+                } if event_task == task => Some((input_hash, candidate_hash, criteria_hash)),
+                _ => None,
+            })
+            .next_back()
+            .ok_or_else(|| {
+                AppError::NotFound(format!(
+                    "task {task} has no sealed candidate; import the worker result first"
+                ))
+            })?;
+        if recorded.1 != verdict.subject_hash {
+            return Err(AppError::Conflict(format!(
+                "stale verdict for task {task}: subject {} is not the sealed candidate; \
+                 reverify against the current seal",
+                verdict.subject_hash,
+            )));
+        }
+        let seal = SealedCandidate {
+            task_id: task,
+            input_hash: recorded.0,
+            candidate_hash: recorded.1,
+            criteria_hash: recorded.2,
+            max_repair_rounds: task_state.max_repair_rounds,
+        };
+        let report = QualityLoop::build_report_from_seal(&state, task, &seal, &verdict, &ctx)?;
+        let receipt = self
+            .execute(
+                actor,
+                CommandEnvelope {
+                    id: self.ids().next_command_id(),
+                    expected_revision: None,
+                    command: Command::SubmitVerification {
+                        task,
+                        attempt,
+                        report,
+                    },
+                },
+            )
+            .await?;
+        let status = self
+            .store()
+            .load(self.run_id())
+            .await?
+            .and_then(|state| state.tasks.get(&task).map(|task| task.status))
+            .ok_or_else(|| {
+                AppError::Storage(format!(
+                    "run {} vanished after verdict commit",
+                    self.run_id()
+                ))
+            })?;
+        Ok((receipt, status))
+    }
+}
+
+#[cfg(test)]
+mod verdict_submit_tests {
+    use super::*;
+
+    fn body(findings: &str) -> String {
+        serde_json::json!({
+            "task": "00000000-0000-0000-0000-000000000001",
+            "attempt": "00000000-0000-0000-0000-000000000099",
+            "verdict": {"version": 1, "subjectHash": "aa", "criteriaHash": "bb", "outcome": "pass", "evidenceIds": ["input-seal"], "findings": findings},
+            "context": {"verifierThread": "v-1", "environment": "test", "checkRefs": [], "failedCriteria": [], "verifierWroteTrackedSource": false, "taintedEvidence": [], "sameSessionOverride": false},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn verdict_submit_parses_and_rejects_shape_violations() {
+        assert!(parse_verdict_submit(&body("judged")).is_ok());
+        assert!(parse_verdict_submit(&body("  ")).is_err());
+        assert!(parse_verdict_submit("{\"task\":1}").is_err());
+    }
 }

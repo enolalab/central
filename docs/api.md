@@ -56,8 +56,17 @@ Task outcomes arrive later through reads, events and verification.
 - Scheduler-internal and harness-internal commands (`QueueAttempt`,
   `StartDispatch`, `AttemptRunning`, …, `RecordObservation`) are not
   operator rights: 403 for everyone, including the owner. Specialized
-  endpoints (`results`, `handover`, inbox actions) validate first and
-  then commit through the same application use cases.
+  endpoints (`results`, `handover`, `verdicts`, inbox actions) validate
+  first and then commit through the same application use cases.
+- `POST /v1/runs/{id}/verdicts` submits one independent verifier verdict
+  (`contracts/verdict-submit-v1.schema.json`: task, attempt, `verdict`
+  per `verification-v1.schema.json`, verifier `context`). The daemon
+  re-derives the seal from the persisted `WorkerResultRecorded` events —
+  exact subject, exact criteria, sealed input cited — and commits
+  `SubmitVerification`, which routes quality (pass → `Succeeded`,
+  fail → repair rounds then leader, blocked → parked). Stale subjects
+  are 409, malformed fail verdicts 400, unknown seals 404. Owner or
+  control only; the response is the receipt plus the task status.
 
 ## Reads: snapshots, pages, streams
 

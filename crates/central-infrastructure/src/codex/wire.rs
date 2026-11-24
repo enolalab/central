@@ -101,7 +101,7 @@ impl std::error::Error for RpcError {}
 pub fn encode_request(id: u64, method: &str, params: &Value) -> String {
     let params = canonical_params(params);
     format!(
-        r#"{{"id":{id},"method":{method},"params":{params}}}"#,
+        r#"{{"jsonrpc":"2.0","id":{id},"method":{method},"params":{params}}}"#,
         method = quote(method)
     )
 }
@@ -112,14 +112,14 @@ pub fn encode_response(id: &RpcId, result: &Value) -> String {
         RpcId::Num(n) => n.to_string(),
         RpcId::Str(s) => quote(s),
     };
-    format!(r#"{{"id":{id},"result":{result}}}"#)
+    format!(r#"{{"jsonrpc":"2.0","id":{id},"result":{result}}}"#)
 }
 
 /// Encode a client notification frame (without trailing newline).
 pub fn encode_notification(method: &str, params: &Value) -> String {
     let params = canonical_params(params);
     format!(
-        r#"{{"method":{method},"params":{params}}}"#,
+        r#"{{"jsonrpc":"2.0","method":{method},"params":{params}}}"#,
         method = quote(method)
     )
 }
@@ -512,5 +512,25 @@ mod tests {
         // token-shaped material.
         let prose = sanitize_text("see the cookie policy before retrying");
         assert_eq!(prose, "see the cookie policy before retrying");
+    }
+
+    #[test]
+    fn outbound_frames_carry_the_jsonrpc_member() {
+        // The muse session host answers -32600 to turn/start frames
+        // missing the JSON-RPC version member (verified live 2026-11-23);
+        // every client frame carries it, while inbound parsing stays
+        // lenient for older captures.
+        let request = encode_request(3, "turn/start", &json!({"a": 1}));
+        let frame: Value = serde_json::from_str(&request).expect("request encodes");
+        assert_eq!(frame["jsonrpc"], json!("2.0"));
+        assert_eq!(frame["id"], json!(3));
+        let notify = encode_notification("initialized", &json!({}));
+        let frame: Value = serde_json::from_str(&notify).expect("notify encodes");
+        assert_eq!(frame["jsonrpc"], json!("2.0"));
+        assert!(frame.get("id").is_none());
+        let response = encode_response(&RpcId::Num(7), &json!({}));
+        let frame: Value = serde_json::from_str(&response).expect("response encodes");
+        assert_eq!(frame["jsonrpc"], json!("2.0"));
+        assert_eq!(frame["id"], json!(7));
     }
 }

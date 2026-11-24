@@ -1,0 +1,30 @@
+{
+  "name": "central-muse-adapter",
+  "cliVersion": "1.4.24",
+  "cliVersionAllowlist": [
+    "1.4.20",
+    "1.4.23",
+    "1.4.24"
+  ],
+  "schemaVersion": 1,
+  "experimental": false,
+  "transport": "stdio JSONL (JSON-RPC 2.0, one frame per line)",
+  "frameCapBytes": 8388608,
+  "frameCapNote": "Measured 2026-11-17 across live echo + meta turns: largest single frame ~2 KB (session objects with sourceRange). 8 MiB inherits the Codex cap: ~4000x headroom, close-on-oversize proven by unit test, never partial parse.",
+  "notificationBufferCapacity": 256,
+  "allowProviderModelFallback": false,
+  "schemaProvenance": {
+    "generatedFromLiveCli": true,
+    "reason": "Schema exported offline on 2026-11-21 from installed muse 1.4.24 (stable surface, schemaVersion 1; identical 75 methods / 47 notifications / 2 requests / 39 error codes as 1.4.20+1.4.23 captures, ApprovalCuaBrowser def still present). The serve handshake was then exercised LIVE on 1.4.24 via the echo provider: initialize (+initialized notify) -> session/start (workspaceRoot composed, UUIDv7 commandId enforced server-side) -> turn/start -> turn/completed with session/tokenUsage + session/contextUsage. Approval/userInput request+decide flows are schema-captured but NOT live-exercised (echo never asks).",
+    "schemaSource": "muse schema generate-json-schema (stable, captured 2026-11-21, kept outside the repo)",
+    "liveHandshakeVerified": "1.4.24, 2026-11-21: echo turn flow (initialize/initialized/session-start/turn-start/turn-completed/tokenUsage/contextUsage); approval/request + userInput/request + decide/answer not exercised",
+    "observedUserAgent": "muse-build/1.4.24 (serve; linux-x86_64; build fbce3ce5091ab25c742c42b7f946aade0a0d8583)"
+  },
+  "policies": {
+    "timeoutAfterWrite": "OutcomeUnknown, never resend turn/start",
+    "oversizeFrame": "close transport, require reconciliation, never parse partial event",
+    "secretHandling": "logs and request errors redact token/secret/authorization material; no tokens or env in durable outbox",
+    "modelMismatch": "requested/observed model mismatch is a capability error, never silent fallback",
+    "usageSource": "usage is harvested from session/tokenUsage (usage/cumulative/totalTokens siblings) and session/contextUsage notifications, not from turn/completed (which carries terminal status only)"
+  }
+}

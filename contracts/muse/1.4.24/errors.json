@@ -1,0 +1,235 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Muse MSP error table (1.4.20, offline-exported)",
+  "description": "All 39 errors the muse 1.4.20 binary can emit, with Central's retry mapping. retryable=true means a bounded retry/backoff is safe; every other error fails the turn loudly. Approval/userInput errors (-32050..-32059) map to inbox semantics, never to silent retries.",
+  "provenance": {
+    "cliVersion": "1.4.24",
+    "schemaSource": "muse schema generate-json-schema (stable, captured 2026-11-21)",
+    "errorCount": 39
+  },
+  "errors": [
+    {
+      "code": -32700,
+      "kind": "parseError",
+      "retryable": false
+    },
+    {
+      "code": -32600,
+      "kind": "invalidRequest",
+      "overrideKinds": [
+        "notInitialized",
+        "alreadyInitialized"
+      ],
+      "retryable": false
+    },
+    {
+      "code": -32601,
+      "kind": "methodNotFound",
+      "overrideKinds": [
+        "experimentalRequired"
+      ],
+      "retryable": false
+    },
+    {
+      "code": -32602,
+      "kind": "invalidParams",
+      "overrideKinds": [
+        "experimentalRequired"
+      ],
+      "retryable": false
+    },
+    {
+      "code": -32603,
+      "kind": "internal",
+      "overrideKinds": [
+        "pageEventTooLarge",
+        "outputResultTooLarge"
+      ],
+      "retryable": false
+    },
+    {
+      "code": -32001,
+      "kind": "overloaded",
+      "retryable": true,
+      "central": "bounded retry with backoff"
+    },
+    {
+      "code": -32002,
+      "kind": "inputTooLarge",
+      "retryable": false
+    },
+    {
+      "code": -32010,
+      "kind": "capabilityRequired",
+      "retryable": false
+    },
+    {
+      "code": -32011,
+      "kind": "notFound",
+      "retryable": false
+    },
+    {
+      "code": -32013,
+      "kind": "interrupted",
+      "retryable": false
+    },
+    {
+      "code": -32014,
+      "kind": "cancelled",
+      "retryable": false
+    },
+    {
+      "code": -32020,
+      "kind": "sessionNotFound",
+      "retryable": false
+    },
+    {
+      "code": -32021,
+      "kind": "sessionInUse",
+      "retryable": false
+    },
+    {
+      "code": -32022,
+      "kind": "sessionAmbiguous",
+      "retryable": false
+    },
+    {
+      "code": -32023,
+      "kind": "forkBoundaryInvalid",
+      "retryable": false
+    },
+    {
+      "code": -32024,
+      "kind": "sessionNotLoaded",
+      "retryable": false
+    },
+    {
+      "code": -32025,
+      "kind": "sessionStreamMismatch",
+      "retryable": false
+    },
+    {
+      "code": -32030,
+      "kind": "commandRejected",
+      "retryable": false
+    },
+    {
+      "code": -32031,
+      "kind": "backpressured",
+      "retryable": true,
+      "central": "bounded retry with backoff"
+    },
+    {
+      "code": -32032,
+      "kind": "skillNotFound",
+      "retryable": false
+    },
+    {
+      "code": -32033,
+      "kind": "computerUseUnavailable",
+      "retryable": false
+    },
+    {
+      "code": -32034,
+      "kind": "marketplaceNotFound",
+      "retryable": false
+    },
+    {
+      "code": -32035,
+      "kind": "pluginNotFound",
+      "retryable": false
+    },
+    {
+      "code": -32036,
+      "kind": "marketplaceAlreadyExists",
+      "retryable": false
+    },
+    {
+      "code": -32037,
+      "kind": "pluginMutationsDisabled",
+      "retryable": false
+    },
+    {
+      "code": -32038,
+      "kind": "uploadNotFound",
+      "retryable": false
+    },
+    {
+      "code": -32040,
+      "kind": "viewTruncated",
+      "retryable": false
+    },
+    {
+      "code": -32041,
+      "kind": "outputUnavailable",
+      "retryable": false
+    },
+    {
+      "code": -32042,
+      "kind": "boundaryPruned",
+      "overrideKinds": [
+        "boundaryUnusable",
+        "noBoundary"
+      ],
+      "retryable": false
+    },
+    {
+      "code": -32050,
+      "kind": "approvalNotFound",
+      "retryable": false,
+      "central": "inbox: unknown key, 409"
+    },
+    {
+      "code": -32051,
+      "kind": "approvalAlreadyResolved",
+      "retryable": false,
+      "central": "inbox: already answered, Conflict"
+    },
+    {
+      "code": -32052,
+      "kind": "approvalChoiceInvalid",
+      "retryable": false,
+      "central": "inbox: validation error"
+    },
+    {
+      "code": -32053,
+      "kind": "approvalRequirementStale",
+      "retryable": false,
+      "central": "inbox: re-read pending, decide against currentRequirementId"
+    },
+    {
+      "code": -32054,
+      "kind": "approvalReviewerUnavailable",
+      "retryable": false
+    },
+    {
+      "code": -32055,
+      "kind": "userInputNotFound",
+      "retryable": false,
+      "central": "inbox: unknown key, 409"
+    },
+    {
+      "code": -32056,
+      "kind": "userInputAlreadySettled",
+      "retryable": false,
+      "central": "inbox: already answered, Conflict"
+    },
+    {
+      "code": -32057,
+      "kind": "userInputAnswerInvalid",
+      "retryable": false,
+      "central": "inbox: validation error"
+    },
+    {
+      "code": -32058,
+      "kind": "approvalBrokerUnavailable",
+      "retryable": true,
+      "central": "bounded retry with backoff"
+    },
+    {
+      "code": -32059,
+      "kind": "approvalResolving",
+      "retryable": false
+    }
+  ]
+}

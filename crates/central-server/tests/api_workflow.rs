@@ -342,6 +342,300 @@ fn plans_tasks_attempts_read_models() {
     assert_eq!(status, 404, "unknown task");
 }
 
+fn git_repo(name: &str) -> (std::path::PathBuf, String) {
+    let root = state_dir(name);
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("repo dir");
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_AUTHOR_NAME", "Central Test")
+            .env("GIT_AUTHOR_EMAIL", "central-test@local")
+            .env("GIT_COMMITTER_NAME", "Central Test")
+            .env("GIT_COMMITTER_EMAIL", "central-test@local")
+            .output()
+            .expect("spawn git");
+        assert!(output.status.success(), "git {args:?} failed");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    git(&["init"]);
+    std::fs::write(repo.join("calc.py"), "VALUE = 1\n").expect("fixture file");
+    git(&["add", "-A"]);
+    git(&["commit", "-m", "base"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    (repo, head)
+}
+
+fn poll_running(server: &Server, run: &str, task: &str) -> (String, serde_json::Value) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let snapshot = get_snapshot(server, run);
+        if let Some(attempt) = snapshot["state"]["attempts"]
+            .as_array()
+            .expect("attempts")
+            .iter()
+            .find(|a| {
+                a["task_id"] == task
+                    && (a["status"] == "Running" || a["status"] == "UnknownOutcome")
+            })
+        {
+            return (
+                attempt["attempt_id"]
+                    .as_str()
+                    .expect("attempt id")
+                    .to_string(),
+                snapshot,
+            );
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scan never dispatched task {task}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn import_result(
+    server: &Server,
+    token: &str,
+    run: &str,
+    attempt: &str,
+    input: &str,
+    candidate: &str,
+) -> serde_json::Value {
+    let (status, body) = post_until_settled(
+        server,
+        token,
+        &format!("/v1/runs/{run}/attempts/{attempt}/results"),
+        &serde_json::json!({"version": 1, "attemptId": attempt, "inputHash": input, "candidatePath": "out.txt", "candidateHash": candidate, "evidencePaths": [], "summary": "worker done"})
+            .to_string(),
+    );
+    assert_eq!(status, 200, "result import: {body}");
+    body
+}
+
+/// POST until the run stops moving under the scan loop. A 409 means the
+/// background tick committed first — nothing was applied, so the identical
+/// body is safe to resend. Any other status returns immediately.
+fn post_until_settled(
+    server: &Server,
+    token: &str,
+    path: &str,
+    body: &str,
+) -> (u16, serde_json::Value) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (status, text) = http("POST", &server.addr, path, Some(token), Some(body), &[]);
+        let value: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+        let code = value["error"]["code"].as_str().unwrap_or("");
+        let message = value["error"]["message"].as_str().unwrap_or("");
+        let raced =
+            status == 409 && (code == "stale_revision" || message.contains("expected revision"));
+        if !raced {
+            return (status, value);
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "run never settled for {path}: {text}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn verdict_body(
+    task: &str,
+    attempt: &str,
+    subject: &str,
+    criteria: &str,
+    outcome: &str,
+    failed: Vec<serde_json::Value>,
+) -> String {
+    serde_json::json!({
+        "task": task,
+        "attempt": attempt,
+        "verdict": {"version": 1, "subjectHash": subject, "criteriaHash": criteria, "outcome": outcome, "evidenceIds": ["input-seal"], "findings": "verifier judged the sealed candidate"},
+        "context": {"verifierThread": "verifier-9", "environment": "test-env", "checkRefs": ["check-1"], "failedCriteria": failed, "verifierWroteTrackedSource": false, "taintedEvidence": [], "sameSessionOverride": false},
+    })
+    .to_string()
+}
+
+fn task_status(snapshot: &serde_json::Value, task: &str) -> String {
+    snapshot["state"]["tasks"]
+        .as_array()
+        .expect("tasks")
+        .iter()
+        .find(|t| t["task_id"] == task)
+        .unwrap_or_else(|| panic!("no task {task}"))["status"]
+        .as_str()
+        .expect("status")
+        .to_string()
+}
+
+#[test]
+fn verdict_pass_moves_task_to_succeeded() {
+    let (repo, head) = git_repo("verdict-pass");
+    let dir = state_dir("verdict-pass-server");
+    let server = start_server_with_scan(&dir, "200");
+    let token = server.token();
+    let run = create_run(&server, 301);
+    let _hash = approve_fixture_plan(&server, &run, 302);
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/sync"),
+        Some(&token),
+        Some(
+            &serde_json::json!({"commit": head, "repository": repo.to_string_lossy()}).to_string(),
+        ),
+        &[],
+    );
+    assert_eq!(status, 200, "sync: {body}");
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/dispatch"),
+        Some(&token),
+        Some("{}"),
+        &[],
+    );
+    assert_eq!(status, 200, "dispatch: {body}");
+
+    let task = "00000000-0000-0000-0000-000000000001";
+    let (attempt, _) = poll_running(&server, &run, task);
+    let seal = import_result(
+        &server,
+        &token,
+        &run,
+        &attempt,
+        "input-seal",
+        "candidate-seal",
+    );
+    let criteria = seal["sealed"]["criteria_hash"]
+        .as_str()
+        .expect("criteria")
+        .to_string();
+    assert_eq!(
+        seal["sealed"]["status"], "awaiting_verification",
+        "seal parks: {seal}"
+    );
+
+    let (status, body) = post_until_settled(
+        &server,
+        &token,
+        &format!("/v1/runs/{run}/verdicts"),
+        &verdict_body(task, &attempt, "candidate-seal", &criteria, "pass", vec![]),
+    );
+    assert_eq!(status, 200, "verdict: {body}");
+    let snapshot = get_snapshot(&server, &run);
+    assert_eq!(
+        task_status(&snapshot, task),
+        "Succeeded",
+        "pass promotes: {snapshot}"
+    );
+
+    // A second verdict on the closed task is stale, never a double apply.
+    let (status, body) = post_until_settled(
+        &server,
+        &token,
+        &format!("/v1/runs/{run}/verdicts"),
+        &verdict_body(task, &attempt, "candidate-seal", &criteria, "pass", vec![]),
+    );
+    assert_eq!(status, 409, "re-verdict refused: {body}");
+}
+
+#[test]
+fn verdict_guards_seal_shape_and_scope() {
+    let (repo, head) = git_repo("verdict-guards");
+    let dir = state_dir("verdict-guards-server");
+    let server = start_server_with_scan(&dir, "200");
+    let token = server.token();
+    let run = create_run(&server, 311);
+    let _hash = approve_fixture_plan(&server, &run, 312);
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/sync"),
+        Some(&token),
+        Some(
+            &serde_json::json!({"commit": head, "repository": repo.to_string_lossy()}).to_string(),
+        ),
+        &[],
+    );
+    assert_eq!(status, 200, "sync: {body}");
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/dispatch"),
+        Some(&token),
+        Some("{}"),
+        &[],
+    );
+    assert_eq!(status, 200, "dispatch: {body}");
+
+    let task = "00000000-0000-0000-0000-000000000002";
+    let (attempt, _) = poll_running(&server, &run, task);
+    let seal = import_result(
+        &server,
+        &token,
+        &run,
+        &attempt,
+        "input-seal",
+        "candidate-seal",
+    );
+    let criteria = seal["sealed"]["criteria_hash"]
+        .as_str()
+        .expect("criteria")
+        .to_string();
+
+    // A verdict for another subject is stale: the seal stays parked.
+    let (status, body) = post_until_settled(
+        &server,
+        &token,
+        &format!("/v1/runs/{run}/verdicts"),
+        &verdict_body(task, &attempt, "candidate-other", &criteria, "pass", vec![]),
+    );
+    assert_eq!(status, 409, "foreign subject: {body}");
+    let snapshot = get_snapshot(&server, &run);
+    assert_eq!(
+        task_status(&snapshot, task),
+        "AwaitingVerification",
+        "still parked: {snapshot}"
+    );
+
+    // A fail that names no failed criteria is a 400, not a silent repair.
+    let (status, body) = post_until_settled(
+        &server,
+        &token,
+        &format!("/v1/runs/{run}/verdicts"),
+        &verdict_body(task, &attempt, "candidate-seal", &criteria, "fail", vec![]),
+    );
+    assert_eq!(status, 400, "empty fail: {body}");
+
+    // A read-scoped client may read but never judge.
+    let issued = issue_client(&server, "reader", "read");
+    let reader = client_token(&issued);
+    let (status, _) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/verdicts"),
+        Some(&reader),
+        Some(&verdict_body(
+            task,
+            &attempt,
+            "candidate-seal",
+            &criteria,
+            "fail",
+            vec![serde_json::json!("b done")],
+        )),
+        &[],
+    );
+    assert_eq!(status, 403, "read scope cannot judge");
+}
+
 #[test]
 fn worker_result_import_parks_without_passing() {
     let dir = state_dir("flow-results");
