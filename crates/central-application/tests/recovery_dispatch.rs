@@ -331,12 +331,27 @@ async fn stopped_run_with_intent(
     runtime: &Runtime,
     attempt_ids: &[u128],
 ) -> Vec<IntentId> {
+    stopped_run_with_statuses(
+        store,
+        runtime,
+        &attempt_ids
+            .iter()
+            .map(|id| (*id, AttemptStatus::Running))
+            .collect::<Vec<_>>(),
+    )
+    .await
+}
+
+async fn stopped_run_with_statuses(
+    store: &Arc<MemoryStore>,
+    runtime: &Runtime,
+    attempts: &[(u128, AttemptStatus)],
+) -> Vec<IntentId> {
     let mut state = created_state();
-    for id in attempt_ids {
-        state.attempts.insert(
-            AttemptId::from_u128(*id),
-            attempt(*id, AttemptStatus::Running),
-        );
+    for (id, status) in attempts {
+        state
+            .attempts
+            .insert(AttemptId::from_u128(*id), attempt(*id, *status));
     }
     store.seed_state(state);
     runtime
@@ -386,6 +401,27 @@ async fn dispatch_with_evidence_completes_intent() {
     let summary = runtime.dispatch_once(run_id()).await.expect("redispatch");
     assert_eq!(summary.dispatched, 0);
     assert_eq!(gateway.cancel_count(), 1);
+}
+
+#[tokio::test]
+async fn stop_cancels_unknown_outcome_attempts() {
+    let store = Arc::new(MemoryStore::default());
+    let gateway = Arc::new(FakeGateway::default());
+    let runtime = runtime(store.clone(), gateway.clone());
+    let intents =
+        stopped_run_with_statuses(&store, &runtime, &[(42, AttemptStatus::UnknownOutcome)]).await;
+    assert_eq!(intents.len(), 1, "stop reaches ambiguous attempts");
+
+    let summary = runtime.dispatch_once(run_id()).await.expect("dispatch");
+    assert_eq!(summary.dispatched, 1);
+    assert_eq!(summary.unknown, 0);
+    assert_eq!(gateway.cancel_count(), 1);
+    let state = store.load(run_id()).await.expect("load").expect("run");
+    assert_eq!(
+        state.attempts[&AttemptId::from_u128(42)].status,
+        AttemptStatus::Cancelled,
+        "a stopped run leaves no live child behind"
+    );
 }
 
 #[tokio::test]

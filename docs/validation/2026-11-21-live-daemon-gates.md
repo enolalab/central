@@ -253,3 +253,143 @@ free local, commit `c6935e6`:
   attempt `Cancelled`, không còn serve child. Kết luận giữ nguyên:
   dispatch pass không phải turn pass; completion live của leader turn
   vẫn chưa được chứng minh.
+
+## 10. Muse userInput/question (24/11 tối)
+
+- Code path đầy đủ và đã có test round-trip mới
+  `question_round_trip_reaches_the_wire` (stub server hỏi
+  `userInput/request` giữa turn → drain ra Question đúng preview →
+  answer thành đúng 1 frame `userInput/answer` với `selectedLabel` →
+  turn vẫn completed). Pass. Lần đầu viết test còn bắt được đúng
+  protocol MSP two-step (receipt ack trước, decision sau) — đã sửa stub
+  cho đọc tiếp frame 2 và trả lời command.
+- Live qua daemon (run `551e5bcb`, profile muse/muse-spark-1.3):
+  dispatch pass, session bind, serve child sống, reconcile thấy
+  Running. Nhưng session CLI đóng băng từ lúc dispatch (12 phút không
+  file mới, không question, inbox trống) — model không hoạt động,
+  nghi thiếu owner auth (`~/.muse` trống, không key env).
+- `stop`: attempt `Cancelled`, serve child bị reap — dọn sạch đã xác minh.
+- Kết luận: nửa vòng gateway (hỏi → đáp) đã chứng minh bằng test;
+  vòng live (model thật tự hỏi) UNVERIFIED — bị chặn trước cả bước hỏi,
+  cần owner auth rồi thử lại với task ép hỏi.
+
+## 11. opencode permission live (24/11 tối)
+
+- Nửa vòng gateway đã có cover: loopback test
+  `loopback_wire_speaks_verified_protocol` (permission request → answer
+  Once scope → `once` trên wire) + lab 17/11 reply/reject. LIST poll
+  live-verified từ trước.
+- Ép hỏi live: run `bf43a926` task shell `echo PERM-PROBE > probe.txt`
+  — bash CHẠY KHÔNG HỎI (auto-approve cả shell, probe.txt đúng nội
+  dung), turn sau đó kẹt im như pattern cũ. Run `4a2d5809` thêm
+  `opencode.json` (`{"permission": {"bash": "ask"}}`) vào fixture —
+  bash CHƯA BAO GIỜ CHẠY trong 12 phút (không probe.txt, inbox trống),
+  serve idle, ollama unload: cùng pattern kẹt, không kết luận được rule
+  có hiệu lực hay không.
+- `stop` cả hai run: attempt `Cancelled`, không còn serve child.
+- Kết luận: vòng hỏi→duyệt→tiếp tục live của permission vẫn
+  UNVERIFIED — bị chặn bởi turn kẹt (lần 5 liên tiếp tối nay, cả
+  opencode lẫn muse), không phải bởi Central (dispatch/attach/stop đều
+  pass). Cần đường turn ổn định rồi thử lại ask-rule.
+
+## 12. Tách biến model nặng vs harness kẹt (24/11 tối)
+
+- Giả thiết: turn kẹt vì `qwen3:4b` nặng/chậm. Thử `qwen2.5:3b`
+  (1.9 GB, profile `live-qwen25`, run `fdff6e1f`, cùng ask-rule +
+  cùng task shell).
+- Kết quả sau 10 phút: worktree mới TRỐNG (probe `PERM-PROBE` thấy ở
+  poll là file cũ của run trước), inbox trống, serve child sống nhưng
+  idle (6 s CPU/10 phút), ollama không load model — ĐÚNG pattern kẹt
+  của `qwen3:4b`. `stop`: attempt `Cancelled`, không còn serve child.
+- Kết luận: biến model bị LOẠI — kẹt không phụ thuộc model (3b cũng
+  như 4b). Blocker nằm ở phía harness (tương tác opencode serve ↔
+  ollama hoặc prompt/môi trường), và signature kẹt của Muse giống hệt
+  nên cũng chưa chắc do auth. Vòng hỏi→duyệt permission live vẫn
+  UNVERIFIED; bước tiếp theo là chẩn đoán stall ở tầng harness thay vì
+  đổi model.
+
+## 13. Sửa kết luận kẹt: turn xong trong ~90s, Central thụ động (24/11 tối)
+
+- §12 sai ở điểm "harness kẹt": bắt quả tang qua REST của serve cho
+  run `e1301c86` (attempt `fa28821f`, model `qwen2.5:3b`) — 6 chat call
+  200 trong 42 giây, session `outcome: succeeded`, permission list
+  TRỐNG. Turn hoàn tất phía serve; Central vẫn `Running` vì scan KHÔNG
+  observe tự động — chỉ inbox-reconcile (curl-only, chưa có CLI) mới
+  kéo observation (`observations: 1`, 2 event `ObservationRecorded`).
+  Đúng thiết kế passive (§3 bước 5), nhưng là ma sát đã ghi ở §7.
+- Vì sao model không làm gì: prompt ~60k token bị ollama cắt còn ~2k
+  (`truncating input prompt`, llama-server `-c 4096`). Run `ccb0e3d8`
+  gọi tool `read` vào path ảo `.ag-1442977557` → error → chat suông
+  hết turn (`succeeded` mà không artifact, không permission). Sáng cùng
+  truncation nhưng may mắn grounding được nên full loop.
+- Permission live VẪN UNVERIFIED: tối nay không turn nào thử gated
+  action (model còn chưa grounding xong). Muốn ép được phải hết cắt
+  context (tăng ctx ollama — quyết định của owner, chưa đụng).
+- `stop` dọn sạch attempt + serve child như mọi khi.
+
+## 14. Root cause clarity: 846 skills phình prompt 13 lần (24/11 tối)
+
+- Chuỗi chứng cứ: prompt serve ~60k token trong khi direct run cùng
+  model cũng 60k — đều auto-compact ngay call đầu → model làm theo
+  template summary (ghi file summary rác, gọi tool vào path ảo,
+  chat suông) → turn `succeeded` mà task không xong.
+- Tách biến bằng `HOME=/tmp/fakehome` (không skills): prompt còn
+  4666 token, model trả đúng `DIRECT-OK`, exit 0. Chênh 60k−4.7k đến
+  từ 846 skills trong `~/.agents/skills` (3.5 MB) mà opencode tự load.
+- Kết luận: blocker của mọi gap live tối nay là config bloat phía
+  owner, KHÔNG phải Central (dispatch/observe/reply đều pass),
+  không phải auth opencode, không phải model yếu, không phải
+  truncation tự thân (direct run cùng cắt mà xong khi prompt gọn).
+- Permission live vẫn UNVERIFIED nhưng đường đã thông: model
+  grounded sẽ thử gated action → serve park → Central drain qua
+  inbox-reconcile → approve → tiếp tục. Cần prune skills (hoặc ctx
+  vừa 60k+) rồi chạy lại probe ask-rule.
+- Giữ nguyên `qwen2.5:3b-64k` (load được `-c 32768`, có ích khi prompt
+  gọn) và fixture ask-rule `c1ecbd6` cho lần thử lại.
+
+## 15. Tách biến skills bằng symlink (24/11 tối, theo ý kiến owner)
+
+- Owner cho rằng skills không phải thủ phạm nên không prune. Kiểm
+  chứng bằng `HOME=/tmp/fakehome2` chỉ symlink `.agents` (không MCP,
+  không config khác): prompt vọt lại 59070/59108 token (so với 4666
+  khi HOME sạch). Skills là delta duy nhất — kết luận bloat đứng vững
+  về số liệu; quyết định không prune là của owner, tôn trọng.
+- Chi tiết mới: call đầu 4666 rồi mới 59k — skill injection bất đồng
+  bộ (prompt đầu đi trước khi skills load xong). Model sau đó gọi
+  `read summary.json` (ảo giác từ template) lỗi rồi chat suông.
+- Hệ quả cho gap permission: không prune thì cần ctx vừa 60k+ (VRAM
+  hiện tại ollama chỉ dám cấp 32k cho 3b) hoặc giảm skills phía
+  opencode. Vòng hỏi→duyệt live vẫn UNVERIFIED vì model chưa bao giờ
+  grounding đủ để thử gated action.
+
+## 16. Vòng permission live hoàn chỉnh + 2 bug (24/11 tối)
+
+- Hỏi: run `8f022556` (ask-rule bash+edit) model thử
+  `shell [echo PERM-PROBE > probe.txt]` → Central drain thành inbox
+  `Approval/Pending` đúng preview qua reconcile. Đây là lần đầu thấy
+  permission thật qua daemon.
+- Duyệt: BUG — `parse_key` từ chối part rỗng, mà key permission
+  opencode luôn có `turn_id` rỗng → 400 mọi approve/answer. Đã sửa
+  (cho phép turn rỗng, giữ chặn các part khác) + 2 unit test
+  (`opencode_permission_keys_parse_with_empty_turn`,
+  `malformed_keys_stay_rejected`). Rebuild + restart daemon rồi duyệt
+  lại: `applied` rev 10.
+- Tiếp tục: reply `once` tới serve (permission list về `[]`),
+  bash CHẠY, `probe.txt` đúng `PERM-PROBE`. Vòng hỏi→duyệt→thực thi
+  live VERIFIED.
+- Đuôi turn: attempt `UnknownOutcome` (reconcile dồn dập của tôi đua
+  với reply send) rồi model park sau tool (0 call 6+ phút, serve
+  idle) — session vẫn mở phía serve. Ma sát quan sát/thiết kế, không
+  thuộc vòng permission.
+- Dọn: BUG/GAP thứ hai — stop chỉ enqueue cancel cho
+  Running/Dispatching/Waiting*/(không có UnknownOutcome) nên child
+  của attempt `UnknownOutcome` sống sót sau stop (serve 779204 sống
+  14+ phút). Đã sửa (UnknownOutcome vào cancel set, kill có kiểm tra
+  identity) + test `stop_cancels_unknown_outcome_attempts`. Chưa kịp
+  live-verify fix này vì child cũ chết theo restart daemon; kill-machinery
+  đã proven trên Running attempts, unit test cover decision.
+- Bài học vận hành: KHÔNG restart daemon giữa turn live (giết serve
+  child, approve sau đó ghi vào session chết).
+- Gate: fmt sạch, clippy sạch, `cargo check` sạch, full suite 44
+  binary xanh (1 lỗi compile thoáng qua ở lần chạy đầu, 3 lần sau +
+  check đều sạch — chưa tái hiện). Commit gộp sau theo yêu cầu.

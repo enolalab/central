@@ -38,9 +38,18 @@ fn runtime_for(state: &AppState, run_id: RunId) -> Runtime {
 
 /// Parse a canonical inbox key: `provider:epoch:thread:turn:item:request`.
 /// Thread and epoch ids never contain `:`, so a six-part split is exact.
+/// The turn segment may be empty: harness requests without turn scope
+/// (opencode permissions) canonicalize with an empty turn id, and
+/// refusing them here would block every such approval at the public
+/// surface while the gateway still holds the live wire route.
 fn parse_key(raw: &str) -> Result<InboxKey, String> {
     let parts: Vec<&str> = raw.split(':').collect();
-    if parts.len() != 6 || parts.iter().any(|part| part.is_empty()) {
+    if parts.len() != 6
+        || parts
+            .iter()
+            .enumerate()
+            .any(|(index, part)| part.is_empty() && index != 3)
+    {
         return Err(format!(
             "invalid inbox key {raw:?}; expected provider:epoch:thread:turn:item:request"
         ));
@@ -332,4 +341,34 @@ pub async fn post_reconcile(
         "run_id": run_id.to_string(),
         "reconcile": summary,
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_key;
+
+    #[test]
+    fn opencode_permission_keys_parse_with_empty_turn() {
+        let key = parse_key("opencode:epoch-1:ses_live::per_20e3d3f84001cUaO8tLSu0AuGP:permission")
+            .expect("turn-less permission keys are valid");
+        assert_eq!(key.provider, "opencode");
+        assert_eq!(key.turn_id, "");
+        assert_eq!(key.item_id, "per_20e3d3f84001cUaO8tLSu0AuGP");
+        assert_eq!(
+            key.canonical(),
+            "opencode:epoch-1:ses_live::per_20e3d3f84001cUaO8tLSu0AuGP:permission"
+        );
+    }
+
+    #[test]
+    fn malformed_keys_stay_rejected() {
+        for raw in [
+            "opencode:epoch-1:ses_live:turn-1:per_1",
+            "opencode:epoch-1:ses_live:turn-1:per_1:permission:extra",
+            ":epoch-1:ses_live:turn-1:per_1:permission",
+            "opencode::ses_live:turn-1:per_1:permission",
+        ] {
+            assert!(parse_key(raw).is_err(), "rejected: {raw}");
+        }
+    }
 }

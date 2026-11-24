@@ -276,12 +276,18 @@ pub fn decide(
             next.control = RunControl::Stopped;
             let mut effects = Vec::new();
             for attempt in next.attempts.values_mut() {
+                // UnknownOutcome joins the cancel set: the harness session
+                // may still be live (an ambiguous send or a lost poll never
+                // proves the child dead), and a stopped run must not leak
+                // serve processes. The kill is identity-checked, so a dead
+                // session refuses instead of touching a recycled pid.
                 if matches!(
                     attempt.status,
                     AttemptStatus::Running
                         | AttemptStatus::Dispatching
                         | AttemptStatus::WaitingForApproval
                         | AttemptStatus::WaitingForInput
+                        | AttemptStatus::UnknownOutcome
                 ) {
                     attempt.status = AttemptStatus::Reconciling;
                     effects.push(Effect::CancelAttempt {
