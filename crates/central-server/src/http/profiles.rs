@@ -174,3 +174,92 @@ pub async fn create_profile(
         capability_for(&state, &record).await,
     )))
 }
+
+fn runtime_for(state: &AppState, run_id: central_domain::RunId) -> central_application::Runtime {
+    central_application::Runtime::new(
+        std::sync::Arc::clone(&state.store),
+        std::sync::Arc::clone(&state.clock),
+        std::sync::Arc::clone(&state.ids),
+        std::sync::Arc::clone(&state.agent),
+        run_id,
+    )
+}
+
+/// Bind (or clear, with `null`) the run-wide profile for one agent role:
+/// `POST /v1/runs/{id}/profile`. Worker attempts without a pinned task
+/// profile dispatch through the worker default; leader reviews dispatch
+/// only through the leader profile. Setting a profile never touches live
+/// work: only later dispatches resolve through it. Owner or control only.
+pub async fn post_run_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
+    let run_id = raw_id.parse::<central_domain::RunId>().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
+    })?;
+    let submitted: RunProfileBody = serde_json::from_str(&body).map_err(|error| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run profile binding: {error}"),
+        )
+    })?;
+    let role = match submitted.role.as_str() {
+        "worker" => central_domain::ProfileRole::Worker,
+        "leader" => central_domain::ProfileRole::Leader,
+        other => {
+            return Err(error_response(
+                StatusCode::BAD_REQUEST,
+                "validation_failed",
+                format!("unknown role {other:?}; want \"worker\" or \"leader\""),
+            ));
+        }
+    };
+    let profile = match submitted.profile.as_deref() {
+        None | Some("") => None,
+        Some(raw) => Some(
+            raw.trim()
+                .parse::<central_domain::ProfileId>()
+                .map_err(|_| {
+                    error_response(
+                        StatusCode::BAD_REQUEST,
+                        "validation_failed",
+                        format!("invalid profile id: {raw}"),
+                    )
+                })?,
+        ),
+    };
+    let receipt = runtime_for(&state, run_id)
+        .set_run_profile(auth.actor, role, profile)
+        .await
+        .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
+    let receipt = serde_json::to_value(&receipt).map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("cannot encode receipt: {error}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.to_string(),
+        "receipt": receipt,
+        "profile": {"role": submitted.role, "profile": submitted.profile},
+    })))
+}
+
+/// The run-profile binding body: which role selects what, or `null` to
+/// clear back to defer-when-unpinned.
+#[derive(Deserialize)]
+struct RunProfileBody {
+    role: String,
+    profile: Option<String>,
+}

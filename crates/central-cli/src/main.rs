@@ -72,6 +72,11 @@ pub enum Commands {
         #[command(subcommand)]
         command: VerdictCommands,
     },
+    /// Leader operations: ask the run's leader to review a task.
+    Leader {
+        #[command(subcommand)]
+        command: LeaderCommands,
+    },
     /// Show pending approval/question entries for a run.
     Inbox {
         #[arg(long)]
@@ -352,6 +357,21 @@ pub enum VerdictCommands {
 }
 
 #[derive(Subcommand)]
+pub enum LeaderCommands {
+    /// Ask the run's leader to review a task: queues one leader turn
+    /// through the leader profile. The task keeps its status; the
+    /// review output returns through handover import.
+    Ask {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        task: TaskId,
+        #[arg(long)]
+        objective: String,
+    },
+}
+
+#[derive(Subcommand)]
 pub enum ProfileCommands {
     /// List stored profiles with capability assessment.
     List,
@@ -372,6 +392,19 @@ pub enum ProfileCommands {
         model: String,
         #[arg(long)]
         effort: Option<String>,
+    },
+    /// Bind (or with --clear, unbind) a run-wide profile for one role:
+    /// worker attempts without a pinned task profile use the default,
+    /// leader reviews use only the leader profile.
+    Use {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        role: String,
+        #[arg(long)]
+        profile: Option<String>,
+        #[arg(long)]
+        clear: bool,
     },
 }
 

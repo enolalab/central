@@ -19,8 +19,8 @@ use std::sync::Arc;
 
 use central_domain::{
     admission, eligible_tasks, eligible_tasks_ignoring_gate, live_attempt_count, render_input,
-    Actor, Admission, Command, CommandEnvelope, ResolvedProfile, RetryPolicy, RunId, RunState,
-    Task, TaskId, WorkRequest, WorkRole,
+    Actor, Admission, AttemptId, Command, CommandEnvelope, ResolvedProfile, RetryPolicy, RunId,
+    RunState, Task, TaskId, WorkRequest, WorkRole,
 };
 
 use crate::contracts::{AppError, DispatchSummary};
@@ -32,8 +32,12 @@ use crate::Runtime;
 
 /// Resolves the frozen profile an attempt dispatches with. The scheduler
 /// never invents profiles: tests hand one in, production wires the
-/// profile layers (P2/T2) here.
-pub type ProfileResolver = dyn Fn(&Task) -> Option<ResolvedProfile> + Send + Sync;
+/// profile layers (P2/T2) here. The run state selects the layer: leader
+/// attempts always use the run's leader profile, pinned tasks use their
+/// own profile, unpinned tasks fall back to the run default (see the
+/// scan wiring for the production layering).
+pub type ProfileResolver =
+    dyn Fn(&RunState, &Task, AttemptId) -> Option<ResolvedProfile> + Send + Sync;
 
 /// MVP default: two implementation attempts run side by side.
 pub const DEFAULT_MAX_PARALLEL: usize = 2;
@@ -182,7 +186,16 @@ impl Scheduler {
     fn effective_resolver(&self) -> Arc<ProfileResolver> {
         let base = Arc::clone(&self.resolver);
         let fallbacks = Arc::clone(&self.fallbacks);
-        Arc::new(move |task: &Task| fallbacks.get(task.id).or_else(|| base(task)))
+        Arc::new(move |state: &RunState, task: &Task, attempt: AttemptId| {
+            // Leader reviews never inherit a worker fallback: they
+            // always resolve through the run's leader profile.
+            if !state.leader_attempts.contains(&attempt) {
+                if let Some(profile) = fallbacks.get(task.id) {
+                    return Some(profile);
+                }
+            }
+            base(state, task, attempt)
+        })
     }
 
     pub fn config(&self) -> &SchedulerConfig {

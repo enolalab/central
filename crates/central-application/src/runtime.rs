@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use central_domain::{
-    decide_envelope, Actor, AttemptStatus, CommandEnvelope, Effect, RunControl, RunId, RunState,
+    decide_envelope, Actor, AttemptId, AttemptStatus, Command, CommandEnvelope, Effect, Event,
+    ProfileId, ProfileRole, RunControl, RunId, RunState, TaskId,
 };
 
 use crate::contracts::{
@@ -151,6 +152,115 @@ impl Runtime {
         // Atomic commit; the store re-checks dedup and CAS inside its
         // transaction, so a racing duplicate resolves there, not here.
         self.store.commit(batch).await
+    }
+
+    /// Set (or clear) the run-wide profile for one agent role. The id is
+    /// validated against the profile store first, so a typo fails here
+    /// with the available profiles instead of deferring every later
+    /// dispatch silently.
+    pub async fn set_run_profile(
+        &self,
+        actor: Actor,
+        role: ProfileRole,
+        profile: Option<ProfileId>,
+    ) -> Result<Receipt, AppError> {
+        if let Some(id) = &profile {
+            if self.store.get_profile(&id.to_string()).await?.is_none() {
+                return Err(AppError::NotFound(format!(
+                    "profile {id} is unknown; list profiles before binding one to run {}",
+                    self.run_id,
+                )));
+            }
+        }
+        self.execute(
+            actor,
+            CommandEnvelope {
+                id: self.ids.next_command_id(),
+                expected_revision: None,
+                command: Command::SetRunProfile { role, profile },
+            },
+        )
+        .await
+    }
+
+    /// Queue one leader review turn against a task and return its attempt
+    /// id. The prompt names the task, its verify criteria and the latest
+    /// sealed candidate (when one exists); the leader advises through
+    /// the gateway with the run's leader profile, and the output returns
+    /// through handover import, never through worker-result import.
+    pub async fn queue_leader_review(
+        &self,
+        actor: Actor,
+        task: TaskId,
+        objective: &str,
+    ) -> Result<(Receipt, AttemptId), AppError> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            return Err(AppError::Validation(
+                "a leader review needs a non-empty objective".to_string(),
+            ));
+        }
+        let Some(state) = self.store.load(self.run_id).await? else {
+            return Err(AppError::NotFound(format!("run {} not found", self.run_id)));
+        };
+        let task_state = state.tasks.get(&task).ok_or_else(|| {
+            AppError::NotFound(format!("task {task} is not part of run {}", self.run_id))
+        })?;
+        // Bind the latest sealed candidate (if any) so the review names
+        // the exact input/candidate/criteria triple it judges; without a
+        // seal yet the leader reviews the task as stated.
+        let mut sealed: Option<(String, String, String)> = None;
+        for event in self.store.events(self.run_id).await? {
+            if let Event::WorkerResultRecorded {
+                task: event_task,
+                input_hash,
+                candidate_hash,
+                criteria_hash,
+                ..
+            } = event
+            {
+                if event_task == task {
+                    sealed = Some((
+                        input_hash.to_string(),
+                        candidate_hash.to_string(),
+                        criteria_hash.to_string(),
+                    ));
+                }
+            }
+        }
+        let criteria = task_state.verify.criteria.join("; ");
+        let mut input = format!(
+            "Leader review for task {task} (\"{}\").\nTask objective: {}\nVerify criteria: {}.\n",
+            objective, task_state.objective, criteria,
+        );
+        match sealed {
+            Some((input_hash, candidate_hash, criteria_hash)) => {
+                input.push_str(&format!(
+                    "Sealed candidate: {candidate_hash} (input {input_hash}, criteria {criteria_hash}).\n"
+                ));
+            }
+            None => input.push_str("No sealed candidate yet: review the task as stated.\n"),
+        }
+        input.push_str(
+            "Advise with findings and one concrete next step. Do not edit anything: \
+             your output returns through handover import.",
+        );
+        let attempt = self.ids.next_attempt_id();
+        let receipt = self
+            .execute(
+                actor,
+                CommandEnvelope {
+                    id: self.ids.next_command_id(),
+                    expected_revision: None,
+                    command: Command::QueueLeaderReview {
+                        attempt,
+                        task,
+                        input,
+                    },
+                },
+            )
+            .await?;
+        Ok((receipt, attempt))
     }
 
     /// Startup recovery for every known run. Nonterminal runs are

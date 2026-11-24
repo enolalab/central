@@ -125,6 +125,8 @@ pub fn project_state(state: &RunState) -> serde_json::Value {
         "holds": state.holds.iter().map(|hold| format!("{hold:?}")).collect::<Vec<_>>(),
         "active_plan": state.active_plan.as_ref().map(|hash| hash.to_string()),
         "pending_plan": state.pending_plan.as_ref().map(|hash| hash.to_string()),
+        "worker_profile": state.worker_profile.as_ref().map(|id| id.to_string()),
+        "leader_profile": state.leader_profile.as_ref().map(|id| id.to_string()),
         "plans": plans,
         "tasks": tasks,
         "attempts": attempts,

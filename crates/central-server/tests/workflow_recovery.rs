@@ -385,7 +385,7 @@ impl Harness {
             self.ids.clone() as Arc<dyn IdSource>,
             self.gateway.clone() as Arc<dyn AgentGateway>,
             SchedulerConfig::default(),
-            Arc::new(|_| Some(matching_profile())),
+            Arc::new(|_, _, _| Some(matching_profile())),
             system(),
         )
         .expect("valid scheduler config")
@@ -1052,7 +1052,6 @@ async fn scan_tick_all_leaves_parked_run_untouched() {
     let ids: Arc<dyn IdSource> = h.ids.clone();
     let agent: Arc<dyn AgentGateway> = h.gateway.clone();
     let mut last_tick = HashMap::new();
-    let profiles = central_server::scan::empty_profile_cache();
     let secrets = std::sync::Arc::new(central_application::inbox::SecretVault::new());
     let (ticked, sent, _) = tick_all(
         &store,
@@ -1061,7 +1060,6 @@ async fn scan_tick_all_leaves_parked_run_untouched() {
         &agent,
         &system(),
         &ScanConfig::disabled(true),
-        &profiles,
         &secrets,
         None,
         &mut last_tick,

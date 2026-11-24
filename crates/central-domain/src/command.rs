@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     quality::VerificationReport, ActorId, AnswerPayload, AttemptId, AttemptSession, CommandId,
     ContentHash, InboxKey, InboxRequest, Observation, PlanDocumentV1, PlanHash, ProfileId,
-    ReuseBindings, ReuseDecision, Revision, TaskId, Timestamp, UsageLimits, UsageObservation,
+    ProfileRole, ReuseBindings, ReuseDecision, Revision, TaskId, Timestamp, UsageLimits,
+    UsageObservation,
 };
 
 /// Internal identity kind. The actor is derived from auth/session mapping,
@@ -279,6 +280,25 @@ pub enum Command {
         previous_head: String,
         new_head: String,
         check_evidence: Vec<String>,
+    },
+    /// Set (or clear, with `None`) the run-wide profile for one agent
+    /// role. Worker attempts without a pinned profile resolve through
+    /// the worker default; leader review attempts resolve only through
+    /// the leader profile. Setting a profile never touches live work:
+    /// attempts keep the profile they dispatched with. User only.
+    SetRunProfile {
+        role: ProfileRole,
+        profile: Option<ProfileId>,
+    },
+    /// Queue one leader review turn against a task. The leader reads
+    /// the task (and any sealed candidate) and advises; it never seals
+    /// a worker candidate. The task is not moved: it keeps its status
+    /// while the review runs, and the review's output returns through
+    /// handover import, never through worker-result import. User only.
+    QueueLeaderReview {
+        attempt: AttemptId,
+        task: TaskId,
+        input: String,
     },
 }
 

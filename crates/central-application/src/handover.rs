@@ -176,6 +176,12 @@ pub fn accept_worker_result(state: &RunState, result: &WorkerResultV1) -> Result
             result.attempt_id, state.id,
         )));
     }
+    if state.leader_attempts.contains(&result.attempt_id) {
+        return Err(AppError::Validation(format!(
+            "attempt {} is a leader review, not a worker candidate: import a handover, not a worker result",
+            result.attempt_id,
+        )));
+    }
     check_candidate_path(&result.candidate_path)?;
     Ok(())
 }

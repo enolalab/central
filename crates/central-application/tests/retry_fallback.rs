@@ -428,7 +428,7 @@ impl Harness {
             self.ids.clone() as Arc<dyn IdSource>,
             self.gateway.clone() as Arc<dyn AgentGateway>,
             SchedulerConfig::default(),
-            Arc::new(|_| Some(primary_profile())),
+            Arc::new(|_, _, _| Some(primary_profile())),
             system(),
         )
         .expect("valid scheduler config")
@@ -445,7 +445,7 @@ impl Harness {
                 retry_policy,
                 ..SchedulerConfig::default()
             },
-            Arc::new(|_| Some(primary_profile())),
+            Arc::new(|_, _, _| Some(primary_profile())),
             system(),
         )
         .expect("valid scheduler config")

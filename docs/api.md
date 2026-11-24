@@ -67,6 +67,23 @@ Task outcomes arrive later through reads, events and verification.
   fail → repair rounds then leader, blocked → parked). Stale subjects
   are 409, malformed fail verdicts 400, unknown seals 404. Owner or
   control only; the response is the receipt plus the task status.
+- `POST /v1/runs/{id}/profile` binds (`{"role","profile"}`) or unbinds
+  (`"profile": null`) the run-wide agent profile for one role
+  (`worker` or `leader`). Worker attempts with no pinned task profile
+  dispatch through the run default; pinned tasks keep their own
+  profile; leader reviews dispatch only through the leader profile.
+  Unknown runs or profiles are 404, bad roles 400, reader/bridge
+  tokens 403.
+- `POST /v1/runs/{id}/leader/review` (`{"task","objective"}`) queues
+  one leader review turn. The scan dispatches it through the run's
+  leader profile with the same gateway machinery as worker turns; the
+  review never seals a candidate and the task keeps its status, so the
+  leader stays a reviewer, never a shadow worker. Unknown runs/tasks
+  are 404. Covering rule (live-verified 24/11): an active leader review
+  covers its task — no worker attempt queues until it settles — while a
+  running worker never blocks a queued leader review. Cancel is async
+  through the scan outbox: `stop` parks the attempt at once, the serve
+  child is reaped on the next tick, not instantly.
 
 ## Reads: snapshots, pages, streams
 

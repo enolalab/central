@@ -114,6 +114,9 @@ central answer --run <id> --key <k> --preview-hash <h> --message "go on"
 central chat --run <id> --message "Should we split task A?"
 central usage ... # `central budget --run <id>` shows the ledger
 central pause|resume|stop --run <id>
+central profiles use --run <id> --role worker --profile <pid>  # run default agent+model
+central profiles use --run <id> --role leader --profile <pid>  # leader turn profile
+central leader ask --run <id> --task <t> --objective "review it"  # real dispatched turn
 central sync --run <id> --commit <sha>         # daemon verifies read-only
 central clients create --name laptop --scope read
 ```

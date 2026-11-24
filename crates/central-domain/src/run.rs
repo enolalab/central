@@ -27,6 +27,17 @@ pub enum HoldReason {
     ResourceConflict,
 }
 
+/// Which agent role a run-level profile selects for. Workers run tasks;
+/// the leader reviews parked work on explicit request. The role only
+/// decides which profile resolves an attempt — both roles dispatch
+/// through the same gateway with the same approval/cancel/reconcile
+/// machinery, and usage ledgers never distinguish them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProfileRole {
+    Worker,
+    Leader,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TaskStatus {
     Pending,
@@ -303,6 +314,23 @@ pub struct RunState {
     /// a late result inserts here without touching the active revision.
     #[serde(default)]
     pub stale_candidates: BTreeMap<AttemptId, StaleCandidate>,
+    /// Run-wide default profile for worker attempts without a pinned
+    /// profile. Set explicitly by the owner; unpinned tasks dispatch on
+    /// this before any fallback, but it never overrides a task pin.
+    #[serde(default)]
+    pub worker_profile: Option<ProfileId>,
+    /// Run-wide profile for leader review attempts, selected the same
+    /// way as the worker profile. Leader dispatches use only this
+    /// profile (or defer when unset); they never fall back to a worker
+    /// profile, so a leader review visibly runs as the chosen agent.
+    #[serde(default)]
+    pub leader_profile: Option<ProfileId>,
+    /// Attempts that are leader reviews, not worker candidates. They
+    /// dispatch through the run's leader profile, they never seal a
+    /// worker candidate, and their output returns via handover — never
+    /// through worker-result import.
+    #[serde(default)]
+    pub leader_attempts: BTreeSet<AttemptId>,
 }
 
 impl RunState {
@@ -337,6 +365,9 @@ impl RunState {
             pending_revision: None,
             revision_holds: BTreeSet::new(),
             stale_candidates: BTreeMap::new(),
+            worker_profile: None,
+            leader_profile: None,
+            leader_attempts: BTreeSet::new(),
         }
     }
 

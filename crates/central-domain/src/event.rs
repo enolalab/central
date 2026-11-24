@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     quality::QualityDecision, revision::ReuseDecision, ActorId, AttemptId, ContentHash, InboxKind,
-    InboxOutcome, PlanHash, ProfileId, RunId, TaskId, Timestamp, VerificationOutcome,
+    InboxOutcome, PlanHash, ProfileId, ProfileRole, RunId, TaskId, Timestamp, VerificationOutcome,
 };
 
 /// Default for [`Event::VerificationDisputed::decision`] when decoding
@@ -138,6 +138,17 @@ pub enum Event {
         previous_head: String,
         new_head: String,
         check_evidence: Vec<String>,
+        by: ActorId,
+        at: Timestamp,
+    },
+    /// A run-wide profile binding changed: which provider/model the
+    /// named role resolves through from now on (`None` clears back to
+    /// defer-when-unpinned). Attempts keep the profile they dispatched
+    /// with; only later dispatches see the new default.
+    RunProfileSet {
+        run_id: RunId,
+        role: ProfileRole,
+        profile: Option<ProfileId>,
         by: ActorId,
         at: Timestamp,
     },
@@ -326,7 +337,8 @@ impl Event {
             | Self::StaleCandidateRecorded { run_id, .. }
             | Self::ReuseAssessed { run_id, .. }
             | Self::WorkerResultRecorded { run_id, .. }
-            | Self::IntegrationPromoted { run_id, .. } => *run_id,
+            | Self::IntegrationPromoted { run_id, .. }
+            | Self::RunProfileSet { run_id, .. } => *run_id,
         }
     }
 
@@ -363,7 +375,8 @@ impl Event {
             | Self::StaleCandidateRecorded { at, .. }
             | Self::ReuseAssessed { at, .. }
             | Self::WorkerResultRecorded { at, .. }
-            | Self::IntegrationPromoted { at, .. } => *at,
+            | Self::IntegrationPromoted { at, .. }
+            | Self::RunProfileSet { at, .. } => *at,
         }
     }
 }

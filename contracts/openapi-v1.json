@@ -452,6 +452,54 @@
     }
    }
   },
+  "/v1/runs/{id}/profile": {
+   "post": {
+    "summary": "Bind (or with null, unbind) the run-wide agent profile for one role. Worker attempts without a pinned task profile dispatch through the worker default; leader reviews dispatch only through the leader profile. Unknown ids are refused. Owner or control only.",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "receipt plus bound role and profile"
+     },
+     "400": {
+      "description": "malformed binding"
+     },
+     "403": {
+      "description": "reader or bridge token"
+     },
+     "404": {
+      "description": "unknown run or unknown profile"
+     }
+    }
+   }
+  },
+  "/v1/runs/{id}/leader/review": {
+   "post": {
+    "summary": "Queue one leader review turn against a task. The review dispatches through the run's leader profile with the same gateway machinery as worker turns; it never seals a candidate and the task keeps its status. Owner or control only.",
+    "security": [
+     {
+      "bearer": []
+     }
+    ],
+    "responses": {
+     "200": {
+      "description": "receipt plus queued attempt id"
+     },
+     "400": {
+      "description": "malformed review request"
+     },
+     "403": {
+      "description": "reader or bridge token"
+     },
+     "404": {
+      "description": "unknown run or task"
+     }
+    }
+   }
+  },
   "/v1/runs/{id}/usage": {
    "get": {
     "summary": "Usage ledger with the observed/estimated/unknown split plus the admission reason.",

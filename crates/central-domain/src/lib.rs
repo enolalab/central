@@ -57,7 +57,8 @@ pub use revision::{
 };
 pub use run::{
     Artifact, Attempt, AttemptSession, AttemptStatus, HoldReason, Observation, PlanRevision,
-    PlanStatus, RunControl, RunState, Task, TaskStatus, UsageLedger, VerificationOutcome,
+    PlanStatus, ProfileRole, RunControl, RunState, Task, TaskStatus, UsageLedger,
+    VerificationOutcome,
 };
 pub use scheduling::{
     covering_attempt, eligible_tasks, eligible_tasks_ignoring_gate, is_confirmed_terminal,

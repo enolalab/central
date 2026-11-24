@@ -16,8 +16,8 @@ use central_infrastructure::process::{spawn_detached, DetachPlacement, ALREADY_R
 
 use crate::client::{health_ok, read_server_info, resolve_state_dir, DaemonClient};
 use crate::{
-    Cli, ClientCommands, Commands, DaemonCommands, HandoverCommands, MaintenanceCommands,
-    PlanCommands, ProfileCommands, ResultCommands, VerdictCommands,
+    Cli, ClientCommands, Commands, DaemonCommands, HandoverCommands, LeaderCommands,
+    MaintenanceCommands, PlanCommands, ProfileCommands, ResultCommands, VerdictCommands,
 };
 
 fn print_json(value: &serde_json::Value) {
@@ -92,6 +92,7 @@ pub fn execute(cli: Cli) -> i32 {
         Commands::Result { command } => result(&state_dir, command),
         Commands::Handover { command } => handover_cmd(&state_dir, command),
         Commands::Verdict { command } => verdict_cmd(&state_dir, command),
+        Commands::Leader { command } => leader_cmd(&state_dir, command),
         Commands::Budget { run } => budget(&state_dir, run),
         Commands::UsageResolve {
             run,
@@ -862,6 +863,26 @@ fn profiles(state_dir: &Path, command: &ProfileCommands) -> i32 {
             }
             client.post_json("/v1/profiles", &body)
         }
+        ProfileCommands::Use {
+            run,
+            role,
+            profile,
+            clear,
+        } => {
+            let body = if *clear {
+                serde_json::json!({"role": role, "profile": null})
+            } else {
+                match profile {
+                    Some(id) => serde_json::json!({"role": role, "profile": id}),
+                    None => {
+                        return fail(
+                            "set --profile <id> or pass --clear to unbind the run default",
+                        );
+                    }
+                }
+            };
+            client.post_json(&format!("/v1/runs/{run}/profile"), &body)
+        }
     };
     match result {
         Ok(value) => {
@@ -1130,6 +1151,32 @@ fn verdict_cmd(state_dir: &Path, command: &VerdictCommands) -> i32 {
         Err(message) => return fail(&message),
     }
     match client.post_text(&format!("/v1/runs/{run}/verdicts"), &text) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Ask the run's leader to review a task: queues one leader turn through
+/// the run's leader profile. The task keeps its status; the review
+/// output returns through handover import.
+fn leader_cmd(state_dir: &Path, command: &LeaderCommands) -> i32 {
+    let LeaderCommands::Ask {
+        run,
+        task,
+        objective,
+    } = command;
+    if objective.trim().is_empty() {
+        return fail("ask needs a non-empty --objective for the leader");
+    }
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let body = serde_json::json!({"task": task.to_string(), "objective": objective});
+    match client.post_json(&format!("/v1/runs/{run}/leader/review"), &body) {
         Ok(value) => {
             print_json(&value);
             0

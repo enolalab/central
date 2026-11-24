@@ -742,7 +742,7 @@ async fn hold_only_impacted_queued_tasks() {
         h.clock.clone() as Arc<dyn Clock>,
         h.ids.clone() as Arc<dyn IdSource>,
         h.gateway.clone() as Arc<dyn AgentGateway>,
-        Arc::new(|_| Some(matching_profile())),
+        Arc::new(|_, _, _| Some(matching_profile())),
         BTreeMap::new(),
         system(),
     );

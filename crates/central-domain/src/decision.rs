@@ -948,6 +948,14 @@ pub fn decide(
             check_evidence,
             now,
         ),
+        Command::SetRunProfile { role, profile } => {
+            set_run_profile(state, actor, *role, *profile, now)
+        }
+        Command::QueueLeaderReview {
+            attempt,
+            task,
+            input,
+        } => queue_leader_review(state, actor, *attempt, *task, input, now),
     }
 }
 
@@ -1078,6 +1086,122 @@ fn task_verify(plan_task: &crate::PlanTaskV1) -> VerifySpec {
 /// task `Succeeded`, files the merge commit as this task's verified
 /// output (so dependents build on exactly what promoted), and emits the
 /// full CAS receipt as evidence.
+/// Set (or clear) the run-wide profile for one agent role. User only.
+/// The choice never touches live work: attempts keep the profile they
+/// dispatched with; only later dispatches resolve through the new
+/// default. Clearing restores defer-when-unpinned behavior.
+fn set_run_profile(
+    state: &RunState,
+    actor: &Actor,
+    role: crate::ProfileRole,
+    profile: Option<crate::ProfileId>,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user(actor)?;
+    require_created(state)?;
+    let mut next = state.clone();
+    match role {
+        crate::ProfileRole::Worker => next.worker_profile = profile,
+        crate::ProfileRole::Leader => next.leader_profile = profile,
+    }
+    Ok(finish(
+        next.clone(),
+        vec![Event::RunProfileSet {
+            run_id: next.id,
+            role,
+            profile,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+/// Queue one leader review turn against a task. Unlike a worker queue,
+/// the task keeps its status: a review advises on parked work without
+/// moving it. The review never seals a worker candidate (worker-result
+/// import refuses leader attempts); its output returns through handover
+/// import. User only.
+fn queue_leader_review(
+    state: &RunState,
+    actor: &Actor,
+    attempt: crate::AttemptId,
+    task: crate::TaskId,
+    input: &str,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user(actor)?;
+    require_created(state)?;
+    if state.control != RunControl::Running {
+        return Err(DomainError::QueueConflict(format!(
+            "the queue gate is closed while the run is {:?}",
+            state.control
+        )));
+    }
+    if !state.holds.is_empty() {
+        return Err(DomainError::QueueConflict(
+            "the queue gate is closed while the run is held".to_string(),
+        ));
+    }
+    if input.trim().is_empty() {
+        return Err(DomainError::InvalidCommand(
+            "a queued leader review needs a non-empty input".to_string(),
+        ));
+    }
+    let task_state = state
+        .tasks
+        .get(&task)
+        .ok_or(DomainError::UnknownTask(task))?;
+    let Some(active) = state.active_plan.as_ref() else {
+        return Err(DomainError::QueueConflict(
+            "the run has no active plan".to_string(),
+        ));
+    };
+    if task_state.plan_hash != *active {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is bound to a superseded plan"
+        )));
+    }
+    if state.revision_holds.contains(&task) {
+        return Err(DomainError::QueueConflict(format!(
+            "task {task} is held by a pending revision proposal; it queues again after the user decides"
+        )));
+    }
+    if state.attempts.contains_key(&attempt) {
+        return Err(DomainError::QueueConflict(format!(
+            "attempt {attempt} is already queued"
+        )));
+    }
+    let mut next = state.clone();
+    release_settled_claims(&mut next);
+    next.attempts.insert(
+        attempt,
+        Attempt {
+            id: attempt,
+            task_id: task,
+            plan_hash: task_state.plan_hash.clone(),
+            status: AttemptStatus::Queued,
+            profile_id: None,
+            created_at: now,
+        },
+    );
+    // Queueing never rewrites an existing entry: new input waits for a
+    // new attempt.
+    next.attempt_inputs.insert(attempt, input.to_string());
+    next.leader_attempts.insert(attempt);
+    Ok(finish(
+        next.clone(),
+        vec![Event::AttemptQueued {
+            run_id: next.id,
+            attempt_id: attempt,
+            task,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_integration(
     state: &RunState,

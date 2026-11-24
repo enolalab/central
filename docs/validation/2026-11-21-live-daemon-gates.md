@@ -189,10 +189,67 @@ là đường free vĩnh viễn, không quota.
 - Còn hở (chưa làm): CLI thiếu inbox-reconcile (phải curl tay);
   `userInput/question` chưa model nào hỏi live.
 
-## 7. Doc fix kèm theo (comment/pin stale từ commit Muse/opencode)
+## 7. Giả lập user vận hành cụm mới từ đầu (24/11, run `38936210`)
+
+Đóng vai user chỉ dùng CLI công khai (+ curl duy nhất cho inbox-reconcile
+vì CLI chưa có lệnh này) trên cụm mới hoàn toàn, model `ollama/qwen3:4b`
+free local, commit `c6935e6`:
+
+- `daemon start` → `meta` (api v1, providers `[opencode]`, profiles 0) →
+  `profiles create` (model advertised `supported`) → `init` → `sync` →
+  `plan import/approve` → scan tự dispatch, không cần `POST /dispatch`.
+- Worker turn ~2 phút: `logs` trống cho đến khi `reconcile` (attempt) +
+  inbox-reconcile (curl) kéo observations; artifact `NOTES.md` đúng 2 bytes
+  `GOALS`. Verdict sai attempt id bị từ chối `foreign verdict` đúng thiết
+  kế; verdict đúng → task `Succeeded`.
+- Lần 1 model kẹt giữa reasoning (serve idle, 0 observation sau 10 phút):
+  `stop --run` → attempt `Cancelled`, serve child bị kill (không leak như
+  trước fix). Thử lại task ngắn gọn thì pass — bài học user: task càng cụ
+  thể/ngắn càng ít kẹt.
+- `budget`/`set-limits` (max_attempts 5, gate open), `pause`/`resume`,
+  `events` (13 items + cursor), `recovery` (0 actions khi healthy),
+  `daemon shutdown` → restart → run park `AwaitingResume`, resume mở lại,
+  attempt Completed giữ nguyên. `artifacts` trống (đúng: worktree file
+  không phải artifact blob).
+- Ma sát user ghi nhận (không chặn): (1) tự viết plan JSON dễ sai schema
+  (thông báo lỗi tốt, nêu rõ field lạ); (2) không có `central
+  inbox-reconcile` — phải curl với session ref lấy từ status, gồm cả epoch
+  gateway; (3) không có cancel từng attempt (chỉ `stop` cả run); (4)
+  `logs --attempt` với attempt id sai trả rỗng im lặng thay vì 404.
+
+## 8. Doc fix kèm theo (comment/pin stale từ commit Muse/opencode)
 
 - `muse/version.rs`, `muse/gateway.rs`: pin 1.4.23 + handshake live 17/11
   (trước đó ghi 1.4.20 / "NOT live-exercised").
 - `opencode/gateway.rs`: đồng bộ với spec (deny/interrupt đã lab 17/11,
   không artifact máy-chấm).
 - `muse-gateway-spec.md` §4: pin `1.4.23` (allowlist giữ `1.4.20`).
+
+## 9. Live smoke: run profiles + leader dispatch (24/11, commit hiện tại)
+
+- `profiles use --role worker|leader` đều `applied`; snapshot trả
+  `worker_profile` + `leader_profile` đúng id đã bind.
+- Task không pin: worker dispatch qua run default, không cần dispatch
+  tay (scan tick tự gửi qua gateway tới serve child, session attached).
+- `leader ask` → attempt id; scan dispatch leader qua leader profile,
+  serve child riêng, session riêng; task giữ `Pending` suốt review.
+- Phát hiện khi live: leader active trước thì worker không queue
+  (`covering_attempt` tính cả leader) — đã ghi thành covering rule
+  trong `docs/api.md`.
+- `stop` hủy cả worker lẫn leader attempt, child bị reap ở tick kế
+  (cancel async qua outbox, không instant) — không leak.
+- Chưa xong live: cả 2 đợt turn opencode+ollama đều kẹt sau hoạt động
+  đầu (worker đã ghi file, serve idle `ep_poll`, ollama unload model,
+  log không thêm) — cùng pattern kẹt đã ghi ở §7, do phía
+  opencode/ollama chứ không phải dispatch (dispatch + session attach
+  đều pass). Hoàn tất turn → reconcile → seal → verdict live còn chờ
+  đường model ổn định; black-box `leader_review_dispatches_through_run_leader_profile`
+  đã cover dispatch qua HTTP + scan trong suite.
+- Đợt 3 (24/11 tối, run `6f26aa00`, leader-only, prompt no-tools 1 câu):
+  UNVERIFIED. Dispatch 19:06 (serve child + session + MCP connect trong
+  log), model có load GPU, nhưng log im từ 19:06:57Z; serve child chết
+  im lặng giữa 19:12–19:15 (không error trong opencode.log, daemon.log,
+  dmesg/journal), attempt vẫn `Running` (stale). Timeout 8 phút → `stop`:
+  attempt `Cancelled`, không còn serve child. Kết luận giữ nguyên:
+  dispatch pass không phải turn pass; completion live của leader turn
+  vẫn chưa được chứng minh.

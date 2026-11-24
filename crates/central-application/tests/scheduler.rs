@@ -89,6 +89,7 @@ struct FakeGateway {
     block_sends: AtomicBool,
     release_sends: AtomicBool,
     workspaces: Mutex<Vec<String>>,
+    opened_profiles: Mutex<Vec<String>>,
 }
 
 impl FakeGateway {
@@ -103,6 +104,7 @@ impl FakeGateway {
             block_sends: AtomicBool::new(false),
             release_sends: AtomicBool::new(false),
             workspaces: Mutex::new(Vec::new()),
+            opened_profiles: Mutex::new(Vec::new()),
         }
     }
 
@@ -120,6 +122,10 @@ impl FakeGateway {
 
     fn cancel_count(&self) -> usize {
         self.cancels.load(Ordering::SeqCst)
+    }
+
+    fn opened_profiles(&self) -> Vec<String> {
+        self.opened_profiles.lock().expect("lock").clone()
     }
 
     fn block_until_released(&self) {
@@ -171,6 +177,10 @@ impl AgentGateway for FakeGateway {
             .lock()
             .expect("lock")
             .push(request.workspace.clone());
+        self.opened_profiles
+            .lock()
+            .expect("lock")
+            .push(request.profile.hash.to_string());
         Ok(SessionRef {
             provider: "fake".to_string(),
             instance_epoch: "epoch-1".to_string(),
@@ -228,6 +238,7 @@ struct Inner {
     receipts: HashMap<(ActorId, CommandId), Receipt>,
     intents: HashMap<RunId, Vec<OutboxIntent>>,
     events: HashMap<RunId, Vec<central_domain::Event>>,
+    profiles: HashMap<String, central_application::ports::store::UserProfileRecord>,
 }
 
 #[derive(Default)]
@@ -381,6 +392,30 @@ impl Store for MemoryStore {
         inner.states.insert(state.id, state.clone());
         Ok(())
     }
+
+    async fn get_profile(
+        &self,
+        profile_id: &str,
+    ) -> Result<Option<central_application::ports::store::UserProfileRecord>, AppError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("lock")
+            .profiles
+            .get(profile_id)
+            .cloned())
+    }
+
+    async fn events(&self, id: RunId) -> Result<Vec<central_domain::Event>, AppError> {
+        Ok(self
+            .inner
+            .lock()
+            .expect("lock")
+            .events
+            .get(&id)
+            .cloned()
+            .unwrap_or_default())
+    }
 }
 
 // ---------- harness ----------
@@ -493,7 +528,7 @@ impl Harness {
             self.ids.clone() as Arc<dyn IdSource>,
             self.gateway.clone() as Arc<dyn AgentGateway>,
             config,
-            Arc::new(|_| Some(matching_profile())),
+            Arc::new(|_, _, _| Some(matching_profile())),
             system(),
         )
         .expect("valid scheduler config")
@@ -977,7 +1012,7 @@ async fn capability_mismatch_defers_dispatch() {
         harness.ids.clone() as Arc<dyn IdSource>,
         harness.gateway.clone() as Arc<dyn AgentGateway>,
         default_config(),
-        Arc::new(|_| {
+        Arc::new(|_, _, _| {
             Some(ResolvedProfile {
                 id: central_domain::ProfileId::from_u128(22),
                 provider: "elsewhere".to_string(),
@@ -1464,5 +1499,160 @@ async fn scheduler_tick_sends_pending_cancel_without_manual_dispatch() {
         state.attempts[&attempt].status,
         AttemptStatus::Cancelled,
         "cancel confirmed by the harness"
+    );
+}
+
+/// Seed an owner profile the dispatcher can resolve by id. The fake
+/// harness only serves `provider: "fake"` + `model: "fake-model"`, so
+/// test profiles use exactly that pair and differ by id.
+fn seed_profile(harness: &Harness, id: u128) -> central_domain::ProfileId {
+    use central_application::ports::store::UserProfileRecord;
+    let raw = central_domain::ProfileId::from_u128(id).to_string();
+    harness.store.inner.lock().expect("lock").profiles.insert(
+        raw.clone(),
+        UserProfileRecord {
+            profile_id: raw,
+            name: "test profile".to_string(),
+            provider: "fake".to_string(),
+            model: "fake-model".to_string(),
+            effort: "low".to_string(),
+            config_json: "{}".to_string(),
+            updated_at: Timestamp(1_700_000_000_000),
+        },
+    );
+    central_domain::ProfileId::from_u128(id)
+}
+
+fn scheduler_without_base(harness: &Harness) -> Scheduler {
+    Scheduler::new(
+        harness.store.clone() as Arc<dyn Store>,
+        harness.clock.clone() as Arc<dyn Clock>,
+        harness.ids.clone() as Arc<dyn IdSource>,
+        harness.gateway.clone() as Arc<dyn AgentGateway>,
+        SchedulerConfig {
+            max_parallel: 10,
+            ..default_config()
+        },
+        Arc::new(|_, _, _| None),
+        system(),
+    )
+    .expect("valid scheduler config")
+}
+
+/// An unpinned task dispatches through the run's worker default, not
+/// the base resolver: the base knows nothing here, so any send proves
+/// the default carried.
+#[tokio::test]
+async fn tick_dispatches_unpinned_task_through_run_worker_default() {
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    let profile = seed_profile(&harness, 77);
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.worker_profile = Some(profile);
+    });
+
+    let report = scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("tick");
+    assert!(report.sent >= 1, "run default dispatches: {report:?}");
+    let opened = harness.gateway.opened_profiles();
+    assert!(
+        opened.contains(&format!("profile:{}", profile)),
+        "worker default profile dispatched the attempt: {opened:?}"
+    );
+    assert_eq!(harness.attempts_of(a).len(), 1);
+}
+
+/// A configured-but-missing worker default defers instead of
+/// substituting: the attempt stays queued with nothing sent.
+#[tokio::test]
+async fn tick_defers_when_run_worker_default_is_missing() {
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.worker_profile = Some(central_domain::ProfileId::from_u128(78));
+    });
+
+    let report = scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("tick");
+    assert_eq!(report.sent, 0, "nothing dispatches: {report:?}");
+    assert!(harness.gateway.opened_profiles().is_empty());
+    assert_eq!(harness.attempts_of(a).len(), 1);
+    assert_eq!(
+        harness.attempts_of(a)[0].status,
+        AttemptStatus::Queued,
+        "unservable profile defers, never fails"
+    );
+}
+
+/// A leader review dispatches through the run's leader profile — never
+/// the task pin, never the worker default, never the base resolver.
+#[tokio::test]
+async fn tick_dispatches_leader_review_through_leader_profile() {
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    seed_profile(&harness, 77);
+    let leader = seed_profile(&harness, 88);
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.worker_profile = Some(central_domain::ProfileId::from_u128(77));
+        state.leader_profile = Some(leader);
+    });
+    let (_receipt, leader_attempt) = harness
+        .runtime()
+        .queue_leader_review(user(), a, "review the candidate, please")
+        .await
+        .expect("queue leader review");
+    let report = scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("tick");
+    assert!(report.sent >= 1, "leader review dispatched");
+    let opened = harness.gateway.opened_profiles();
+    assert!(
+        opened.contains(&format!("profile:{}", leader)),
+        "leader profile dispatched the review: {opened:?}"
+    );
+    assert_eq!(
+        harness.load().attempts[&leader_attempt].status,
+        AttemptStatus::Running,
+        "leader attempt runs"
+    );
+}
+
+/// Without a leader profile the review waits even when a worker
+/// default exists: leaders never fall back to worker agents.
+#[tokio::test]
+async fn leader_review_waits_without_leader_profile() {
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    seed_profile(&harness, 77);
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.worker_profile = Some(central_domain::ProfileId::from_u128(77));
+    });
+    let (_receipt, leader_attempt) = harness
+        .runtime()
+        .queue_leader_review(user(), a, "review the candidate, please")
+        .await
+        .expect("queue leader review");
+
+    let _report = scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("tick");
+    assert_eq!(
+        harness.load().attempts[&leader_attempt].status,
+        AttemptStatus::Queued
+    );
+    assert!(
+        !harness
+            .gateway
+            .opened_profiles()
+            .iter()
+            .any(|p| p == &format!("profile:{}", central_domain::ProfileId::from_u128(88))),
+        "no dispatch carries the leader profile: {:?}",
+        harness.gateway.opened_profiles()
     );
 }

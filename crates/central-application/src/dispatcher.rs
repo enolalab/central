@@ -25,10 +25,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use crate::ports::store::UserProfileRecord;
 use central_domain::{
-    admission, classify_rejection, failure_for_rejection, Actor, Admission, AttemptId,
-    AttemptSession, AttemptStatus, Command, CommandEnvelope, IntegrationCheck, RetryPolicy, RunId,
-    Task, TaskId, TaskKind, TaskStatus, Timestamp, WorkRequest, WorkRole,
+    admission, classify_rejection, failure_for_rejection, Actor, Admission, Attempt, AttemptId,
+    AttemptSession, AttemptStatus, Command, CommandEnvelope, ContentHash, IntegrationCheck,
+    ProfileId, ResolvedProfile, RetryPolicy, RunId, RunState, Task, TaskId, TaskKind, TaskStatus,
+    Timestamp, WorkRequest, WorkRole,
 };
 
 use crate::contracts::{AppError, DispatchError, DispatchSummary, OpenSession, SendTurn};
@@ -160,11 +162,72 @@ impl Dispatcher {
             .ok_or_else(|| AppError::NotFound(format!("run {run_id} vanished mid-dispatch")))
     }
 
+    /// Resolve a stored owner profile into the harness-facing shape.
+    /// Same mapping as the daemon registry used to build: the profile
+    /// id falls back to a deterministic digest when the stored string
+    /// is not a UUID, so hand-written ids still resolve.
+    fn profile_from_record(record: &UserProfileRecord) -> ResolvedProfile {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        record.profile_id.hash(&mut hasher);
+        let digest = hasher.finish() as u128;
+        ResolvedProfile {
+            id: record
+                .profile_id
+                .parse()
+                .unwrap_or_else(|_| central_domain::ProfileId::from_u128(digest)),
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            effort: record.effort.clone(),
+            skills: Vec::new(),
+            subagents: Vec::new(),
+            permissions: Vec::new(),
+            fallbacks: Vec::new(),
+            hash: ContentHash::from_hex(format!("profile:{}", record.profile_id)),
+        }
+    }
+
+    /// Look a stored profile up by id and resolve it for dispatch.
+    /// A store read failure defers like a missing profile: the next
+    /// tick retries instead of dispatching blind.
+    async fn lookup_profile(&self, id: &ProfileId) -> Option<ResolvedProfile> {
+        let record = self.store.get_profile(&id.to_string()).await.ok()??;
+        Some(Self::profile_from_record(&record))
+    }
+
+    /// Resolve the exact profile an attempt dispatches with, in order:
+    /// leader reviews use only the run's leader profile; pinned tasks
+    /// keep their stored profile; unpinned tasks use the run worker
+    /// default; anything else falls through to the base resolver (the
+    /// fake-agent dev profile in tests, nothing in production).
+    /// `None` defers the attempt without touching it: a configured-but-
+    /// missing profile waits for the owner to fix it rather than
+    /// dispatching on a substituted agent.
+    async fn resolve_for_attempt(
+        &self,
+        state: &RunState,
+        attempt: &Attempt,
+        task: &Task,
+    ) -> Option<ResolvedProfile> {
+        if state.leader_attempts.contains(&attempt.id) {
+            let id = state.leader_profile.as_ref()?;
+            return self.lookup_profile(id).await;
+        }
+        if let Some(pinned) = task.profile_id.as_ref() {
+            return self.lookup_profile(pinned).await;
+        }
+        if let Some(default) = state.worker_profile.as_ref() {
+            return self.lookup_profile(default).await;
+        }
+        (self.resolver)(state, task, attempt.id)
+    }
+
     /// Whether the harness still serves this attempt's resolved profile.
     /// A mismatch defers the attempt: Central never swaps profiles or
     /// models silently to make a dispatch fit.
-    async fn capabilities_hold(&self, task: &Task) -> bool {
-        let Some(profile) = (self.resolver)(task) else {
+    async fn capabilities_hold(&self, state: &RunState, attempt: &Attempt, task: &Task) -> bool {
+        let Some(profile) = self.resolve_for_attempt(state, attempt, task).await else {
             return false;
         };
         let capabilities = match self.agent.capabilities(&profile).await {
@@ -277,19 +340,28 @@ impl Dispatcher {
         if state.revision_holds.contains(&attempt.task_id) {
             return Ok(());
         }
+        // The budget role follows the attempt: leader reviews draw from
+        // the shared ledger like any other turn (the role is audit
+        // context, not a separate quota).
+        let role = if state.leader_attempts.contains(&attempt_id) {
+            WorkRole::Leader
+        } else {
+            WorkRole::Worker
+        };
         if matches!(
-            admission(
-                &state,
-                &WorkRequest {
-                    role: WorkRole::Worker
-                },
-                self.clock.now()
-            ),
+            admission(&state, &WorkRequest { role }, self.clock.now()),
             Admission::Held(_)
         ) {
             return Ok(());
         }
-        if state.active_plan.as_ref() != Some(&task.plan_hash) || task.status != TaskStatus::Running
+        // A leader review dispatches against a parked task on purpose:
+        // the review advises without moving the task, so the Running
+        // gate below is lifted for leader attempts only. The active-plan
+        // binding still holds: a review never dispatches for a
+        // superseded plan.
+        let is_leader_review = state.leader_attempts.contains(&attempt_id);
+        if state.active_plan.as_ref() != Some(&task.plan_hash)
+            || (task.status != TaskStatus::Running && !is_leader_review)
         {
             return Ok(());
         }
@@ -301,7 +373,7 @@ impl Dispatcher {
                 .dispatch_integration(run_id, &state, &task, attempt_id)
                 .await;
         }
-        if !self.capabilities_hold(&task).await {
+        if !self.capabilities_hold(&state, &attempt, &task).await {
             return Ok(());
         }
         // The queue-time claim may have been released while the attempt
@@ -373,9 +445,12 @@ impl Dispatcher {
 
         // The gateway calls below hold no store transaction: the claim
         // above is committed, and the outcome commits afterwards.
-        let profile = (self.resolver)(&task).ok_or_else(|| {
-            AppError::Capability("attempt profile vanished mid-dispatch".to_string())
-        })?;
+        let profile = self
+            .resolve_for_attempt(&state, &attempt, &task)
+            .await
+            .ok_or_else(|| {
+                AppError::Capability("attempt profile vanished mid-dispatch".to_string())
+            })?;
         let session = match self
             .agent
             .open(OpenSession {
@@ -664,7 +739,13 @@ impl Dispatcher {
             Some(task) => task.clone(),
             None => return Ok(()),
         };
-        let current = match (self.resolver)(&task) {
+        // Leader reviews never fall back to a worker chain: a quota/auth
+        // refusal on the leader profile fails loudly instead of silently
+        // substituting another agent.
+        if state.leader_attempts.contains(&attempt_id) {
+            return self.fail_attempt(run_id, attempt_id).await;
+        }
+        let current = match self.resolve_for_attempt(&state, &attempt, &task).await {
             Some(profile) => profile,
             // No servable profile: park without touching the chain.
             None => return self.fail_attempt(run_id, attempt_id).await,

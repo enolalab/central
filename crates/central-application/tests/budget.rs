@@ -346,7 +346,7 @@ impl Harness {
             self.ids.clone() as Arc<dyn IdSource>,
             self.gateway.clone() as Arc<dyn AgentGateway>,
             SchedulerConfig::default(),
-            Arc::new(|_| Some(matching_profile())),
+            Arc::new(|_, _, _| Some(matching_profile())),
             system(),
         )
         .expect("valid scheduler config")

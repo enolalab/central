@@ -11,6 +11,7 @@ pub mod artifacts;
 pub mod chat;
 pub mod clients;
 pub mod events;
+pub mod leader;
 pub mod logs;
 pub mod maintenance;
 pub mod plans;
@@ -122,6 +123,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/runs/{id}/handover", post(results::post_handover))
         .route("/v1/runs/{id}/verdicts", post(results::post_verdicts))
+        .route("/v1/runs/{id}/profile", post(profiles::post_run_profile))
+        .route(
+            "/v1/runs/{id}/leader/review",
+            post(leader::post_leader_review),
+        )
         .route("/v1/runs/{id}/usage", get(usage::get_usage))
         .route("/v1/runs/{id}/usage/resolve", post(usage::post_resolve))
         .route(

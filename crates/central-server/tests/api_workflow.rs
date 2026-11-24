@@ -668,3 +668,123 @@ fn worker_result_import_parks_without_passing() {
         .any(|task| task["status"] == "Succeeded");
     assert!(!succeeded, "no pass from a refused import: {snapshot}");
 }
+
+fn poll_attempt_running(server: &Server, run: &str, attempt: &str) -> serde_json::Value {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let snapshot = get_snapshot(server, run);
+        if let Some(found) = snapshot["state"]["attempts"]
+            .as_array()
+            .expect("attempts")
+            .iter()
+            .find(|a| a["attempt_id"] == attempt)
+        {
+            if found["status"] == "Running" || found["status"] == "UnknownOutcome" {
+                return snapshot;
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "scan never dispatched attempt {attempt}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn leader_review_dispatches_through_run_leader_profile() {
+    let (repo, head) = git_repo("leader-review");
+    let dir = state_dir("leader-review-server");
+    let server = start_server_with_scan(&dir, "200");
+    let token = server.token();
+    let run = create_run(&server, 401);
+    let _hash = approve_fixture_plan(&server, &run, 402);
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/sync"),
+        Some(&token),
+        Some(
+            &serde_json::json!({"commit": head, "repository": repo.to_string_lossy()}).to_string(),
+        ),
+        &[],
+    );
+    assert_eq!(status, 200, "sync: {body}");
+
+    // Fake-harness profile the daemon can actually serve.
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        "/v1/profiles",
+        Some(&token),
+        Some(
+            &serde_json::json!({"name": "leader-fake", "provider": "fake", "model": "fake-model"})
+                .to_string(),
+        ),
+        &[],
+    );
+    assert_eq!(status, 200, "profile: {body}");
+    let profile: serde_json::Value = serde_json::from_str(&body).expect("profile");
+    let profile_id = profile["profile_id"]
+        .as_str()
+        .expect("profile id")
+        .to_string();
+
+    // Unknown profiles and roles are rejected before anything commits.
+    let (status, _) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/profile"),
+        Some(&token),
+        Some(
+            &serde_json::json!({"role": "leader", "profile": "00000000-0000-0000-0000-000000000099"})
+                .to_string(),
+        ),
+        &[],
+    );
+    assert_eq!(status, 404, "unknown profile");
+    let (status, _) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/profile"),
+        Some(&token),
+        Some(&serde_json::json!({"role": "janitor", "profile": profile_id}).to_string()),
+        &[],
+    );
+    assert_eq!(status, 400, "unknown role");
+
+    // Bind the run's leader profile.
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/profile"),
+        Some(&token),
+        Some(&serde_json::json!({"role": "leader", "profile": profile_id}).to_string()),
+        &[],
+    );
+    assert_eq!(status, 200, "bind leader: {body}");
+
+    // Queue a leader review; the SCAN dispatches it, no manual dispatch.
+    let task = "00000000-0000-0000-0000-000000000001";
+    let (status, body) = http(
+        "POST",
+        &server.addr,
+        &format!("/v1/runs/{run}/leader/review"),
+        Some(&token),
+        Some(&serde_json::json!({"task": task, "objective": "review the candidate"}).to_string()),
+        &[],
+    );
+    assert_eq!(status, 200, "ask leader: {body}");
+    let asked: serde_json::Value = serde_json::from_str(&body).expect("ask");
+    let attempt = asked["attempt_id"].as_str().expect("attempt").to_string();
+
+    let snapshot = poll_attempt_running(&server, &run, &attempt);
+    let state = &snapshot["state"];
+    let leader = state["attempts"]
+        .as_array()
+        .expect("attempts")
+        .iter()
+        .find(|a| a["attempt_id"] == attempt)
+        .expect("leader attempt");
+    assert_eq!(leader["status"], "Running", "leader dispatched: {snapshot}");
+}
