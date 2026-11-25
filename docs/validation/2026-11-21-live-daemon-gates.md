@@ -431,3 +431,66 @@ free local, commit `c6935e6`:
 - Push 25/11: `c6935e6..a90627b` lên `origin/main` sau gate sạch trên
   cây không WIP (fmt/clippy/44 binary test xanh). Feature finish +
   evidence §§17–18 còn treo uncommitted.
+
+## 19. Slow-close ba mốc thời gian (25/11, run timing opencode+Muse)
+
+- opencode/qwen2.5:3b (run `36e47804`, task ghi ok.txt): dispatch
+  10:22:03 → tool-call + chat 10:22:21–22 → serve `succeeded`
+  10:22:25 (T0+22s, KHÔNG tạo artifact: model gọi `write` với input
+  rỗng → error → chat). Central ghi observation lúc 10:26:50 sau
+  reconcile tay (T0+4m47s). Provider xong trong 22s; 4m25s còn lại
+  là Central chưa poll — phân biệt xong.
+- Muse/muse-spark-1.3 (run `3f0968ec`, task ghi done.txt): bind
+  10:27:26 → `done.txt` đúng `DONE` lúc 10:27:33 (T0+7s, grounded,
+  hành động thật) → journal im từ 10:28:25 (đuôi slow-close) →
+  crash OOM giết serve. Central không bao giờ reconcile kịp.
+- Kết luận: provider (cả hai) hành động/xong trong vài chục giây;
+  "kẹt" quan sát được trước đây = Central thụ động + đuôi slow-close
+  phía model sau khi đã hành động. Không phải nghẽn dispatch.
+
+## 20. Auto-observe bounded trong scan tick (code + test, chưa deploy)
+
+- Thiết kế (giữ nguyên passive): cuối `Scheduler::tick`, với mỗi
+  attempt `Running` có session binding thì drain requests + observe
+  messages, commit qua `RecordExternalRequest`/`RecordObservation`
+  (cả hai dedup sẵn, MAX_OBSERVATIONS=4096 có evict). Không answer,
+  không resend, không mark terminal; poll lỗi thì bỏ qua tick đó
+  (attempt giữ nguyên status — UnknownOutcome vẫn cần reconcile tay).
+  Attempt parked/non-Running bị skip (drain approval tự park nó).
+- Test mới trong `scheduler.rs` (24/24 xanh): observe+drain ghi
+  đúng, closed transport không ghi gì và không mark terminal, event
+  muộn ghi đúng 1 lần. Restart: binding epoch cũ không match session
+  mới → gateway trả rỗng/lỗi → skip, không fabricate (covered bởi
+  closed-transport test).
+- Chưa restart daemon để nạp (đợi quyết định deploy).
+
+## 21. Release thử 0.1.0 + ma trận provider (25/11)
+
+- `cargo build --release` (JOBS=4, tránh OOM): pass 12m45s,
+  `target/release/central` 43.7 MB, `central 0.1.0`.
+- Ma trận tại máy kiểm chứng: opencode 2.2.7 allowlisted, live
+  full loop (hỏi→duyệt→thực thi 24/11); muse 1.4.25 allowlisted,
+  live dispatch + userInput loop (24/11); codex 0.169.0 KHÔNG tương
+  thích (allowlist giữ 0.167.0-alpha.3.2 + 0.167.1) → fail-closed
+  đúng thiết kế, cần capture mới trước khi mở; ollama local
+  (qwen3:4b, qwen2.5:3b/7b, qwen2.5:3b-64k) free, không auth.
+- WIP treo: auto-observe (code+test xong, chưa commit/deploy);
+  inbox-reconcile thiếu CLI (curl-only); stop-UnknownOutcome live
+  chưa proof trực tiếp (unit test + kill-machinery proven); đuôi
+  slow-close sau hành động (cả 2 provider); prompt 60k do skills
+  (owner quyết không prune); /tmp làm state dir bị dọn sau crash —
+  nên chuyển state ra chỗ bền.
+- Commit đề xuất tiếp theo: auto-observe + evidence §§19–21 (hiện
+  treo: `scheduler.rs`, `tests/scheduler.rs`, doc này).
+
+## 22. Auto-observe live proof + metric lesson (25/11)
+
+- Run `07d8144a` (opencode, KHÔNG reconcile tay lần nào): turn xong
+  phía serve, scan tick tự ghi `ObservationRecorded` ("turn
+  completed: stop, usage in=2046 out=60") vào durable log. Vòng
+  Central-thấy-turn-xong đã tự động — đúng mục đích auto-observe.
+- Bài học đo: snapshot `status` KHÔNG mang observations (projection
+  curated) nên poll `obs: 0` là mù; events mới là nguồn thật. Mọi kết
+  luận "không observe" trước đây phải đối chiếu events.
+- Turn này model vẫn chat suông (out=60, không artifact) — cùng bệnh
+  grounding, không liên quan observe.

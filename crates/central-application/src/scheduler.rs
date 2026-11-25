@@ -19,11 +19,11 @@ use std::sync::Arc;
 
 use central_domain::{
     admission, eligible_tasks, eligible_tasks_ignoring_gate, live_attempt_count, render_input,
-    Actor, Admission, AttemptId, Command, CommandEnvelope, ResolvedProfile, RetryPolicy, RunId,
-    RunState, Task, TaskId, WorkRequest, WorkRole,
+    Actor, Admission, AttemptId, AttemptStatus, Command, CommandEnvelope, InboxKey, InboxRequest,
+    ResolvedProfile, RetryPolicy, RunId, RunState, Task, TaskId, WorkRequest, WorkRole,
 };
 
-use crate::contracts::{AppError, DispatchSummary};
+use crate::contracts::{AppError, DispatchSummary, SessionRef};
 use crate::dispatcher::Dispatcher;
 use crate::fallback::FallbackOverrides;
 use crate::inbox::SecretVault;
@@ -363,6 +363,82 @@ impl Scheduler {
         report.sent = summary.dispatched;
         report.unknown = summary.unknown;
         report.deferred += summary.still_pending;
+
+        // Bounded auto-observe: pull harness evidence for live attempts so
+        // completions and questions surface without a manual reconcile.
+        // Passive only: drained requests and observations are recorded
+        // (both dedup at commit); nothing is answered, resent or marked
+        // terminal, and a failed poll is tick-local — the attempt keeps
+        // its status, so UnknownOutcome still needs an explicit
+        // reconcile to prove.
+        self.observe_live_attempts(run_id).await;
+
         Ok(report)
+    }
+
+    /// One best-effort evidence pass over live attempts. Each attempt
+    /// with a bound harness session gets its open requests drained and
+    /// its messages observed; every commit is idempotent, every failure
+    /// is swallowed tick-locally. Attempts without a session (queued,
+    /// not yet dispatched) and non-running attempts are skipped:
+    /// there is nothing to poll and nothing to conclude.
+    async fn observe_live_attempts(&self, run_id: RunId) {
+        let Ok(Some(state)) = self.store.load(run_id).await else {
+            return;
+        };
+        if state.control != central_domain::RunControl::Running {
+            return;
+        }
+        let runtime = self.runtime_for(run_id);
+        for attempt in state.attempts.values() {
+            if !matches!(attempt.status, AttemptStatus::Running) {
+                continue;
+            }
+            let Some(binding) = state.attempt_sessions.get(&attempt.id) else {
+                continue;
+            };
+            let session = SessionRef {
+                provider: binding.provider.clone(),
+                instance_epoch: binding.instance_epoch.clone(),
+                thread_id: binding.thread_id.clone(),
+            };
+            // Drain first so questions surface before their observations.
+            if let Ok(drained) = self.agent.drain_requests(&session).await {
+                for request in &drained {
+                    let key = InboxKey::from(&request.key);
+                    let canonical = key.canonical();
+                    let duplicate = state
+                        .inbox
+                        .get(&canonical)
+                        .is_some_and(|entry| entry.preview_hash == request.preview_hash);
+                    if duplicate {
+                        continue;
+                    }
+                    let envelope = CommandEnvelope {
+                        id: self.ids.next_command_id(),
+                        expected_revision: None,
+                        command: Command::RecordExternalRequest {
+                            request: InboxRequest::from(request),
+                        },
+                    };
+                    // Same-key/different-text races against a concurrent
+                    // manual reconcile settle as conflicts: fail nothing,
+                    // poll again next tick.
+                    let _ = runtime.execute(self.actor.clone(), envelope).await;
+                }
+            }
+            if let Ok(observations) = self.agent.observe(&session).await {
+                for observation in &observations {
+                    let envelope = CommandEnvelope {
+                        id: self.ids.next_command_id(),
+                        expected_revision: None,
+                        command: Command::RecordObservation {
+                            observation: observation.clone(),
+                        },
+                    };
+                    let _ = runtime.execute(self.actor.clone(), envelope).await;
+                }
+            }
+        }
     }
 }

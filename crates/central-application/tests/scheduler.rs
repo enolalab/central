@@ -90,6 +90,9 @@ struct FakeGateway {
     release_sends: AtomicBool,
     workspaces: Mutex<Vec<String>>,
     opened_profiles: Mutex<Vec<String>>,
+    observations: Mutex<Vec<Observation>>,
+    requests: Mutex<Vec<central_application::contracts::ExternalRequest>>,
+    fail_poll: AtomicBool,
 }
 
 impl FakeGateway {
@@ -105,6 +108,9 @@ impl FakeGateway {
             release_sends: AtomicBool::new(false),
             workspaces: Mutex::new(Vec::new()),
             opened_profiles: Mutex::new(Vec::new()),
+            observations: Mutex::new(Vec::new()),
+            requests: Mutex::new(Vec::new()),
+            fail_poll: AtomicBool::new(false),
         }
     }
 
@@ -206,7 +212,24 @@ impl AgentGateway for FakeGateway {
     }
 
     async fn observe(&self, _session: &SessionRef) -> Result<Vec<Observation>, AppError> {
-        Ok(Vec::new())
+        if self.fail_poll.load(Ordering::SeqCst) {
+            return Err(AppError::Transport(
+                "closed transport: poll lost".to_string(),
+            ));
+        }
+        Ok(self.observations.lock().expect("lock").clone())
+    }
+
+    async fn drain_requests(
+        &self,
+        _session: &SessionRef,
+    ) -> Result<Vec<central_application::contracts::ExternalRequest>, AppError> {
+        if self.fail_poll.load(Ordering::SeqCst) {
+            return Err(AppError::Transport(
+                "closed transport: poll lost".to_string(),
+            ));
+        }
+        Ok(self.requests.lock().expect("lock").clone())
     }
 
     async fn answer(&self, _answer: ExternalAnswer) -> Result<(), DispatchError> {
@@ -1654,5 +1677,188 @@ async fn leader_review_waits_without_leader_profile() {
             .any(|p| p == &format!("profile:{}", central_domain::ProfileId::from_u128(88))),
         "no dispatch carries the leader profile: {:?}",
         harness.gateway.opened_profiles()
+    );
+}
+
+/// Auto-observe: a tick records harness observations and drains open
+/// requests for live attempts, so completions and questions surface
+/// without a manual reconcile. Nothing is answered or sent.
+#[tokio::test]
+async fn tick_auto_observes_live_attempts_and_drains_requests() {
+    use central_application::contracts::{ExternalRequest, ExternalRequestKey};
+    use central_domain::InboxKind;
+
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    let profile = seed_profile(&harness, 77);
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.worker_profile = Some(profile);
+    });
+    scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("dispatch tick");
+    let attempt = harness.attempts_of(a)[0].id;
+    assert_eq!(
+        harness.load().attempts[&attempt].status,
+        AttemptStatus::Running
+    );
+
+    let observation = Observation {
+        attempt_id: attempt,
+        provider_epoch: "epoch-1".to_string(),
+        dedup_key: "session.message:srv-1:msg-1".to_string(),
+        outcome: None,
+        detail: "turn completed: stop".to_string(),
+    };
+    harness
+        .gateway
+        .observations
+        .lock()
+        .expect("lock")
+        .push(observation);
+    harness
+        .gateway
+        .requests
+        .lock()
+        .expect("lock")
+        .push(ExternalRequest {
+            key: ExternalRequestKey {
+                session: SessionRef {
+                    provider: "fake".to_string(),
+                    instance_epoch: "epoch-1".to_string(),
+                    thread_id: "thread-1".to_string(),
+                },
+                turn_id: String::new(),
+                item_id: "perm-1".to_string(),
+                request_id: "permission".to_string(),
+            },
+            kind: InboxKind::Approval,
+            preview: "shell [echo hi]".to_string(),
+            preview_hash: ContentHash::from_hex(&"ab".repeat(32)),
+            attempt_id: Some(attempt),
+            is_secret: false,
+        });
+
+    scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("observe tick");
+    let state = harness.load();
+    assert!(
+        state
+            .observations
+            .iter()
+            .any(|o| o.dedup_key == "session.message:srv-1:msg-1"),
+        "completion observation recorded without manual reconcile"
+    );
+    assert_eq!(state.inbox.len(), 1, "open request drained into the inbox");
+    assert_eq!(
+        state.attempts[&attempt].status,
+        AttemptStatus::WaitingForApproval,
+        "a drained approval parks the attempt until the operator answers"
+    );
+
+    // A parked attempt is skipped by later ticks: polling resumes only
+    // after the operator's answer moves it back to Running.
+    scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("observe tick");
+    let state = harness.load();
+    assert_eq!(
+        state.attempts[&attempt].status,
+        AttemptStatus::WaitingForApproval,
+        "parked attempts are skipped, never re-polled"
+    );
+    assert_eq!(
+        state
+            .observations
+            .iter()
+            .filter(|o| o.dedup_key == "session.message:srv-1:msg-1")
+            .count(),
+        1,
+        "repeat polls never duplicate"
+    );
+}
+
+/// A closed transport (restart epoch loss, overflowed buffer) fails the
+/// poll tick-locally: the tick still succeeds, nothing is recorded,
+/// and the attempt is never marked terminal for lack of evidence.
+#[tokio::test]
+async fn tick_tolerates_closed_gateway_without_marking_terminal() {
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    let profile = seed_profile(&harness, 77);
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.worker_profile = Some(profile);
+    });
+    scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("dispatch tick");
+    let attempt = harness.attempts_of(a)[0].id;
+
+    harness.gateway.fail_poll.store(true, Ordering::SeqCst);
+    scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("tick survives a lost poll");
+    let state = harness.load();
+    assert!(
+        state.observations.is_empty(),
+        "no evidence fabricated from a failed poll"
+    );
+    assert!(state.inbox.is_empty(), "no request fabricated either");
+    assert_eq!(
+        state.attempts[&attempt].status,
+        AttemptStatus::Running,
+        "insufficient evidence never marks UnknownOutcome"
+    );
+}
+
+/// Late or repeated events record once: the second identical poll is a
+/// dedup no-op, never a duplicate row.
+#[tokio::test]
+async fn tick_records_late_events_once() {
+    let harness = Harness::new();
+    let (a, _b, _c) = harness.approved_run().await;
+    let profile = seed_profile(&harness, 77);
+    harness.store.mutate_state(harness.run_id, |state| {
+        state.worker_profile = Some(profile);
+    });
+    scheduler_without_base(&harness)
+        .tick(harness.run_id)
+        .await
+        .expect("dispatch tick");
+    let attempt = harness.attempts_of(a)[0].id;
+    harness
+        .gateway
+        .observations
+        .lock()
+        .expect("lock")
+        .push(Observation {
+            attempt_id: attempt,
+            provider_epoch: "epoch-1".to_string(),
+            dedup_key: "session.message:srv-1:msg-9".to_string(),
+            outcome: None,
+            detail: "turn completed: stop".to_string(),
+        });
+
+    for _ in 0..2 {
+        scheduler_without_base(&harness)
+            .tick(harness.run_id)
+            .await
+            .expect("observe tick");
+    }
+    let state = harness.load();
+    assert_eq!(
+        state
+            .observations
+            .iter()
+            .filter(|o| o.dedup_key == "session.message:srv-1:msg-9")
+            .count(),
+        1,
+        "a repeated event records exactly once"
     );
 }
