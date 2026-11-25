@@ -962,6 +962,9 @@ pub fn decide(
             task,
             input,
         } => queue_leader_review(state, actor, *attempt, *task, input, now),
+        Command::CompleteLeaderReview { attempt } => {
+            complete_leader_review(state, actor, *attempt, now)
+        }
     }
 }
 
@@ -1205,6 +1208,67 @@ fn queue_leader_review(
             at: now,
         }],
         Vec::new(),
+    ))
+}
+
+/// Close a leader review turn after its output returned through
+/// handover import. Only the operator closes reviews, and only live
+/// leader attempts close: the attempt must have been queued by
+/// [`Command::QueueLeaderReview`] and must not be terminal. Closing
+/// releases the task cover so the waiting worker can dispatch; the
+/// task itself keeps its status — a review advises, it never moves
+/// the task. A cancel intent rides along so a lingering harness
+/// session is reaped instead of leaking.
+fn complete_leader_review(
+    state: &RunState,
+    actor: &Actor,
+    attempt: AttemptId,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user(actor)?;
+    require_created(state)?;
+    let attempt_state = state
+        .attempts
+        .get(&attempt)
+        .ok_or(DomainError::UnknownAttempt(attempt))?;
+    if !state.leader_attempts.contains(&attempt) {
+        return Err(DomainError::InvalidCommand(format!(
+            "attempt {attempt} is not a leader review; only queued leader reviews complete this way"
+        )));
+    }
+    if !matches!(
+        attempt_state.status,
+        AttemptStatus::Queued
+            | AttemptStatus::Dispatching
+            | AttemptStatus::Running
+            | AttemptStatus::WaitingForApproval
+            | AttemptStatus::WaitingForInput
+            | AttemptStatus::Reconciling
+            | AttemptStatus::UnknownOutcome
+    ) {
+        return Err(DomainError::InvalidTransition(format!(
+            "attempt {attempt} is already {:?}; only a live review completes",
+            attempt_state.status
+        )));
+    }
+    let task = attempt_state.task_id;
+    let mut next = state.clone();
+    if let Some(record) = next.attempts.get_mut(&attempt) {
+        record.status = AttemptStatus::Completed;
+    }
+    release_settled_claims(&mut next);
+    Ok(finish(
+        next.clone(),
+        vec![Event::LeaderReviewCompleted {
+            run_id: next.id,
+            attempt_id: attempt,
+            task,
+            by: actor.id,
+            at: now,
+        }],
+        vec![Effect::CancelAttempt {
+            attempt_id: attempt,
+        }],
     ))
 }
 

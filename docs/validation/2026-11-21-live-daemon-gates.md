@@ -393,3 +393,41 @@ free local, commit `c6935e6`:
 - Gate: fmt sạch, clippy sạch, `cargo check` sạch, full suite 44
   binary xanh (1 lỗi compile thoáng qua ở lần chạy đầu, 3 lần sau +
   check đều sạch — chưa tái hiện). Commit gộp sau theo yêu cầu.
+
+## 17. Leader completion → worker proceeds (24/11 tối, run `76e546c9`)
+
+- `leader ask` → dispatch qua leader profile, Running. Turn xong
+  phía serve trong ~60s (`succeeded`, đúng một câu review
+  grounded về seen.txt). Observation kéo về qua inbox-reconcile.
+- Handover import: 1 verified fact + 1 unverified note đúng thiết kế
+  (transcript serve không算 durable evidence).
+- Phát hiện gap: không có gì kết thúc leader attempt → worker đói
+  mãi (covering rule tính cả leader review). Đóng bằng lệnh mới
+  `CompleteLeaderReview` (+ `POST /v1/runs/{id}/leader/finish` +
+  `central leader finish`): attempt → Completed, task giữ nguyên,
+  kèm cancel intent để reap serve child. `leader finish` live → attempt
+  Completed, task Pending, child bị reap.
+- Sau resume (restart park run theo fail-safe): worker `17b60575`
+  dispatch qua run default → Running → ghi `seen.txt` đúng, session
+  `succeeded`. Chuỗi leader→worker khép kín live.
+- Stop UnknownOutcome live: KHÔNG dựng được instance sạch (cần race
+  đúng lúc reply/observe; không chế tạo cưỡng bức). Đã cover bằng unit
+  test `stop_cancels_unknown_outcome_attempts` + kill-machinery proven
+  live trên Running/WaitingForApproval. Ghi nhận là đường live duy
+  nhất còn thiếu proof trực tiếp.
+
+## 18. Muse userInput/question live (24/11 tối, run `f225db5b`)
+
+- `muse exec` trực tiếp trả đúng `MUSE-DIRECT` → model ổn định, không
+  phải auth (nghi vấn cũ bị bác).
+- Worker task mơ hồ → model hỏi tiếng Việt 3 câu (tên file, nội dung,
+  vị trí) → inbox `Question/Pending` → `central answer` applied rev 26
+  → attempt `WaitingForInput` → Running, entry Resolved → model tạo
+  `ANSWER.md` đúng nội dung (`MUSE-ANSWER`). Vòng hỏi→đáp→hành động
+  VERIFIED live.
+- Đuôi turn: model im sau khi hành động (session files đóng băng),
+  serve child còn sống → `stop` dọn sạch (Cancelled + reap). Cùng
+  pattern slow-close đã thấy ở opencode.
+- Push 25/11: `c6935e6..a90627b` lên `origin/main` sau gate sạch trên
+  cây không WIP (fmt/clippy/44 binary test xanh). Feature finish +
+  evidence §§17–18 còn treo uncommitted.

@@ -126,6 +126,16 @@ pub enum Event {
         by: ActorId,
         at: Timestamp,
     },
+    /// A leader review turn closed after its output returned. The task
+    /// keeps its status: this releases the task cover so the waiting
+    /// worker can dispatch, nothing more.
+    LeaderReviewCompleted {
+        run_id: RunId,
+        attempt_id: AttemptId,
+        task: TaskId,
+        by: ActorId,
+        at: Timestamp,
+    },
     /// A mechanical Git integration moved the good ref by
     /// compare-and-swap after every approved check passed. The event
     /// carries the full receipt: candidate, previous and new head, and
@@ -323,6 +333,7 @@ impl Event {
             | Self::AttemptUnknown { run_id, .. }
             | Self::AttemptRequeued { run_id, .. }
             | Self::AttemptFailed { run_id, .. }
+            | Self::LeaderReviewCompleted { run_id, .. }
             | Self::TaskReopened { run_id, .. }
             | Self::AttemptRetryDeferred { run_id, .. }
             | Self::LimitsSet { run_id, .. }
@@ -361,6 +372,7 @@ impl Event {
             | Self::AttemptUnknown { at, .. }
             | Self::AttemptRequeued { at, .. }
             | Self::AttemptFailed { at, .. }
+            | Self::LeaderReviewCompleted { at, .. }
             | Self::TaskReopened { at, .. }
             | Self::AttemptRetryDeferred { at, .. }
             | Self::LimitsSet { at, .. }

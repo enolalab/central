@@ -74,6 +74,11 @@ Task outcomes arrive later through reads, events and verification.
   profile; leader reviews dispatch only through the leader profile.
   Unknown runs or profiles are 404, bad roles 400, reader/bridge
   tokens 403.
+- `POST /v1/runs/{id}/leader/finish` (`{"attempt"}`) closes the review
+  after its output returned through handover import: the review attempt
+  becomes `Completed` (releasing the task cover so the waiting worker
+  can dispatch) while the task keeps its status, and a cancel intent
+  rides along so a lingering serve child is reaped.
 - `POST /v1/runs/{id}/leader/review` (`{"task","objective"}`) queues
   one leader review turn. The scan dispatches it through the run's
   leader profile with the same gateway machinery as worker turns; the

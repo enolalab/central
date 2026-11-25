@@ -300,6 +300,16 @@ pub enum Command {
         task: TaskId,
         input: String,
     },
+    /// Close one leader review turn after its output returned. The
+    /// review must be a live attempt queued by [`Command::QueueLeaderReview`];
+    /// completing it releases the task cover so the waiting worker can
+    /// dispatch. The task itself is untouched: a review advises, it
+    /// never verifies, seals or moves the task. A cancel intent for the
+    /// harness session rides along so a lingering serve child is
+    /// reaped. User only.
+    CompleteLeaderReview {
+        attempt: AttemptId,
+    },
 }
 
 fn default_defer_max_retries() -> u32 {

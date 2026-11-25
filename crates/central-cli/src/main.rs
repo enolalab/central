@@ -369,6 +369,15 @@ pub enum LeaderCommands {
         #[arg(long)]
         objective: String,
     },
+    /// Finish a leader review turn after its output returned: completes
+    /// the review attempt (releasing the waiting worker) without moving
+    /// the task, and reaps the harness session.
+    Finish {
+        #[arg(long)]
+        run: RunId,
+        #[arg(long)]
+        attempt: String,
+    },
 }
 
 #[derive(Subcommand)]

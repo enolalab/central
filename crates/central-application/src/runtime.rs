@@ -263,6 +263,29 @@ impl Runtime {
         Ok((receipt, attempt))
     }
 
+    /// Close a leader review turn after its output returned. Only the
+    /// operator closes reviews; the domain completes the review
+    /// attempt (releasing the task cover so the waiting worker can
+    /// dispatch) and rides a cancel intent along so a lingering
+    /// harness session is reaped. The task itself keeps its status.
+    pub async fn finish_leader_review(
+        &self,
+        actor: Actor,
+        attempt: AttemptId,
+    ) -> Result<Receipt, AppError> {
+        let receipt = self
+            .execute(
+                actor,
+                CommandEnvelope {
+                    id: self.ids.next_command_id(),
+                    expected_revision: None,
+                    command: Command::CompleteLeaderReview { attempt },
+                },
+            )
+            .await?;
+        Ok(receipt)
+    }
+
     /// Startup recovery for every known run. Nonterminal runs are
     /// parked in `AwaitingResume` and attempts/intents left in
     /// `Dispatching` without a receipt become `UnknownOutcome`: a
@@ -537,9 +560,15 @@ impl Runtime {
                                 )
                                 .await?;
                             summary.dispatched += 1;
+                            // The kill is still useful cleanup, but a
+                            // terminal status never regresses: a finish
+                            // that rode along with its own cancel intent
+                            // stays completed.
                             if let Some(attempt) = next_state.attempts.get_mut(attempt_id) {
-                                attempt.status = AttemptStatus::Cancelled;
-                                state_changed = true;
+                                if !central_domain::is_confirmed_terminal(attempt.status) {
+                                    attempt.status = AttemptStatus::Cancelled;
+                                    state_changed = true;
+                                }
                             }
                             // A cancelled attempt is a confirmed
                             // terminal: its resource claims release so a
@@ -551,7 +580,9 @@ impl Runtime {
                         Ok(_) | Err(_) => {
                             // No usable evidence: the cancel may or
                             // may not have landed. Mark unknown, never
-                            // complete, never resend.
+                            // complete, never resend — unless the
+                            // attempt already reached a terminal state
+                            // through another path, which never regresses.
                             self.store
                                 .transition_outbox(
                                     intent.id,
@@ -561,8 +592,10 @@ impl Runtime {
                                 .await?;
                             summary.unknown += 1;
                             if let Some(attempt) = next_state.attempts.get_mut(attempt_id) {
-                                attempt.status = AttemptStatus::UnknownOutcome;
-                                state_changed = true;
+                                if !central_domain::is_confirmed_terminal(attempt.status) {
+                                    attempt.status = AttemptStatus::UnknownOutcome;
+                                    state_changed = true;
+                                }
                             }
                         }
                     }

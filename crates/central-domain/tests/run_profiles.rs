@@ -163,3 +163,104 @@ fn leader_review_rejects_bad_requests() {
         Err(DomainError::QueueConflict(_))
     ));
 }
+
+#[test]
+fn finishing_a_leader_review_completes_it_without_moving_the_task() {
+    let (state, _) = approved_run();
+    let attempt = central_domain::AttemptId::from_u128(4242);
+    let queued = decide(
+        &state,
+        &user(),
+        &Command::QueueLeaderReview {
+            attempt,
+            task: task_a(),
+            input: "review the scope".to_string(),
+        },
+        support::later(),
+    )
+    .expect("queue leader review")
+    .next;
+    assert_eq!(
+        queued.tasks[&task_a()].status,
+        central_domain::TaskStatus::Pending
+    );
+
+    let decision = decide(
+        &queued,
+        &user(),
+        &Command::CompleteLeaderReview { attempt },
+        support::later(),
+    )
+    .expect("finish leader review");
+    let next = decision.next;
+    assert_eq!(
+        next.attempts[&attempt].status,
+        AttemptStatus::Completed,
+        "the review closes"
+    );
+    assert_eq!(
+        next.tasks[&task_a()].status,
+        central_domain::TaskStatus::Pending,
+        "the task never moves on review output"
+    );
+    assert!(
+        decision
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, central_domain::Effect::CancelAttempt { attempt_id } if *attempt_id == attempt)),
+        "a cancel rides along so the harness session is reaped"
+    );
+
+    // A finished review never completes twice.
+    assert!(matches!(
+        decide(
+            &next,
+            &user(),
+            &Command::CompleteLeaderReview { attempt },
+            support::later()
+        ),
+        Err(DomainError::InvalidTransition(_))
+    ));
+}
+
+#[test]
+fn only_live_leader_reviews_complete() {
+    let (state, _) = approved_run();
+    // Unknown attempt.
+    assert!(matches!(
+        decide(
+            &state,
+            &user(),
+            &Command::CompleteLeaderReview {
+                attempt: central_domain::AttemptId::from_u128(9999)
+            },
+            support::later()
+        ),
+        Err(DomainError::UnknownAttempt(_))
+    ));
+    // Worker attempts are not reviews.
+    let worker = central_domain::AttemptId::from_u128(7);
+    let with_worker = decide(
+        &state,
+        &user(),
+        &Command::QueueAttempt {
+            attempt: worker,
+            task: task_a(),
+            input: "do the work".to_string(),
+            resources: Vec::new(),
+            max_parallel: 1,
+        },
+        support::later(),
+    )
+    .expect("queue worker attempt")
+    .next;
+    assert!(matches!(
+        decide(
+            &with_worker,
+            &user(),
+            &Command::CompleteLeaderReview { attempt: worker },
+            support::later()
+        ),
+        Err(DomainError::InvalidCommand(_))
+    ));
+}

@@ -14,7 +14,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use central_application::Runtime;
-use central_domain::{RunId, TaskId};
+use central_domain::{AttemptId, RunId, TaskId};
 use serde::Deserialize;
 
 use super::auth::{app_error_response, authenticate};
@@ -69,6 +69,60 @@ pub async fn post_leader_review(
     })?;
     let (receipt, attempt) = runtime_for(&state, run_id)
         .queue_leader_review(auth.actor, task, submitted.objective.trim())
+        .await
+        .map_err(app_error_response)?;
+    state.scan_notify.notify_one();
+    let receipt = serde_json::to_value(&receipt).map_err(|error| {
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            format!("cannot encode receipt: {error}"),
+        )
+    })?;
+    Ok(Json(serde_json::json!({
+        "run_id": run_id.to_string(),
+        "receipt": receipt,
+        "attempt_id": attempt.to_string(),
+    })))
+}
+
+/// The finish body: which review attempt to close.
+#[derive(Deserialize)]
+struct LeaderFinishBody {
+    attempt: String,
+}
+
+pub async fn post_leader_finish(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+    body: String,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    auth.require_control()?;
+    let run_id = raw_id.parse::<RunId>().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
+    })?;
+    let submitted: LeaderFinishBody = serde_json::from_str(&body).map_err(|error| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid leader finish: {error}"),
+        )
+    })?;
+    let attempt = submitted.attempt.parse::<AttemptId>().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid attempt id: {}", submitted.attempt),
+        )
+    })?;
+    let receipt = runtime_for(&state, run_id)
+        .finish_leader_review(auth.actor, attempt)
         .await
         .map_err(app_error_response)?;
     state.scan_notify.notify_one();

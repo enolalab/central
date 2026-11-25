@@ -128,6 +128,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/runs/{id}/leader/review",
             post(leader::post_leader_review),
         )
+        .route(
+            "/v1/runs/{id}/leader/finish",
+            post(leader::post_leader_finish),
+        )
         .route("/v1/runs/{id}/usage", get(usage::get_usage))
         .route("/v1/runs/{id}/usage/resolve", post(usage::post_resolve))
         .route(

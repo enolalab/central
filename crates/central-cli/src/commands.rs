@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use central_domain::{
     plan_hash, AttemptId, Command, CommandEnvelope, CommandId, PlanDocumentV1, Revision, RunId,
+    TaskId,
 };
 use central_infrastructure::process::{spawn_detached, DetachPlacement, ALREADY_RUNNING_EXIT_CODE};
 
@@ -1163,11 +1164,17 @@ fn verdict_cmd(state_dir: &Path, command: &VerdictCommands) -> i32 {
 /// the run's leader profile. The task keeps its status; the review
 /// output returns through handover import.
 fn leader_cmd(state_dir: &Path, command: &LeaderCommands) -> i32 {
-    let LeaderCommands::Ask {
-        run,
-        task,
-        objective,
-    } = command;
+    match command {
+        LeaderCommands::Ask {
+            run,
+            task,
+            objective,
+        } => leader_ask(state_dir, run, task, objective),
+        LeaderCommands::Finish { run, attempt } => leader_finish(state_dir, run, attempt),
+    }
+}
+
+fn leader_ask(state_dir: &Path, run: &RunId, task: &TaskId, objective: &str) -> i32 {
     if objective.trim().is_empty() {
         return fail("ask needs a non-empty --objective for the leader");
     }
@@ -1177,6 +1184,27 @@ fn leader_cmd(state_dir: &Path, command: &LeaderCommands) -> i32 {
     };
     let body = serde_json::json!({"task": task.to_string(), "objective": objective});
     match client.post_json(&format!("/v1/runs/{run}/leader/review"), &body) {
+        Ok(value) => {
+            print_json(&value);
+            0
+        }
+        Err(message) => fail(&message),
+    }
+}
+
+/// Finish a leader review turn after its output returned: completes the
+/// review attempt (releasing the waiting worker) without moving the
+/// task, and reaps the harness session.
+fn leader_finish(state_dir: &Path, run: &RunId, attempt: &str) -> i32 {
+    if attempt.trim().is_empty() {
+        return fail("finish needs a non-empty --attempt for the leader");
+    }
+    let client = match client(state_dir) {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+    let body = serde_json::json!({"attempt": attempt});
+    match client.post_json(&format!("/v1/runs/{run}/leader/finish"), &body) {
         Ok(value) => {
             print_json(&value);
             0

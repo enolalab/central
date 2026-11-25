@@ -251,6 +251,19 @@ paths:
         '403': { description: reader or bridge token }
         '404': { description: unknown run or task }
 
+  /v1/runs/{id}/leader/finish:
+    post:
+      summary: >-
+        Close one leader review turn after its output returned through
+        handover import. Completes the review attempt (releasing the
+        task cover so the waiting worker can dispatch) without moving
+        the task, and reaps the harness session. Owner or control only.
+      responses:
+        '200': { description: receipt plus completed attempt id }
+        '400': { description: malformed finish request }
+        '403': { description: reader or bridge token }
+        '404': { description: unknown run or attempt }
+
   /v1/runs/{id}/usage:
     get:
       summary: Usage ledger with the observed/estimated/unknown split plus the admission reason.
