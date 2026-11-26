@@ -323,6 +323,11 @@ impl Dispatcher {
             Some(task) => task.clone(),
             None => return Ok(()),
         };
+        let workspace_read_only = state
+            .leader_discussion
+            .iter()
+            .find(|turn| turn.attempt == attempt_id)
+            .is_some_and(|turn| turn.workspace_read_only);
         // A deferred safe retry is not due yet: leave it queued and
         // let a later tick (past the virtual-clock deadline) send it.
         // The end-of-scan recount reports it as still pending, and no
@@ -457,6 +462,7 @@ impl Dispatcher {
                 attempt_id,
                 profile,
                 workspace,
+                workspace_read_only,
                 resume_from: None,
             })
             .await
