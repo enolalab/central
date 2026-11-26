@@ -81,6 +81,8 @@ impl VolatileAnswerRef {
 pub enum AnswerPayload {
     Plain(String),
     Secret(VolatileAnswerRef),
+    Decline,
+    Cancel,
 }
 
 /// Epoch-scoped identity of one harness request. The canonical string is the
