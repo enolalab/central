@@ -125,7 +125,7 @@ fn load_opencode_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
     let config = OpencodeConfig {
         binary: binary.to_string(),
         cli_version: cli_version.to_string(),
-        surveyed_models: surveyed_models(&value),
+        surveyed_models: enabled_models(state_dir, "opencode", &value),
         extra_args,
         ..OpencodeConfig::default()
     };
@@ -138,18 +138,6 @@ fn load_opencode_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
     Some(Arc::new(gateway))
 }
 
-fn surveyed_models(value: &serde_json::Value) -> Vec<String> {
-    value["surveyed_models"]
-        .as_array()
-        .map(|models| {
-            models
-                .iter()
-                .filter_map(|model| model.as_str().map(|model| model.to_string()))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 pub(crate) fn read_model_catalog(state_dir: &Path) -> BTreeMap<String, BTreeSet<String>> {
     std::fs::read_to_string(state_dir.join("model-catalog.json"))
         .ok()
@@ -159,6 +147,23 @@ pub(crate) fn read_model_catalog(state_dir: &Path) -> BTreeMap<String, BTreeSet<
 
 pub(crate) fn enables_catalog_models(config: &serde_json::Value) -> bool {
     config["enable_catalog_models"].as_bool().unwrap_or(true)
+}
+
+fn enabled_models(state_dir: &Path, provider: &str, value: &serde_json::Value) -> Vec<String> {
+    let mut models: BTreeSet<String> = value["surveyed_models"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.as_str().map(str::to_owned))
+        .collect();
+    if enables_catalog_models(value) {
+        if let Some(catalog) = read_model_catalog(state_dir).remove(provider) {
+            models.extend(catalog.into_iter().filter(|id| {
+                !id.trim().is_empty() && id.len() <= 200 && !id.chars().any(char::is_control)
+            }));
+        }
+    }
+    models.into_iter().collect()
 }
 
 fn load_codex_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
@@ -179,7 +184,7 @@ fn load_codex_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
     let config = central_infrastructure::codex::CodexConfig {
         binary: binary.to_string(),
         cli_version: cli_version.to_string(),
-        surveyed_models: surveyed_models(&value),
+        surveyed_models: enabled_models(state_dir, "codex", &value),
         app_server_args,
         ..central_infrastructure::codex::CodexConfig::default()
     };
@@ -226,7 +231,7 @@ fn load_muse_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
     let config = MuseConfig {
         binary: binary.to_string(),
         cli_version: cli_version.to_string(),
-        surveyed_models: surveyed_models(&value),
+        surveyed_models: enabled_models(state_dir, "muse", &value),
         serve_args,
         ..MuseConfig::default()
     };
@@ -944,7 +949,13 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
     // This boot's instance id: snapshots and cursors bind to it, and a
     // restart rotates it so old cursors fail fast with resync_required.
     let instance_epoch = Uuid::new_v4().to_string();
-    let origins = crate::http::origin::OriginConfig::load(&config.state_dir).allowed;
+    let mut origins = crate::http::origin::OriginConfig::load(&config.state_dir).allowed;
+    // The embedded workspace uses the actual listener's origin. API requests
+    // still require bearer auth, including requests from this origin.
+    let workspace_origin = format!("http://{addr}");
+    if !origins.contains(&workspace_origin) {
+        origins.push(workspace_origin);
+    }
     let artifacts = Arc::new(
         central_infrastructure::artifacts::FilesystemArtifactStore::open(
             config.state_dir.join("artifacts"),
