@@ -145,6 +145,7 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
   margin: 0 20px 10px; padding: 7px 11px; border: 1px solid #c7dbd0;
   border-radius: 8px; color: #17483d; background: #e6eee7;
 }
+.chat .plan-status { background: #eef3e0; border-color: #ccd8ae; font-weight: 600; }
 @media (max-width: 520px) {
   .chat-transcript { padding: 15px 12px; }
   .chat-message { gap: 7px; }

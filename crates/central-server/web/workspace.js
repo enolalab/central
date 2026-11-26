@@ -15,7 +15,7 @@ for (const [repository, runIds] of Object.entries(preferences.projects || {})) {
 }
 
 function projectState(repository, runIds = []) {
-    return { repository, runIds, draft: '', mode: 'plan', roles: null, run: null, chat: [], attempt: '', logs: [], logAttempt: '' };
+    return { repository, runIds, draft: '', mode: 'plan', roles: null, run: null, chat: [], attempt: '', logs: [], logAttempt: '', exitPlanningFor: '' };
 }
 
 function loadPreferences() {
@@ -590,14 +590,31 @@ async function bindRoles(workspace, snapshot) {
     return true;
 }
 
-async function sendDiscussion(workspace, message) {
+async function sendDiscussion(workspace, message, { intent = 'discuss', assume = false } = {}) {
     const snapshot = await ensureRun(workspace, message);
     if (!snapshot.state.leader_profile || !snapshot.state.worker_profile) {
         if (!await bindRoles(workspace, snapshot)) return chooseAgent();
     }
-    await request('/app/' + runPath(snapshot.state.run_id, '/leader-chat'), { body: message });
+    await request('/app/' + runPath(snapshot.state.run_id, '/leader-chat'), {
+        body: message, intent, ...(assume ? { assume: true } : {}),
+    });
     if (workspace.draft.trim() === message) workspace.draft = '';
     await refresh(workspace);
+}
+
+// Planning mode is derived, never stored: the last turn asked to plan (or
+// revise) and has not produced a proposal yet. "Quay lại thảo luận" only
+// exits for that one turn, by remembering its attempt id.
+function planningIntent(workspace) {
+    const turn = workspace?.run?.state?.leader_discussion?.at(-1);
+    if (!turn || turn.proposal) return null;
+    if (turn.intent !== 'plan' && turn.intent !== 'revise') return null;
+    if (workspace.exitPlanningFor && workspace.exitPlanningFor === turn.attempt_id) return null;
+    return turn.intent;
+}
+
+function currentIntent(workspace) {
+    return planningIntent(workspace) || 'discuss';
 }
 
 async function submitDirect(workspace, goal) {
@@ -1154,6 +1171,19 @@ function render({ keepWorkerFocus = false } = {}) {
         ? 'Central chưa xác nhận được kết quả lượt trước.' : '';
     if ($('leader-status').textContent !== (status || '')) $('leader-status').textContent = status || '';
     $('leader-status').hidden = !status;
+    const planIntent = planningIntent(workspace);
+    const leaderRunning = Boolean(state?.leader_discussion?.some(turn =>
+        activeStatuses.has(turn.status) || turn.status === 'Reconciling'));
+    const planStatus = planIntent ? 'Đang lập kế hoạch: leader có thể hỏi các câu cần thiết' : '';
+    if ($('plan-status').textContent !== planStatus) $('plan-status').textContent = planStatus;
+    $('plan-status').hidden = !planStatus;
+    $('plan').hidden = !state || !state.leader_discussion?.length || Boolean(state.active_plan)
+        || leaderRunning || Boolean(planIntent);
+    $('plan').disabled = busy || Boolean(unresolved || state?.control === 'Paused' || state?.control === 'AwaitingResume');
+    $('plan-assume').hidden = !planIntent;
+    $('plan-assume').disabled = busy || leaderRunning || Boolean(unresolved);
+    $('plan-back').hidden = !planIntent;
+    $('plan-back').disabled = busy;
     $('refresh-chat').hidden = !token || !state;
     $('refresh-chat').disabled = busy;
     const mode = workspace?.mode || 'plan';
@@ -1186,6 +1216,29 @@ $('office-leader').addEventListener('click', () => {
     render();
     $('message').focus();
 });
+$('plan').addEventListener('click', () => {
+    const workspace = currentWorkspace();
+    if (!workspace) return addProject();
+    if (!token) return showConnection();
+    if ($('plan').disabled) return;
+    const body = workspace.draft.trim() || 'Lập kế hoạch từ cuộc trao đổi';
+    void perform(() => sendDiscussion(workspace, body, { intent: 'plan' }));
+});
+$('plan-assume').addEventListener('click', () => {
+    const workspace = currentWorkspace();
+    if (!workspace) return addProject();
+    if (!token) return showConnection();
+    if ($('plan-assume').disabled) return;
+    const body = workspace.draft.trim() || 'Lập kế hoạch từ cuộc trao đổi';
+    void perform(() => sendDiscussion(workspace, body, { intent: planningIntent(workspace) || 'plan', assume: true }));
+});
+$('plan-back').addEventListener('click', () => {
+    const workspace = currentWorkspace();
+    const turn = workspace?.run?.state?.leader_discussion?.at(-1);
+    if (turn) workspace.exitPlanningFor = turn.attempt_id;
+    render();
+    $('message').focus();
+});
 $('stop').addEventListener('click', () => showControl(currentWorkspace(), 'Stop', 'Dừng công việc'));
 $('new-work').addEventListener('click', () => {
     const workspace = currentWorkspace();
@@ -1197,6 +1250,7 @@ $('new-work').addEventListener('click', () => {
     workspace.replyPreview = '';
     workspace.draft = '';
     workspace.mode = 'plan';
+    workspace.exitPlanningFor = '';
     render();
     $('message').focus();
 });
@@ -1236,7 +1290,7 @@ $('composer').addEventListener('submit', event => {
     } else if (!isConversation && workspace.mode === 'direct') {
         void perform(() => submitDirect(workspace, body));
     } else {
-        void perform(() => sendDiscussion(workspace, body));
+        void perform(() => sendDiscussion(workspace, body, { intent: currentIntent(workspace) }));
     }
 });
 

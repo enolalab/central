@@ -46,6 +46,7 @@
       </header>
       <div class="pb chat-transcript" id="chat" role="log" aria-labelledby="leader-label"></div>
       <p id="leader-status" class="leader-status" role="status" hidden></p>
+      <p id="plan-status" class="leader-status plan-status" role="status" hidden></p>
       <form class="comp" id="composer">
         <label for="message" class="sr-only">Bạn muốn Central làm gì?</label>
         <textarea id="message" rows="2" required placeholder="Bạn muốn Central làm gì?"></textarea>
@@ -58,6 +59,9 @@
           <button type="button" class="btn" id="stop" hidden>Dừng công việc</button>
           <button type="button" class="btn" id="new-work" hidden>Việc mới</button>
           <span class="sp"></span>
+          <button type="button" class="btn" id="plan-back" hidden>Quay lại thảo luận</button>
+          <button type="button" class="btn ink" id="plan-assume" hidden>Lập ngay với giả định</button>
+          <button type="button" class="btn" id="plan" hidden>Lập kế hoạch</button>
           <button type="submit" class="btn ink" id="send">Gửi</button>
         </div>
       </form>
