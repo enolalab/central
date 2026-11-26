@@ -377,7 +377,9 @@ impl Runtime {
                     return false;
                 }
                 match payload {
-                    AnswerPayload::Plain(_) => true,
+                    AnswerPayload::Plain(_) | AnswerPayload::Decline | AnswerPayload::Cancel => {
+                        true
+                    }
                     AnswerPayload::Secret(reference) => self.secrets.lookup(reference).is_some(),
                 }
             }
@@ -439,11 +441,10 @@ impl Runtime {
                     // The plaintext resolves without opening inference:
                     // secrets come only from the memory-only vault, whose
                     // presence was checked before the claim above.
-                    let text = match payload {
-                        AnswerPayload::Plain(text) => text.clone(),
+                    let wire_payload = match payload {
                         AnswerPayload::Secret(reference) => {
                             match self.secrets.lookup(reference) {
-                                Some(secret) => secret,
+                                Some(secret) => AnswerPayload::Plain(secret),
                                 None => {
                                     // Lost between gate and claim: release
                                     // back to Pending for re-entry.
@@ -459,6 +460,7 @@ impl Runtime {
                                 }
                             }
                         }
+                        other => other.clone(),
                     };
                     let answer = ExternalAnswer {
                         key: crate::contracts::ExternalRequestKey {
@@ -471,7 +473,7 @@ impl Runtime {
                             item_id: key.item_id.clone(),
                             request_id: key.request_id.clone(),
                         },
-                        payload: AnswerPayload::Plain(text),
+                        payload: wire_payload,
                         scope: *scope,
                     };
                     match self.agent.answer(answer).await {
