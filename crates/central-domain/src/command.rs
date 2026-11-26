@@ -2,8 +2,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     quality::VerificationReport, ActorId, AnswerPayload, AttemptId, AttemptSession, CommandId,
-    ContentHash, InboxKey, InboxRequest, Observation, PlanDocumentV1, PlanHash, ProfileId,
-    ProfileRole, ReuseBindings, ReuseDecision, Revision, TaskId, Timestamp, UsageLimits,
+    ContentHash, DiscussionIntent, InboxKey, InboxRequest, Observation, PlanDocumentV1, PlanHash,
+    ProfileId, ProfileRole, ReuseBindings, ReuseDecision, Revision, TaskId, Timestamp, UsageLimits,
     UsageObservation,
 };
 
@@ -309,6 +309,25 @@ pub enum Command {
     /// reaped. User only.
     CompleteLeaderReview {
         attempt: AttemptId,
+    },
+
+    /// Queue a discussion turn without creating a task or approving a plan.
+    QueueLeaderDiscussion {
+        attempt: AttemptId,
+        #[serde(default)]
+        workspace_read_only: bool,
+        #[serde(default)]
+        intent: DiscussionIntent,
+        message: String,
+        input: String,
+    },
+    /// Record the reply returned by the owned leader attempt and, when
+    /// present, attach a pending plan for a separate user approval.
+    CompleteLeaderDiscussion {
+        attempt: AttemptId,
+        reply: Option<String>,
+        proposal: Option<PlanDocumentV1>,
+        error: Option<String>,
     },
 }
 

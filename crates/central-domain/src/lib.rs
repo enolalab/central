@@ -56,9 +56,9 @@ pub use revision::{
     CriteriaImpact, ImpactSet, PendingRevision, ReuseBindings, ReuseDecision, StaleCandidate,
 };
 pub use run::{
-    Artifact, Attempt, AttemptSession, AttemptStatus, HoldReason, Observation, PlanRevision,
-    PlanStatus, ProfileRole, RunControl, RunState, Task, TaskStatus, UsageLedger,
-    VerificationOutcome,
+    Artifact, Attempt, AttemptSession, AttemptStatus, DiscussionIntent, HoldReason,
+    LeaderDiscussion, Observation, PlanRevision, PlanStatus, ProfileRole, RunControl, RunState,
+    Task, TaskStatus, UsageLedger, VerificationOutcome,
 };
 pub use scheduling::{
     covering_attempt, eligible_tasks, eligible_tasks_ignoring_gate, is_confirmed_terminal,

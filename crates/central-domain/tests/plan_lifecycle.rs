@@ -2,8 +2,8 @@ mod support;
 
 use central_domain::{
     decide, decide_envelope, validate_plan, Attempt, AttemptId, AttemptStatus, Command,
-    CommandEnvelope, CommandId, DomainError, PlanDocumentV1, PlanStatus, Revision, RunControl,
-    TaskId, TaskStatus,
+    CommandEnvelope, CommandId, DiscussionIntent, DomainError, Event, LeaderDiscussion,
+    PlanDocumentV1, PlanStatus, Revision, RunControl, RunState, TaskId, TaskStatus,
 };
 use support::{
     approved_run, created_run, leader, now, proposed_run, task_a, task_b, user, valid_plan,
@@ -331,4 +331,231 @@ fn criteria_change_changes_hash_and_conflicts() {
         support::later(),
     );
     assert_eq!(stale_old, Err(DomainError::StaleRevision));
+}
+
+#[test]
+fn leader_discussion_creates_only_a_pending_plan_until_the_user_approves() {
+    let mut state = created_run();
+    state.leader_profile = Some(central_domain::ProfileId::from_u128(901));
+    let plan = valid_plan();
+    let hash = validate_plan(&plan).unwrap();
+    for (number, reply, proposal, intent) in [
+        (
+            201,
+            "Which file format do you need?",
+            None,
+            DiscussionIntent::Discuss,
+        ),
+        (
+            202,
+            "Here is the agreed plan.",
+            Some(plan),
+            DiscussionIntent::Plan,
+        ),
+    ] {
+        let attempt = AttemptId::from_u128(number);
+        for command in [
+            Command::QueueLeaderDiscussion {
+                workspace_read_only: false,
+                intent,
+                attempt,
+                message: "Discuss the export".into(),
+                input: "Conversation context".into(),
+            },
+            Command::StartDispatch { attempt },
+            Command::AttemptRunning {
+                attempt,
+                session: central_domain::AttemptSession {
+                    provider: "codex".into(),
+                    instance_epoch: "epoch".into(),
+                    thread_id: "thread".into(),
+                },
+            },
+            Command::CompleteLeaderDiscussion {
+                attempt,
+                reply: Some(reply.into()),
+                proposal,
+                error: None,
+            },
+        ] {
+            state = decide(&state, &user(), &command, now()).unwrap().next;
+        }
+        assert_eq!(state.attempts[&attempt].status, AttemptStatus::Completed);
+        assert!(state.tasks.is_empty());
+        assert!(state.active_plan.is_none());
+        if number == 201 {
+            assert!(state.pending_plan.is_none());
+        }
+    }
+    assert_eq!(state.leader_discussion.len(), 2);
+    assert_eq!(state.leader_discussion[1].proposal, Some(hash.clone()));
+    let approved = decide(
+        &state,
+        &user(),
+        &Command::ApprovePlan {
+            plan_hash: hash.clone(),
+        },
+        now(),
+    )
+    .unwrap()
+    .next;
+    assert_eq!(approved.active_plan, Some(hash));
+    assert!(approved.tasks.contains_key(&task_a()));
+}
+
+#[test]
+fn missing_intent_deserializes_as_discuss() {
+    let turn: LeaderDiscussion = serde_json::from_value(serde_json::json!({
+        "attempt": AttemptId::from_u128(201).to_string(),
+        "user": "Discuss the export",
+        "reply": null,
+        "proposal": null,
+        "error": null,
+    }))
+    .expect("old LeaderDiscussion without intent");
+    assert_eq!(turn.intent, DiscussionIntent::Discuss);
+
+    let command: Command = serde_json::from_value(serde_json::json!({
+        "QueueLeaderDiscussion": {
+            "attempt": AttemptId::from_u128(202).to_string(),
+            "message": "Discuss the export",
+            "input": "Conversation context",
+        }
+    }))
+    .expect("old QueueLeaderDiscussion without intent");
+    assert!(matches!(
+        command,
+        Command::QueueLeaderDiscussion {
+            intent: DiscussionIntent::Discuss,
+            ..
+        }
+    ));
+}
+
+fn discussion_run() -> RunState {
+    let mut state = created_run();
+    state.leader_profile = Some(central_domain::ProfileId::from_u128(901));
+    state
+}
+
+fn run_discussion_turn(
+    state: &RunState,
+    number: u128,
+    intent: DiscussionIntent,
+    proposal: Option<PlanDocumentV1>,
+) -> central_domain::Decision {
+    let attempt = AttemptId::from_u128(number);
+    let mut next = state.clone();
+    for command in [
+        Command::QueueLeaderDiscussion {
+            workspace_read_only: false,
+            intent,
+            attempt,
+            message: "Discuss the export".into(),
+            input: "Conversation context".into(),
+        },
+        Command::StartDispatch { attempt },
+        Command::AttemptRunning {
+            attempt,
+            session: central_domain::AttemptSession {
+                provider: "codex".into(),
+                instance_epoch: "epoch".into(),
+                thread_id: "thread".into(),
+            },
+        },
+    ] {
+        next = decide(&next, &user(), &command, now()).unwrap().next;
+    }
+    decide(
+        &next,
+        &user(),
+        &Command::CompleteLeaderDiscussion {
+            attempt,
+            reply: Some("Leader reply.".into()),
+            proposal,
+            error: None,
+        },
+        now(),
+    )
+    .expect("complete discussion turn")
+}
+
+#[test]
+fn discuss_turn_ignores_proposal() {
+    let state = discussion_run();
+    let decision = run_discussion_turn(&state, 211, DiscussionIntent::Discuss, Some(valid_plan()));
+    assert!(decision.next.pending_plan.is_none());
+    assert!(decision.next.plans.is_empty());
+    assert!(!decision
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::PlanProposed { .. })));
+    let turn = decision.next.leader_discussion.last().expect("turn");
+    assert_eq!(turn.intent, DiscussionIntent::Discuss);
+    assert_eq!(turn.reply.as_deref(), Some("Leader reply."));
+    assert_eq!(turn.proposal, None);
+}
+
+#[test]
+fn plan_turn_creates_pending_plan() {
+    let state = discussion_run();
+    let plan = valid_plan();
+    let hash = validate_plan(&plan).unwrap();
+    let decision = run_discussion_turn(&state, 212, DiscussionIntent::Plan, Some(plan));
+    assert_eq!(decision.next.pending_plan, Some(hash.clone()));
+    assert!(decision
+        .events
+        .iter()
+        .any(|event| matches!(event, Event::PlanProposed { .. })));
+    let turn = decision.next.leader_discussion.last().expect("turn");
+    assert_eq!(turn.intent, DiscussionIntent::Plan);
+    assert_eq!(turn.proposal, Some(hash));
+}
+
+#[test]
+fn plan_and_revise_are_rejected_when_a_plan_is_active() {
+    let (mut state, _) = approved_run();
+    state.leader_profile = Some(central_domain::ProfileId::from_u128(901));
+    for (number, intent) in [
+        (221, DiscussionIntent::Plan),
+        (222, DiscussionIntent::Revise),
+    ] {
+        let result = decide(
+            &state,
+            &user(),
+            &Command::QueueLeaderDiscussion {
+                workspace_read_only: false,
+                intent,
+                attempt: AttemptId::from_u128(number),
+                message: "Change the plan".into(),
+                input: "Conversation context".into(),
+            },
+            now(),
+        );
+        assert!(
+            matches!(result, Err(DomainError::InvalidCommand(_))),
+            "intent {intent:?} with active plan must be InvalidCommand, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn revise_requires_a_pending_plan() {
+    let state = discussion_run();
+    let result = decide(
+        &state,
+        &user(),
+        &Command::QueueLeaderDiscussion {
+            workspace_read_only: false,
+            intent: DiscussionIntent::Revise,
+            attempt: AttemptId::from_u128(231),
+            message: "Revise the plan".into(),
+            input: "Conversation context".into(),
+        },
+        now(),
+    );
+    assert!(
+        matches!(result, Err(DomainError::InvalidTransition(_))),
+        "revise without pending plan must be InvalidTransition, got {result:?}"
+    );
 }

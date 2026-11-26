@@ -91,6 +91,13 @@ pub struct Observation {
 }
 
 impl Observation {
+    /// A complete user-visible assistant message, separate from deltas,
+    /// tool output, and commentary. The gateway supplies redacted text.
+    pub fn assistant_reply(&self) -> Option<&str> {
+        (self.dedup_key.starts_with("assistant.reply:") && !self.detail.trim().is_empty())
+            .then_some(self.detail.as_str())
+    }
+
     /// Evidence that one turn was sent for an attempt: keyed by the
     /// harness turn id so a later reconcile can correlate it. The
     /// dispatcher records this through `RecordObservation` right after a
@@ -150,6 +157,31 @@ impl Task {
     pub fn is_ready(&self) -> bool {
         matches!(self.status, TaskStatus::Pending | TaskStatus::Ready)
     }
+}
+
+/// Why one leader turn was queued: ordinary discussion, explicit
+/// planning, or revision of the pending plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiscussionIntent {
+    #[default]
+    Discuss,
+    Plan,
+    Revise,
+}
+
+/// One user message and its isolated leader turn, in conversation order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaderDiscussion {
+    pub attempt: AttemptId,
+    #[serde(default)]
+    pub workspace_read_only: bool,
+    #[serde(default)]
+    pub intent: DiscussionIntent,
+    pub user: String,
+    pub reply: Option<String>,
+    pub proposal: Option<PlanHash>,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -331,6 +363,8 @@ pub struct RunState {
     /// through worker-result import.
     #[serde(default)]
     pub leader_attempts: BTreeSet<AttemptId>,
+    #[serde(default)]
+    pub leader_discussion: Vec<LeaderDiscussion>,
 }
 
 impl RunState {
@@ -368,6 +402,7 @@ impl RunState {
             worker_profile: None,
             leader_profile: None,
             leader_attempts: BTreeSet::new(),
+            leader_discussion: Vec::new(),
         }
     }
 

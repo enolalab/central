@@ -58,6 +58,16 @@ mod tests {
     use central_application::contracts::AppError;
 
     #[test]
+    fn invalid_transition_maps_to_409() {
+        let error = AppError::from(central_domain::DomainError::InvalidTransition(
+            "there is no pending plan to revise".to_string(),
+        ));
+        let (status, Json(body)) = app_error_response(error);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"]["code"], "conflict");
+    }
+
+    #[test]
     fn conflict_codes_are_stable() {
         let cases = [
             (

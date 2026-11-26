@@ -72,6 +72,7 @@ impl From<DomainError> for AppError {
             | DomainError::PlanHashMismatch
             | DomainError::StaleRequest
             | DomainError::RequestConflict(_)
+            | DomainError::InvalidTransition(_)
             | DomainError::QueueConflict(_) => Self::Conflict(error.to_string()),
             DomainError::UnknownPlan(_)
             | DomainError::UnknownRequest(_)
@@ -207,6 +208,8 @@ pub struct OpenSession {
     pub attempt_id: AttemptId,
     pub profile: ResolvedProfile,
     pub workspace: String,
+    #[serde(default)]
+    pub workspace_read_only: bool,
     pub resume_from: Option<SessionRef>,
 }
 

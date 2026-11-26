@@ -4,7 +4,7 @@
 use std::io::Read;
 use std::path::Path;
 
-use central_domain::{RunState, TaskKind};
+use central_domain::{DiscussionIntent, RunState, TaskKind};
 
 use crate::contracts::AppError;
 use crate::leader::{LeaderReplyV1, LEADER_REPLY_VERSION};
@@ -18,6 +18,10 @@ pub fn prompt(
     workspace_entries: &[String],
     workspace_read_only: bool,
     inspect_reason: Option<&str>,
+    // Intent-specific prompt branches land in later tasks; every intent
+    // keeps the discuss wording for now.
+    _intent: DiscussionIntent,
+    _assume: bool,
 ) -> Result<String, AppError> {
     if message.trim().is_empty() || message.len() > 16_384 {
         return Err(AppError::Validation(
@@ -157,6 +161,8 @@ mod tests {
             &["src/".to_string()],
             can_inspect,
             inspect_reason,
+            DiscussionIntent::Discuss,
+            false,
         )
         .expect("prompt")
     }

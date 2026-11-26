@@ -24,6 +24,10 @@ use crate::api::read_models::project_chat_message;
 #[derive(Deserialize)]
 pub struct PostChatBody {
     pub body: String,
+    #[serde(default)]
+    pub intent: Option<String>,
+    #[serde(default)]
+    pub assume: bool,
 }
 
 pub async fn list_chat(
@@ -138,6 +142,18 @@ pub async fn post_leader_chat(
             "leader model is not available",
         ));
     }
+    let intent = match body.intent.as_deref() {
+        None | Some("discuss") => central_domain::DiscussionIntent::Discuss,
+        Some("plan") => central_domain::DiscussionIntent::Plan,
+        Some("revise") => central_domain::DiscussionIntent::Revise,
+        Some(other) => {
+            return Err(error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "validation_failed",
+                format!("invalid intent: {other}"),
+            ))
+        }
+    };
     let message = body.body.trim().to_owned();
     // Local project metadata is collected for the owner. Control clients
     // still get the run's stored path in the prompt.
@@ -163,6 +179,8 @@ pub async fn post_leader_chat(
         &entries,
         workspace_read_only,
         inspect_reason,
+        intent,
+        body.assume,
     )
     .map_err(app_error_response)?;
     let attempt = state.ids.next_attempt_id();
@@ -182,6 +200,7 @@ pub async fn post_leader_chat(
                 command: central_domain::Command::QueueLeaderDiscussion {
                     attempt,
                     workspace_read_only,
+                    intent,
                     message,
                     input,
                 },

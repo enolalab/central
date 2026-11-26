@@ -157,6 +157,17 @@ pub fn decide(
         Command::ApprovePlan { plan_hash } => {
             require_user(actor)?;
             require_created(state)?;
+            if state
+                .leader_discussion
+                .last()
+                .and_then(|turn| state.attempts.get(&turn.attempt))
+                .is_some_and(|attempt| !is_confirmed_terminal(attempt.status))
+            {
+                return Err(DomainError::QueueConflict(
+                    "wait for the leader's current discussion turn before approving the plan"
+                        .into(),
+                ));
+            }
             let Some(plan) = state.plans.get(plan_hash) else {
                 return Err(DomainError::UnknownPlan(plan_hash.clone()));
             };
@@ -469,7 +480,11 @@ pub fn decide(
                 key,
                 preview_hash,
                 InboxKind::Question,
-                InboxOutcome::Answered,
+                if matches!(payload, AnswerPayload::Decline | AnswerPayload::Cancel) {
+                    InboxOutcome::Declined
+                } else {
+                    InboxOutcome::Answered
+                },
                 payload.clone(),
                 now,
             )
@@ -678,8 +693,10 @@ pub fn decide(
             if let Some(record) = next.attempts.get_mut(attempt) {
                 record.status = AttemptStatus::Failed;
             }
-            if let Some(task) = next.tasks.get_mut(&task_id) {
-                task.status = TaskStatus::Failed;
+            if !next.leader_attempts.contains(attempt) {
+                if let Some(task) = next.tasks.get_mut(&task_id) {
+                    task.status = TaskStatus::Failed;
+                }
             }
             // A refused send is confirmed finished: release its claims.
             release_settled_claims(&mut next);
@@ -965,7 +982,198 @@ pub fn decide(
         Command::CompleteLeaderReview { attempt } => {
             complete_leader_review(state, actor, *attempt, now)
         }
+        Command::QueueLeaderDiscussion {
+            attempt,
+            workspace_read_only,
+            intent,
+            message,
+            input,
+        } => queue_leader_discussion(
+            state,
+            actor,
+            *attempt,
+            message,
+            input,
+            *workspace_read_only,
+            *intent,
+            now,
+        ),
+        Command::CompleteLeaderDiscussion {
+            attempt,
+            reply,
+            proposal,
+            error,
+        } => {
+            complete_leader_discussion(state, actor, *attempt, reply, proposal.as_ref(), error, now)
+        }
     }
+}
+
+// Discussion attempts intentionally have no task in the task registry.
+fn queue_leader_discussion(
+    state: &RunState,
+    actor: &Actor,
+    attempt: AttemptId,
+    message: &str,
+    input: &str,
+    workspace_read_only: bool,
+    intent: crate::DiscussionIntent,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user(actor)?;
+    require_created(state)?;
+    if state.control != RunControl::Running
+        || !state.holds.is_empty()
+        || matches!(
+            admission(
+                state,
+                &WorkRequest {
+                    role: WorkRole::Leader
+                },
+                now
+            ),
+            Admission::Held(_)
+        )
+    {
+        return Err(DomainError::QueueConflict(
+            "leader discussion is held or paused".into(),
+        ));
+    }
+    if state.leader_profile.is_none() {
+        return Err(DomainError::InvalidCommand(
+            "choose a leader profile first".into(),
+        ));
+    }
+    if intent != crate::DiscussionIntent::Discuss && state.active_plan.is_some() {
+        return Err(DomainError::InvalidCommand(
+            "planning cannot replace an active plan".into(),
+        ));
+    }
+    if intent == crate::DiscussionIntent::Revise && state.pending_plan.is_none() {
+        return Err(DomainError::InvalidTransition(
+            "there is no pending plan to revise".into(),
+        ));
+    }
+    if state.leader_discussion.iter().any(|turn| {
+        state
+            .attempts
+            .get(&turn.attempt)
+            .is_some_and(|attempt| !is_confirmed_terminal(attempt.status))
+    }) {
+        return Err(DomainError::QueueConflict(
+            "the previous leader turn has not finished".into(),
+        ));
+    }
+    if message.trim().is_empty() || message.len() > 16_384 || input.len() > 100_000 {
+        return Err(DomainError::InvalidCommand(
+            "leader message is empty or too long".into(),
+        ));
+    }
+    let task = TaskId::from_uuid(attempt.uuid());
+    if state.attempts.contains_key(&attempt) || state.tasks.contains_key(&task) {
+        return Err(DomainError::QueueConflict(
+            "leader attempt already exists".into(),
+        ));
+    }
+    let mut next = state.clone();
+    next.attempts.insert(
+        attempt,
+        Attempt {
+            id: attempt,
+            task_id: task,
+            plan_hash: PlanHash::from_hex(""),
+            status: AttemptStatus::Queued,
+            profile_id: state.leader_profile,
+            created_at: now,
+        },
+    );
+    next.attempt_inputs.insert(attempt, input.to_owned());
+    next.leader_attempts.insert(attempt);
+    next.leader_discussion.push(crate::LeaderDiscussion {
+        attempt,
+        workspace_read_only,
+        intent,
+        user: message.to_owned(),
+        reply: None,
+        proposal: None,
+        error: None,
+    });
+    Ok(finish(
+        next,
+        vec![Event::AttemptQueued {
+            run_id: state.id,
+            attempt_id: attempt,
+            task,
+            by: actor.id,
+            at: now,
+        }],
+        Vec::new(),
+    ))
+}
+
+fn complete_leader_discussion(
+    state: &RunState,
+    actor: &Actor,
+    attempt: AttemptId,
+    reply: &Option<String>,
+    proposal: Option<&PlanDocumentV1>,
+    error: &Option<String>,
+    now: Timestamp,
+) -> Result<Decision, DomainError> {
+    require_user_or_system(actor)?;
+    let position = state
+        .leader_discussion
+        .iter()
+        .position(|turn| turn.attempt == attempt)
+        .ok_or(DomainError::UnknownAttempt(attempt))?;
+    if state.control == RunControl::Stopped
+        || !state
+            .attempts
+            .get(&attempt)
+            .is_some_and(|item| item.status == AttemptStatus::Running)
+    {
+        return Err(DomainError::InvalidTransition(
+            "leader discussion is no longer running".into(),
+        ));
+    }
+    let mut decision = complete_leader_review(state, &Actor::user(actor.id), attempt, now)?;
+    // A discuss turn never creates a pending plan, even when the model
+    // ignored its instructions and returned a structured proposal.
+    let proposal = if state.leader_discussion[position].intent == crate::DiscussionIntent::Discuss {
+        None
+    } else {
+        proposal
+    };
+    if let Some(plan) = proposal {
+        if state.active_plan.is_some()
+            || plan
+                .tasks
+                .iter()
+                .any(|task| task.kind == TaskKind::Integration)
+        {
+            return Err(DomainError::InvalidCommand(
+                "discussion cannot replace an active plan or queue Git integration".into(),
+            ));
+        }
+        let proposed = decide(
+            state,
+            &Actor {
+                id: actor.id,
+                kind: ActorKind::Leader,
+            },
+            &Command::ProposePlan { plan: plan.clone() },
+            now,
+        )?;
+        // Merge the proposal and the terminal observation in one revision.
+        decision.next.plans = proposed.next.plans;
+        decision.next.pending_plan = proposed.next.pending_plan;
+        decision.events.extend(proposed.events);
+        decision.next.leader_discussion[position].proposal = decision.next.pending_plan.clone();
+    }
+    let item = &mut decision.next.leader_discussion[position];
+    item.reply.clone_from(reply);
+    item.error.clone_from(error);
+    Ok(decision)
 }
 
 /// Durably record one worker result (P4 durable worker-done command).
@@ -2528,6 +2736,19 @@ fn answer_inbox(
         // preview mismatches: an old accept never applies, even to the same
         // text under a new key.
         return Err(DomainError::StaleRequest);
+    }
+    let is_acp_form = entry.kind == InboxKind::Question
+        && entry.epoch.starts_with("acp-v1-")
+        && entry.item_id.starts_with("form-");
+    if matches!(payload, AnswerPayload::Decline | AnswerPayload::Cancel) && !is_acp_form {
+        return Err(DomainError::InvalidCommand(
+            "dismissal is available for ACP questions only".into(),
+        ));
+    }
+    if is_acp_form && matches!(payload, AnswerPayload::Secret(_)) {
+        return Err(DomainError::InvalidCommand(
+            "ACP text forms accept non-sensitive responses only".into(),
+        ));
     }
     match &payload {
         AnswerPayload::Plain(text) if text.trim().is_empty() => {
