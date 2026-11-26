@@ -3,7 +3,7 @@
 //! file lock is acquired before the database is opened, and recovery
 //! runs (with zero external sends) before the listener accepts work.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -148,6 +148,17 @@ fn surveyed_models(value: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+pub(crate) fn read_model_catalog(state_dir: &Path) -> BTreeMap<String, BTreeSet<String>> {
+    std::fs::read_to_string(state_dir.join("model-catalog.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<BTreeMap<String, BTreeSet<String>>>(&text).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn enables_catalog_models(config: &serde_json::Value) -> bool {
+    config["enable_catalog_models"].as_bool().unwrap_or(true)
 }
 
 fn load_codex_gateway(state_dir: &Path) -> Option<Arc<dyn AgentGateway>> {
@@ -511,7 +522,7 @@ mod router_tests {
     }
 }
 
-fn find_on_path(binary: &str) -> Option<PathBuf> {
+pub(crate) fn find_on_path(binary: &str) -> Option<PathBuf> {
     if binary.contains('/') || binary.contains('\\') {
         let path = PathBuf::from(binary);
         return path.is_file().then_some(path);
@@ -675,7 +686,7 @@ pub fn parse_listen_addr(listen: &str) -> Result<std::net::SocketAddr, Bootstrap
 /// it: a protected owner-only DACL on Windows, mode `0700`/`0600` on
 /// Unix. Applied to the state directory and to the credential/info
 /// files inside it; failure fails closed.
-fn restrict_to_owner(path: &Path, directory: bool) -> Result<(), BootstrapError> {
+pub(crate) fn restrict_to_owner(path: &Path, directory: bool) -> Result<(), BootstrapError> {
     #[cfg(windows)]
     {
         owner_only_windows::restrict(path, directory).map_err(BootstrapError::Io)
