@@ -1044,7 +1044,7 @@ impl AgentGateway for CodexGateway {
                 return Err(DispatchError::Rejected("empty external answer".to_string()));
             }
             AnswerPayload::Plain(_) => {}
-            AnswerPayload::Secret(_) => {
+            AnswerPayload::Secret(_) | AnswerPayload::Decline | AnswerPayload::Cancel => {
                 // The gateway never sees credentials: the application resolves
                 // the memory-only reference before calling.
                 return Err(DispatchError::Rejected(
@@ -1117,7 +1117,7 @@ impl AgentGateway for CodexGateway {
                     }
                     serde_json::json!({ "answers": answers })
                 }
-                AnswerPayload::Secret(_) => {
+                AnswerPayload::Secret(_) | AnswerPayload::Decline | AnswerPayload::Cancel => {
                     return Err(DispatchError::Rejected(
                         "secret answers must be resolved to plain text by the caller".to_string(),
                     ));

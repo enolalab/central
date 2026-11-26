@@ -746,7 +746,7 @@ impl AgentGateway for OpencodeGateway {
                 return Err(DispatchError::Rejected("empty external answer".to_string()));
             }
             AnswerPayload::Plain(_) => {}
-            AnswerPayload::Secret(_) => {
+            AnswerPayload::Secret(_) | AnswerPayload::Decline | AnswerPayload::Cancel => {
                 // The gateway never sees credentials: the application resolves
                 // the memory-only reference before calling.
                 return Err(DispatchError::Rejected(
