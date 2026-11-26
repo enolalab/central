@@ -248,3 +248,91 @@ impl Stream for FrameStream {
         self.receiver.poll_recv(cx)
     }
 }
+
+/// Ephemeral assistant text for one discussion attempt. The gateway
+/// supplies the accumulated view, so a slow browser may reconnect
+/// without replaying deltas and this stream never starts or polls a turn.
+pub async fn stream_leader_preview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((raw_run, raw_attempt)): Path<(String, String)>,
+) -> Result<axum::response::Response, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let parse_error = || {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            "invalid run or attempt id",
+        )
+    };
+    let run_id = raw_run.parse::<RunId>().map_err(|_| parse_error())?;
+    let attempt_id = raw_attempt
+        .parse::<central_domain::AttemptId>()
+        .map_err(|_| parse_error())?;
+    let snapshot = state.store.load(run_id).await.map_err(app_error_response)?;
+    if !snapshot.as_ref().is_some_and(|run| {
+        run.leader_discussion
+            .iter()
+            .any(|turn| turn.attempt == attempt_id)
+    }) {
+        return Err(error_response(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            "leader discussion attempt not found",
+        ));
+    }
+    let (sender, receiver) = mpsc::channel::<Result<SseEvent, Infallible>>(2);
+    tokio::spawn(async move {
+        let mut last = String::new();
+        loop {
+            if sender.is_closed() {
+                return;
+            }
+            if let Some(client_id) = &auth.client_id {
+                if !matches!(state.store.get_client(client_id).await, Ok(Some(record)) if !record.revoked)
+                {
+                    return;
+                }
+            }
+            let Ok(Some(run)) = state.store.load(run_id).await else {
+                return;
+            };
+            let Some(attempt) = run.attempts.get(&attempt_id) else {
+                return;
+            };
+            if run.control != central_domain::RunControl::Running
+                || central_domain::is_confirmed_terminal(attempt.status)
+                || attempt.status == central_domain::AttemptStatus::UnknownOutcome
+            {
+                let _ = sender
+                    .send(Ok(SseEvent::default().event("done").data("{}")))
+                    .await;
+                return;
+            }
+            if let Some(binding) = run.attempt_sessions.get(&attempt_id) {
+                let session = central_application::contracts::SessionRef {
+                    provider: binding.provider.clone(),
+                    instance_epoch: binding.instance_epoch.clone(),
+                    thread_id: binding.thread_id.clone(),
+                };
+                let text = state.agent.reply_preview(&session).unwrap_or_default();
+                if text != last {
+                    let data = serde_json::json!({ "text": &text }).to_string();
+                    if sender
+                        .send(Ok(SseEvent::default().event("preview").data(data)))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last = text;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    });
+    Ok(axum::response::IntoResponse::into_response(
+        Sse::new(FrameStream { receiver })
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(10))),
+    ))
+}

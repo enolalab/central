@@ -16,6 +16,12 @@ pub trait AgentGateway: Send + Sync {
     async fn open(&self, request: OpenSession) -> Result<SessionRef, AppError>;
     async fn send(&self, request: SendTurn) -> Result<TurnRef, DispatchError>;
     async fn observe(&self, session: &SessionRef) -> Result<Vec<Observation>, AppError>;
+    /// Enable an ephemeral assistant preview for a leader discussion session.
+    fn enable_reply_preview(&self, _session: &SessionRef) {}
+    /// A passive snapshot of text already received from the harness.
+    fn reply_preview(&self, _session: &SessionRef) -> Option<String> {
+        None
+    }
     async fn answer(&self, answer: ExternalAnswer) -> Result<(), DispatchError>;
     async fn cancel(&self, target: &ExecutionRef) -> Result<CancelObservation, AppError>;
     async fn reconcile(&self, target: &ExecutionRef) -> Result<ReconcileEvidence, AppError>;
