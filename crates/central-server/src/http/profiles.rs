@@ -31,7 +31,10 @@ pub struct CreateProfileBody {
     pub config: Option<serde_json::Value>,
 }
 
-async fn capability_for(state: &AppState, record: &UserProfileRecord) -> serde_json::Value {
+pub(super) async fn capability_for(
+    state: &AppState,
+    record: &UserProfileRecord,
+) -> serde_json::Value {
     let profile = central_domain::ResolvedProfile {
         id: record
             .profile_id

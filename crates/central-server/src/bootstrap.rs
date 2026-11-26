@@ -948,6 +948,7 @@ pub async fn run(config: DaemonConfig) -> Result<(), BootstrapError> {
             .map_err(BootstrapError::Storage)?,
     );
     let state = AppState {
+        state_dir: config.state_dir.clone(),
         store,
         actor,
         token,

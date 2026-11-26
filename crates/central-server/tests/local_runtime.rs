@@ -698,6 +698,7 @@ async fn resume_dispatch_failure_is_caller_visible_over_http() {
     let token = "dispatch-error-token".to_string();
     let artifact_root = dir.join("artifacts");
     let state = central_server::http::AppState {
+        state_dir: dir.clone(),
         store,
         actor: central_domain::Actor::user(central_domain::ActorId::from_u128(0xaa)),
         token: token.clone(),
@@ -919,6 +920,7 @@ async fn history_reads_use_bounded_store_fetches() {
     let token = "bounded-probe-token".to_string();
     let artifact_root = dir.join("artifacts");
     let state = central_server::http::AppState {
+        state_dir: dir.clone(),
         store,
         actor: central_domain::Actor::user(central_domain::ActorId::from_u128(0xbb)),
         token: token.clone(),
