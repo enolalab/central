@@ -2,6 +2,7 @@ pub mod artifacts;
 pub mod client_access;
 pub mod contracts;
 pub mod conversation;
+pub mod discussion;
 pub mod dispatcher;
 pub mod fallback;
 pub mod handover;
