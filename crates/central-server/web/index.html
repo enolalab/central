@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Central</title>
+  <link rel="stylesheet" href="/app/design.css">
+  <link rel="stylesheet" href="/app/workspace.css">
+  <script src="/app/vendor/marked.js" defer></script>
+  <script src="/app/vendor/purify.js" defer></script>
+  <script src="/app/workspace.js" defer></script>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="logo"><i aria-hidden="true"></i>Central</div>
+    <nav class="tabs" id="tabs" aria-label="Workspace"></nav>
+    <button type="button" class="tab" id="add-project" aria-label="Mở workspace mới">+</button>
+    <span class="sp"></span>
+    <nav class="mode" aria-label="Giao diện">
+      <button type="button" data-view="work">Công việc</button>
+      <button type="button" data-view="office">Văn phòng</button>
+    </nav>
+  </header>
+  <div class="cmd">
+    <div class="cell"><span class="lab">Project</span><span class="big" id="project-title"></span><span class="sm mu mono path" id="project-path"></span></div>
+    <div class="cell"><span class="lab">Agent đang làm</span><span class="big" id="activity"></span><span class="sm mu" id="progress"></span></div>
+    <div class="cell" id="need"><span class="lab">Cần bạn</span><div class="row g12"><span class="big grow" id="attention"></span><button type="button" class="btn" id="action" hidden>Xem</button></div></div>
+  </div>
+  <p class="feedback" id="feedback" role="status" hidden></p>
+  <main class="main" id="work">
+    <section class="p chat" aria-labelledby="leader-label">
+      <header class="ph chat-header">
+        <div class="chat-identity">
+          <span class="chat-avatar chat-avatar-leader" aria-hidden="true">L</span>
+          <div>
+            <h1 class="disp" id="leader-label">Hội thoại với Leader</h1>
+            <p id="chat-workspace" class="chat-model muted" hidden></p>
+            <p id="chat-model" class="chat-model muted" hidden></p>
+          </div>
+        </div>
+        <div class="row g8">
+          <button type="button" class="btn" id="refresh-chat" hidden>Làm mới hội thoại</button>
+          <span class="tag" id="connection"></span>
+        </div>
+      </header>
+      <div class="pb chat-transcript" id="chat" role="log" aria-labelledby="leader-label"></div>
+      <p id="leader-status" class="leader-status" role="status" hidden></p>
+      <form class="comp" id="composer">
+        <label for="message" class="sr-only">Bạn muốn Central làm gì?</label>
+        <textarea id="message" rows="2" required placeholder="Bạn muốn Central làm gì?"></textarea>
+        <div class="cbar">
+          <button type="button" class="pill" id="agent">Chọn agent</button>
+          <div class="tog" id="run-mode" aria-label="Cách giao việc">
+            <button type="button" data-mode="plan">Trao đổi</button>
+            <button type="button" data-mode="direct">Chạy ngay</button>
+          </div>
+          <button type="button" class="btn" id="stop" hidden>Dừng công việc</button>
+          <button type="button" class="btn" id="new-work" hidden>Việc mới</button>
+          <span class="sp"></span>
+          <button type="submit" class="btn ink" id="send">Gửi</button>
+        </div>
+      </form>
+    </section>
+    <section class="p workers" aria-labelledby="workers-label">
+      <header class="ph"><h2 class="disp" id="workers-label">Worker</h2><span class="tag teal" id="worker-count"></span></header>
+      <div class="pb">
+        <div class="col g8" id="workers"></div>
+        <div class="col g8" id="detail"></div>
+      </div>
+    </section>
+  </main>
+  <section class="office" id="office" aria-label="Văn phòng" hidden>
+    <div class="scene">
+      <img src="/app/office.svg" alt="Bản đồ văn phòng pixel">
+      <button class="pill point board" id="board">Bảng kế hoạch</button>
+      <button class="pill point leader" id="office-leader">Leader</button>
+      <div class="office-workers" id="office-workers"></div>
+    </div>
+  </section>
+  <footer class="ph"><span class="sm mu">Central · Trên máy này</span><div class="row g8"><button type="button" class="btn" id="agent-settings">Cài đặt agent</button><button type="button" class="btn" id="connect">Kết nối</button></div></footer>
+</div>
+<dialog id="dialog" aria-labelledby="dialog-title">
+  <form method="dialog" class="row dialog-title"><h2 class="disp grow" id="dialog-title"></h2><button class="btn" value="close">Đóng</button></form>
+  <div class="col g12" id="dialog-body"></div>
+</dialog>
+</body>
+</html>

@@ -21,6 +21,8 @@ pub mod results;
 pub mod sync;
 pub mod tasks;
 pub mod usage;
+mod web;
+mod web_providers;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +46,7 @@ pub type FakeCounts = Arc<dyn Fn() -> (usize, usize) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct AppState {
+    pub state_dir: PathBuf,
     pub store: Arc<dyn Store>,
     pub actor: Actor,
     pub token: String,
@@ -87,6 +90,23 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/", get(ui_not_built))
+        .route("/app", get(web::index))
+        .route("/app/design.css", get(web::stylesheet))
+        .route("/app/workspace.css", get(web::workspace_stylesheet))
+        .route("/app/workspace.js", get(web::javascript))
+        .route("/app/vendor/marked.js", get(web::marked_javascript))
+        .route("/app/vendor/purify.js", get(web::purify_javascript))
+        .route("/app/office.svg", get(web::office))
+        .route("/app/models", get(web_providers::models))
+        .route("/app/runs/{id}/leader-chat", post(chat::post_leader_chat))
+        .route(
+            "/app/runs/{id}/leader-preview/{attempt}",
+            get(events::stream_leader_preview),
+        )
+        .route(
+            "/app/provider-settings",
+            get(web_providers::list).post(web_providers::save),
+        )
         .route("/v1/meta", get(meta::get_meta))
         .route("/v1/openapi.json", get(meta::get_openapi))
         .route(
@@ -209,23 +229,20 @@ async fn fake_sends(
     }
 }
 
-/// Outside the public API there is nothing: no UI, no static assets.
-/// Every non-API path except `/` is a stable 404, never a crash.
+/// Unregistered paths return a stable JSON 404.
 async fn outside_api() -> ApiError {
     error_response(
         StatusCode::NOT_FOUND,
         "not_found",
-        "no such API path; Central serves no UI — see /v1/openapi.json",
+        "no such path; open /app for the workspace or /v1/openapi.json for the API",
     )
 }
 
-/// The UI entry point browsers and naive probes hit: Central ships no
-/// UI, so `/` answers an explicit 503 (P1 acceptance: UI not built is a
-/// clear signal, never an ambiguous 404), while the daemon stays up.
+/// Preserve the legacy API root response. The browser workspace lives at /app.
 async fn ui_not_built() -> ApiError {
     error_response(
         StatusCode::SERVICE_UNAVAILABLE,
         "capability_unavailable",
-        "no UI is built into this daemon; use the API — see /v1/openapi.json",
+        "open /app for the local workspace or /v1/openapi.json for the API",
     )
 }
