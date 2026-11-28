@@ -497,6 +497,57 @@ fn discuss_turn_ignores_proposal() {
 }
 
 #[test]
+fn revise_turn_supersedes_pending_plan() {
+    let state = discussion_run();
+    let first = run_discussion_turn(&state, 241, DiscussionIntent::Plan, Some(valid_plan()));
+    let h1 = first.next.pending_plan.clone().expect("pending plan");
+    let attempt = AttemptId::from_u128(242);
+    let mut next = first.next.clone();
+    for command in [
+        Command::QueueLeaderDiscussion {
+            workspace_read_only: false,
+            intent: DiscussionIntent::Revise,
+            attempt,
+            message: "Drop a task and sharpen the criteria".into(),
+            input: "Conversation context".into(),
+        },
+        Command::StartDispatch { attempt },
+        Command::AttemptRunning {
+            attempt,
+            session: central_domain::AttemptSession {
+                provider: "codex".into(),
+                instance_epoch: "epoch".into(),
+                thread_id: "thread".into(),
+            },
+        },
+    ] {
+        next = decide(&next, &user(), &command, now()).unwrap().next;
+    }
+    let mut changed = valid_plan();
+    changed.goal = "Revised export goal".to_string();
+    let h2 = validate_plan(&changed).expect("changed plan stays valid");
+    assert_ne!(h1, h2);
+    let done = decide(
+        &next,
+        &user(),
+        &Command::CompleteLeaderDiscussion {
+            attempt,
+            reply: Some("Revised the plan.".into()),
+            proposal: Some(changed),
+            error: None,
+        },
+        now(),
+    )
+    .expect("complete revise turn")
+    .next;
+    assert_eq!(done.pending_plan, Some(h2.clone()));
+    assert_eq!(done.plans[&h1].status, PlanStatus::Superseded);
+    let turn = done.leader_discussion.last().expect("revise turn");
+    assert_eq!(turn.intent, DiscussionIntent::Revise);
+    assert_eq!(turn.proposal, Some(h2));
+}
+
+#[test]
 fn plan_turn_creates_pending_plan() {
     let state = discussion_run();
     let plan = valid_plan();

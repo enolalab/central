@@ -137,8 +137,14 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 }
 .chat-plan:hover { background: #e3eee6; border-color: #729386; }
 .chat-plan-marker { font-size: 19px; line-height: 1; }
-.chat-plan-text { display: grid; min-width: 0; overflow-wrap: anywhere; }
+.chat-plan-text { display: grid; flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .chat-plan-summary { font-size: 12px; color: #425f56; }
+.chat-plan-detail {
+  margin-left: auto; flex-shrink: 0; font-size: 12px; font-weight: 600; white-space: nowrap;
+  padding: 4px 10px; border: 1px solid #729386; border-radius: 999px;
+  background: #fffdf7; color: #17483d;
+}
+.chat-plan:hover .chat-plan-detail { background: #17483d; color: #fffdf7; }
 .chat-empty { max-width: 39ch; margin: 14px auto; text-align: center; color: var(--mu); }
 .chat-empty h2 { font-size: 18px; color: var(--ink); margin-bottom: 6px; }
 .chat .leader-status {

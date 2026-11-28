@@ -712,6 +712,38 @@ function showPlan(workspace) {
             $('dialog').close();
             await refresh(workspace);
         }), 'btn ink'),
+        button('Yêu cầu sửa', () => {
+            const input = node('textarea');
+            input.rows = 4;
+            input.placeholder = 'Mô tả điều cần sửa trong kế hoạch…';
+            const send = button('Gửi yêu cầu sửa', () => {
+                const feedback = input.value.trim();
+                if (!feedback) {
+                    $('dialog-body').querySelector('.form-error')?.remove();
+                    const hint = node('p', 'Hãy mô tả điều cần sửa trước khi gửi.', 'feedback form-error');
+                    hint.setAttribute('role', 'alert');
+                    $('dialog-body').append(hint);
+                    input.focus();
+                    return;
+                }
+                void perform(async () => {
+                    try {
+                        await request('/app/' + runPath(state.run_id, '/leader-chat'), { body: feedback, intent: 'revise' });
+                    } catch (error) {
+                        if (error.status === 409) {
+                            await refresh(workspace);
+                            $('dialog').close();
+                            throw new Error('Kế hoạch đã thay đổi. Mở lại để xem bản mới.');
+                        }
+                        throw error;
+                    }
+                    $('dialog').close();
+                    await refresh(workspace);
+                });
+            }, 'btn ink');
+            modal('Yêu cầu sửa kế hoạch', field('Góp ý cho leader', input), send);
+            input.focus();
+        }),
     ] : [];
     modal('Kế hoạch', list, ...actions);
 }
@@ -878,14 +910,16 @@ function renderMessage(message, workspace) {
 
     if (message.plan) {
         const attachment = button('', () => showPlan(workspace), 'chat-plan');
-        attachment.setAttribute('aria-label', 'Xem kế hoạch leader đề xuất');
+        attachment.setAttribute('aria-label', 'Xem chi tiết kế hoạch leader đề xuất');
         const marker = node('span', '↗', 'chat-plan-marker');
         marker.setAttribute('aria-hidden', 'true');
+        const tasks = message.plan.tasks || [];
         const text = node('span', '', 'chat-plan-text');
-        text.append(node('strong', 'Kế hoạch Leader đề xuất'));
-        const description = message.plan.goal || message.plan.tasks.length + ' công việc';
-        text.append(node('span', description, 'chat-plan-summary'));
-        attachment.append(marker, text);
+        text.append(node('strong', message.plan.goal || 'Kế hoạch Leader đề xuất'));
+        text.append(node('span', tasks.length + ' công việc', 'chat-plan-summary'));
+        const detail = node('span', 'Xem chi tiết', 'chat-plan-detail');
+        detail.setAttribute('aria-hidden', 'true');
+        attachment.append(marker, text, detail);
         card.append(attachment);
     }
     if (!isNotice) {
@@ -1118,7 +1152,7 @@ function actionFor(workspace) {
     if (snapshot?.state.control === 'AwaitingResume' || snapshot?.state.control === 'Paused') {
         return ['Chờ bạn tiếp tục', () => showControl(workspace, 'Resume', 'Tiếp tục công việc')];
     }
-    if (snapshot?.state.pending_plan) return ['Chờ duyệt kế hoạch', () => showPlan(workspace)];
+    if (snapshot?.state.pending_plan) return ['Có kế hoạch chờ duyệt', () => showPlan(workspace)];
     const { worker, leader } = roleChoices(workspace);
     if ((!worker || !leader) && !snapshot?.state.active_plan) return ['Chọn model sẵn sàng', chooseAgent];
     return ['Không có gì cần bạn', null];
