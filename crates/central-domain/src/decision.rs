@@ -1010,6 +1010,7 @@ pub fn decide(
 }
 
 // Discussion attempts intentionally have no task in the task registry.
+#[allow(clippy::too_many_arguments)]
 fn queue_leader_discussion(
     state: &RunState,
     actor: &Actor,
