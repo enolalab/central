@@ -227,7 +227,8 @@ async function refresh(workspace, { includeLogs = true } = {}) {
     if (!token || !workspace || workspace.newDraft) return;
     const id = workspace.run?.state.run_id || workspace.runIds.at(-1);
     if (!id) return;
-    const [snapshot, chat] = await Promise.all([api(runPath(id)), api(runPath(id, '/chat?limit=100'))]);
+    const [snapshot, chat, access] = await Promise.all([api(runPath(id)), api(runPath(id, '/chat?limit=100')),
+        request('/app/' + runPath(id, '/leader-workspace-access')).catch(() => null)]);
     if (workspace.newDraft || (workspace.run && workspace.run.state.run_id !== id)) return;
     if (snapshot.state.repository !== workspace.repository) {
         workspace.runIds = workspace.runIds.filter(runId => runId !== id);
@@ -237,6 +238,7 @@ async function refresh(workspace, { includeLogs = true } = {}) {
     if (workspace.run?.instance_epoch === snapshot.instance_epoch && workspace.run.revision > snapshot.revision) return;
     workspace.run = snapshot;
     workspace.chat = chat.items;
+    if (access) workspace.leaderAccess = access;
     if (includeLogs && workspace.attempt) await loadLogs(workspace, id, workspace.attempt);
 }
 
@@ -944,6 +946,12 @@ function renderChat(workspace) {
     $('chat-model').hidden = !model;
     $('chat-workspace').textContent = workspace?.repository || '';
     $('chat-workspace').hidden = !workspace;
+    const access = workspace?.leaderAccess;
+    const accessText = !access ? '' : access.readable ? 'Đọc được mã workspace'
+        : 'Không đọc được mã workspace' + (access.reason ? ' · ' + access.reason : '');
+    $('chat-access').textContent = accessText;
+    $('chat-access').hidden = !accessText;
+    $('chat-access').classList.toggle('ok', Boolean(access?.readable));
 
     const messages = [];
     const discussion = state?.leader_discussion || [];

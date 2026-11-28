@@ -61,6 +61,8 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
 .chat-header { gap: 12px; flex-wrap: wrap; background: var(--card); }
 .chat-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .chat-model { color: var(--mu); font-size: 12px; overflow-wrap: anywhere; }
+.chat-access { color: var(--mu); font-size: 12px; overflow-wrap: anywhere; }
+.chat-access.ok { color: #17483d; }
 .chat-avatar {
   display: grid; place-items: center; width: 34px; height: 34px;
   flex: 0 0 34px; border-radius: 10px; font-weight: 750; font-size: 13px;

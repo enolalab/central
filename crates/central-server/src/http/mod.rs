@@ -100,6 +100,10 @@ pub fn router(state: AppState) -> Router {
         .route("/app/models", get(web_providers::models))
         .route("/app/runs/{id}/leader-chat", post(chat::post_leader_chat))
         .route(
+            "/app/runs/{id}/leader-workspace-access",
+            get(chat::get_leader_workspace_access),
+        )
+        .route(
             "/app/runs/{id}/leader-preview/{attempt}",
             get(events::stream_leader_preview),
         )

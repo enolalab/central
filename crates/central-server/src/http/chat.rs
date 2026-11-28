@@ -165,14 +165,8 @@ pub async fn post_leader_chat(
     } else {
         (false, Vec::new())
     };
-    let workspace_read_only = local_checkout && record.provider == "codex";
-    let inspect_reason = if workspace_read_only {
-        None
-    } else if !local_checkout {
-        Some("workspace không phải checkout local")
-    } else {
-        Some("provider không phải Codex")
-    };
+    let (workspace_read_only, inspect_reason) =
+        leader_workspace_access(local_checkout, &record.provider);
     let input = central_application::discussion::prompt(
         &snapshot,
         &message,
@@ -212,6 +206,100 @@ pub async fn post_leader_chat(
     Ok(Json(
         serde_json::json!({"receipt": receipt, "attempt_id": attempt}),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::leader_workspace_access;
+
+    #[test]
+    fn local_checkout_with_codex_is_readable() {
+        let (readable, reason) = leader_workspace_access(true, "codex");
+        assert!(readable);
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn non_codex_provider_is_not_readable_with_reason() {
+        let (readable, reason) = leader_workspace_access(true, "claude");
+        assert!(!readable);
+        assert_eq!(reason, Some("provider không phải Codex"));
+    }
+
+    #[test]
+    fn non_checkout_is_not_readable_with_reason() {
+        let (readable, reason) = leader_workspace_access(false, "codex");
+        assert!(!readable);
+        assert_eq!(reason, Some("workspace không phải checkout local"));
+    }
+}
+
+/// Expected code-reading permission for the next leader turn: readable
+/// only when the workspace is a local checkout served by Codex.
+pub fn leader_workspace_access(
+    local_checkout: bool,
+    provider: &str,
+) -> (bool, Option<&'static str>) {
+    if local_checkout && provider == "codex" {
+        (true, None)
+    } else if !local_checkout {
+        (false, Some("workspace không phải checkout local"))
+    } else {
+        (false, Some("provider không phải Codex"))
+    }
+}
+
+/// Expected code-reading permission for the next leader turn, served to
+/// the web chat header (`GET /app/runs/{id}/leader-workspace-access`).
+/// Always 200 for an existing run; without a bound leader the session
+/// simply cannot read yet.
+pub async fn get_leader_workspace_access(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(raw_id): Path<String>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let auth = authenticate(&state, &headers).await?;
+    let run_id = raw_id.parse::<RunId>().map_err(|_| {
+        error_response(
+            StatusCode::BAD_REQUEST,
+            "validation_failed",
+            format!("invalid run id: {raw_id}"),
+        )
+    })?;
+    let snapshot = state
+        .store
+        .load(run_id)
+        .await
+        .map_err(app_error_response)?
+        .ok_or_else(|| error_response(StatusCode::NOT_FOUND, "not_found", "run not found"))?;
+    let (readable, reason) = match snapshot.leader_profile.as_ref() {
+        None => (false, Some("chưa chọn leader")),
+        Some(profile) => {
+            let record = state
+                .store
+                .get_profile(&profile.to_string())
+                .await
+                .map_err(app_error_response)?
+                .ok_or_else(|| {
+                    error_response(StatusCode::NOT_FOUND, "not_found", "leader profile is missing")
+                })?;
+            let local_checkout = if auth.is_owner() {
+                let repository = snapshot.repository.clone();
+                tokio::task::spawn_blocking(move || {
+                    workspace_entries(FsPath::new(&repository)).0
+                })
+                .await
+                .unwrap_or_default()
+            } else {
+                false
+            };
+            leader_workspace_access(local_checkout, &record.provider)
+        }
+    };
+    Ok(Json(serde_json::json!({
+        "readable": readable,
+        "reason": reason,
+    })))
 }
 
 fn workspace_entries(root: &FsPath) -> (bool, Vec<String>) {
