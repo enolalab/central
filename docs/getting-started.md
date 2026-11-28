@@ -7,12 +7,12 @@ uses the public API and runs on the same loopback address as the daemon.
 
 ## Local web workspace
 
-Run `central local-web` to start the daemon and open the workspace in
-your default browser. If a daemon is already running for the selected
-state directory, the command opens its existing address. A new daemon
-listens on `127.0.0.1:8765` by default. Pass `--listen 127.0.0.1:0`
-for an available port. If the browser launcher is unavailable, open the
-URL printed by the command.
+Start the daemon with `central daemon start` (see
+[Install](#install)) and open the workspace at the daemon's loopback
+address in your browser.
+
+> **Upcoming:** `central local-web` (start the daemon and open the
+> workspace in one step) is not available yet.
 
 Select **Kết nối** and enter a workflow control token, or choose
 `daemon.token` from the state directory. The page keeps the token in
@@ -24,10 +24,11 @@ Worker model, and you can remember both choices for the project.
 
 Central enables all catalog models by default for each configured
 provider. To restrict a provider, turn off **Bật toàn bộ model trong catalog**
-and enter the models to allow. Refresh the catalog snapshot with
-`python3 scripts/refresh-model-catalog.py --state-dir <state-dir>` and
-restart the daemon to activate the updated catalog. The refresh reads
-catalogs without starting inference.
+and enter the models to allow.
+
+> **Upcoming:** `scripts/refresh-model-catalog.py` is not available yet.
+> Until then, edit `model-catalog.json` in the state directory directly
+> and restart the daemon to activate the updated catalog.
 
 With the owner token, **Cấu hình provider và danh sách model** edits the
 CLI version, catalog toggle and manual model list. Central loads these
@@ -82,16 +83,11 @@ something looks odd.
 
 ## ACP transport
 
-Set `"transport": "acp"` in each provider's existing JSON file in the
-Central state directory. Keep its model inventory and CLI version settings.
-Muse Code and OpenCode run their respective `acp` subcommand. Codex runs
-`codex-acp` from `PATH`, or the executable specified in `acp_binary`, and
-passes the configured Codex executable to that adapter as `CODEX_PATH`.
-Install the adapter before restarting Central.
-
-New sessions use ACP after restart. Central can load ACP sessions when the
-agent advertises that capability. Previously recorded native sessions
-continue to route through their original transport for reconciliation.
+> **Upcoming:** ACP transport selection is not available yet. A future
+> release will document the `"transport": "acp"` provider setting
+> (including `codex-acp` / `acp_binary`); until then there is no
+> `transport` setting — configure providers as described in the
+> provider sections below.
 
 Central surfaces session forms containing one unrestricted, non-sensitive
 text field in Inbox. You can reply, decline, or cancel from the request
